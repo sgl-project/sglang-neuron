@@ -1,0 +1,7 @@
+{
+ "files": {
+  "__init__.py": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+  "pack_model.py": "587ccf127aeb96f2ff9bd940323dc13e790d066759bc7428840e2ed14716e541"
+ },
+ "note": "sha256 of every file of this kernel copy; ../PROVENANCE.md lists the edits since the fork"
+}

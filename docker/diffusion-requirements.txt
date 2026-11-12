@@ -1,0 +1,15 @@
+# SGLang Diffusion's own packages, which the image adds to SGLang's runtime set so it serves the diffusion models
+# (FLUX.1-dev, FLUX.3-Action, Wan2.2, LingBot-World, MiniMax-H3): diffusers' models and configs, the image and video
+# I/O of its entrypoints (PyAV reads and checks video and audio: MiniMax-H3's outputs need it, or ffprobe), cache-dit,
+# addict configs, and the action policies' WebSocket endpoint with its msgpack payloads. Versions follow SGLang's `diffusion`
+# extra where it pins one that runs here; diffusers and cache-dit are the versions the FLUX.1-dev pipeline is validated
+# with. The one list: scripts/setup_sglang_diffusion_env.sh installs this file, and docker/lock_requirements.sh locks it
+# with the rest for the image.
+addict==2.4.0
+av==16.1.0
+cache-dit==1.5.0
+diffusers==0.40.0
+imageio==2.36.0
+imageio-ffmpeg==0.5.1
+msgpack==1.2.4
+websockets==17.4

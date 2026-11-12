@@ -1,0 +1,10 @@
+# docker/Dockerfile's context is the repository root: the plugin source, tools/build_nixl.sh and patches/nixl go in;
+# git metadata and local build output never do. docker/build.sh builds from a git archive of HEAD, so the images hold
+# the commit's files only; a context that is a working tree would bring its untracked files in.
+.git
+**/__pycache__
+**/*.pyc
+build/
+dist/
+*.egg-info
+.pytest_cache/

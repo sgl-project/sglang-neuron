@@ -1,0 +1,6 @@
+# The tools the image's two wheels (SGLang's and the plugin's) are built with, in the sglang-wheel stage's throwaway
+# venv: they never reach an image, but they build what ships. docker/lock_requirements.sh locks them, with what they
+# need, into docker/wheel-build-lock.txt, which the Dockerfile installs by sha256.
+setuptools==84.2.1
+setuptools-scm==10.3.4
+wheel==0.48.0

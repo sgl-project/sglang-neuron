@@ -1,0 +1,48 @@
+libfabric: NIXL_LIBFABRIC_EFA_UNSOLICITED_WRITE_RECV keeps EFA unsolicited write receive on
+
+Built against the EFA installer's libfabric headers, which the patched plugin needs, the plugin turns EFA's unsolicited
+write receive off on every endpoint, and nothing turns it back on. With it off, every incoming write with immediate
+data uses up a posted receive. A decode rank that takes many KV writes at once runs out of them, its endpoint fails
+("Internal queue pair error") and the whole decode server stops. With the variable set to 1 the plugin keeps the
+feature on, as the PyPI 1.5.0 wheels do (their headers lack the option). Unset, the plugin behaves as upstream.
+
+Upstream turns the feature off because, with it on, remote write completions can be lost under load, so that
+notifications never arrive (ai-dynamo/nixl#2494). SGLang's KV transfers do not depend on them: they carry no
+notification, and the prefill learns each transfer's outcome from its own handles and tells the decode in its
+KV_STATUS message over ZMQ. Both ends of a connection need the same setting; the EFA provider does not refuse a pair
+that disagrees but falls back to slower emulated writes between them.
+
+Upstream: not proposed yet (from v1.5.2, upstream disables the feature whatever the headers, #2494)
+Tests: none in this patch
+
+diff --git a/src/utils/libfabric/libfabric_rail.cpp b/src/utils/libfabric/libfabric_rail.cpp
+index 491d16f4..b66e32d3 100644
+--- a/src/utils/libfabric/libfabric_rail.cpp
++++ b/src/utils/libfabric/libfabric_rail.cpp
+@@ -588,8 +588,14 @@ nixlLibfabricRail::nixlLibfabricRail(const std::string &device,
+ 
+         if (provider_name == "efa") {
+ #ifdef HAVE_FI_OPT_EFA_USE_UNSOLICITED_WRITE_RECV
+-            // Disable unsolicited write recv for EFA RDM to reduce CQ overflow likelihood
+-            const bool use_unsolicited_write_recv = false; // Set to false to disable the feature
++            // Disabled by default to reduce CQ overflow likelihood: every incoming write-with-imm then consumes a
++            // posted receive instead of completing straight into the CQ. A target that takes many small writes from
++            // many peers at once (a disaggregated-inference decode rank receiving KV from 64 prefill ranks) runs its
++            // posted receives dry, and with infinite RNR retry (below) the senders' retries flood its NIC.
++            // NIXL_LIBFABRIC_EFA_UNSOLICITED_WRITE_RECV=1 keeps the feature on for such deployments.
++            const char *uwr_env = getenv("NIXL_LIBFABRIC_EFA_UNSOLICITED_WRITE_RECV");
++            const bool use_unsolicited_write_recv =
++                uwr_env != nullptr && (std::strcmp(uwr_env, "1") == 0 || std::strcmp(uwr_env, "true") == 0);
+             ret = fi_setopt(&endpoint->fid,
+                             FI_OPT_ENDPOINT,
+                             FI_OPT_EFA_USE_UNSOLICITED_WRITE_RECV,
+@@ -599,7 +605,8 @@ nixlLibfabricRail::nixlLibfabricRail(const std::string &device,
+                 NIXL_WARN << "fi_setopt FI_OPT_EFA_USE_UNSOLICITED_WRITE_RECV failed for rail "
+                           << rail_id << ": " << fi_strerror(-ret) << " - continuing anyway";
+             } else if (ret == 0) {
+-                NIXL_INFO << "Successfully disabled unsolicited write recv for rail " << rail_id;
++                NIXL_INFO << "Unsolicited write recv " << (use_unsolicited_write_recv ? "enabled" : "disabled")
++                          << " for rail " << rail_id;
+             } else if (ret == -FI_ENOSYS || ret == -FI_ENOPROTOOPT) {
+                 NIXL_DEBUG << "FI_OPT_EFA_USE_UNSOLICITED_WRITE_RECV not supported for rail "
+                            << rail_id << " (provider: " << provider_name << ") - skipping";

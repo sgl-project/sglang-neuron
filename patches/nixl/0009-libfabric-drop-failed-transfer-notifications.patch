@@ -1,0 +1,42 @@
+libfabric: never deliver the notification of a transfer that failed on the initiator
+
+With 0002 the target learns when a notified transfer failed on the initiator, but it still delivered the notification
+once the writes that did go out had landed (only warning that the data is incomplete), so a partly written transfer
+looked complete. SGLang's KV transfers post no notification, but SGLang-Neuron's PP seam posts one with each
+stage-boundary hop and needs it to mean the hop landed. The target now drops such a notification and logs an error.
+The initiator reports the failure only after every request of the transfer has completed, so no write is still posted
+when the entry is dropped; the application sees the failure on the initiator's transfer handle (the PP seam's sender
+sees its WRITE fail and tells the receiver).
+
+Upstream: not proposed yet (the defect is in release/1.5.0 and main)
+Tests: none in this patch
+
+diff --git a/src/plugins/libfabric/libfabric_backend.cpp b/src/plugins/libfabric/libfabric_backend.cpp
+index 79b0cc25..cd22aa01 100644
+--- a/src/plugins/libfabric/libfabric_backend.cpp
++++ b/src/plugins/libfabric/libfabric_backend.cpp
+@@ -2275,11 +2275,19 @@ nixlLibfabricEngine::checkPendingNotifications() {
+                        << it->second.expected_completions;
+ 
+             if (it->second.xfer_failed) {
+-                NIXL_WARN << "Releasing the notification for notif_xfer_id="
+-                          << it->second.notif_xfer_id
+-                          << " whose transfer failed on the initiator; only "
+-                          << it->second.received_completions
+-                          << " writes arrived, so the data for this transfer is incomplete";
++                // A notification tells the application that the transfer's data arrived. This
++                // transfer failed on the initiator, so its data is incomplete: delivering the
++                // notification would make a partial transfer look complete. Its writes have all
++                // landed or failed by now (the initiator reports the error only once every
++                // request of the transfer has completed), so the entry is dropped; the
++                // application learns of the failure from the initiator's own error handling.
++                NIXL_ERROR << "Dropping the notification for notif_xfer_id="
++                           << it->second.notif_xfer_id
++                           << " whose transfer failed on the initiator after "
++                           << it->second.received_completions
++                           << " writes: its data is incomplete";
++                it = pending_notifications_.erase(it);
++                continue;
+             }
+ 
+             // Reassemble combined payload from fragments

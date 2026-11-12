@@ -1,0 +1,12 @@
+#!/bin/bash
+# The balancer in front of the prefill server and the decode servers: it sends each request to the prefill and to one
+# decode server, and returns the decode's answer. It needs no Neuron device; run it on the prefill node, or on any host
+# that reaches every server.
+set -euo pipefail
+
+PREFILL_URL=${PREFILL_URL:?set PREFILL_URL to the prefill server, http://<prefill node>:30000}
+DECODE_URL=${DECODE_URL:?set DECODE_URL to the first decode server, http://<decode node>:30001}
+
+# listens on 127.0.0.1:8000; for clients on other hosts pass --host <address> (and --port) as arguments, reachable
+# only by them. Pass --decode <URL> for each decode server after the first.
+exec python3 -m sglang_neuron.disaggregation.balancer --prefill "$PREFILL_URL" --decode "$DECODE_URL" "$@"

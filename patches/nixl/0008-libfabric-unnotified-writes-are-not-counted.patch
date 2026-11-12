@@ -1,0 +1,100 @@
+libfabric: a write of a transfer without a notification is not counted by the target
+
+The initiator tags every write with its transfer's 16-bit XFER_ID, and the target counts each into the pending
+notification entry of (sender, XFER_ID) until the transfer's notification completes it. SGLang posts every KV
+transfer without a notification, so each one left an entry that nothing removed: the map grew with every request, and
+checkPendingNotifications, which walks every entry after each remote-write completion, slowed the decode's progress
+threads with it. A transfer without a notification now takes the reserved XFER_ID 0, which getNextXferId never
+returns, and the target ignores writes with that id; a notification without a transfer (genNotif) is delivered as
+before. The handshake's protocol version is 3, so a peer that tags these writes otherwise is refused at connection
+setup.
+
+Upstream: not proposed yet (the defect is in release/1.5.0 and main; main's #2436, after the base, removed only the
+  slowdown, by checking just the entry an event updated, and lists the entries left behind as a follow-up)
+Tests: none in this patch
+
+diff --git a/src/plugins/libfabric/libfabric_backend.cpp b/src/plugins/libfabric/libfabric_backend.cpp
+index cedf619b..ae415b43 100644
+--- a/src/plugins/libfabric/libfabric_backend.cpp
++++ b/src/plugins/libfabric/libfabric_backend.cpp
+@@ -573,6 +573,10 @@ nixlLibfabricEngine::nixlLibfabricEngine(const nixlBackendInitParams *init_param
+             rail_manager_.getRail(rail_id).setXferIdCallback(
+                 [this](uint64_t imm_data, uint32_t sender_peer_idx) {
+                     uint16_t xfer_id = NIXL_GET_XFER_ID_FROM_IMM(imm_data);
++                    // a write of a transfer without a notification: nothing waits for it
++                    if (xfer_id == NIXL_LIBFABRIC_UNNOTIFIED_XFER_ID) {
++                        return;
++                    }
+                     addReceivedXferId(xfer_id, sender_peer_idx);
+                 });
+             NIXL_DEBUG << "Set XFER_ID callback for rail " << rail_id;
+@@ -1500,8 +1504,13 @@ nixlLibfabricEngine::postXfer(const nixl_xfer_op_t &operation,
+         backend_handle->total_notif_msg_len = 0;
+     }
+ 
+-    // Allocate xfer_id once in prepXfer
+-    backend_handle->post_xfer_id = LibfabricUtils::getNextXferId();
++    // Allocate xfer_id once in prepXfer. A transfer without a notification takes the unnotified id:
++    // the target counts writes only to complete a notification, and would keep a pending entry for
++    // every other transfer's writes that nothing ever completes (and that a later transfer reusing
++    // its 16-bit id would inherit).
++    backend_handle->post_xfer_id = backend_handle->has_notif ?
++        LibfabricUtils::getNextXferId() :
++        static_cast<uint16_t>(NIXL_LIBFABRIC_UNNOTIFIED_XFER_ID);
+ 
+     nixlLibfabricReq::OpType op_type;
+     int desc_count = local.descCount();
+diff --git a/src/utils/libfabric/libfabric_common.cpp b/src/utils/libfabric/libfabric_common.cpp
+index 662da308..affd0005 100644
+--- a/src/utils/libfabric/libfabric_common.cpp
++++ b/src/utils/libfabric/libfabric_common.cpp
+@@ -176,23 +176,11 @@ static std::atomic<uint8_t> g_seq_id_counter{0}; // 4-bit SEQ_ID counter, start
+ 
+ uint16_t
+ getNextXferId() {
+-    uint16_t xfer_id = g_xfer_id_counter.fetch_add(1);
+-
+-    // Handle wraparound: 16-bit field can hold 0 to 65,535
+-    if (xfer_id > NIXL_XFER_ID_MASK) {
+-        // Reset counter atomically and get a fresh ID
+-        uint16_t expected = xfer_id;
+-        while (expected > NIXL_XFER_ID_MASK &&
+-               !g_xfer_id_counter.compare_exchange_weak(expected, 1)) {
+-            expected = g_xfer_id_counter.load();
+-        }
++    // The 16-bit counter wraps by itself; it skips the id of unnotified transfers' writes.
++    uint16_t xfer_id;
++    do {
+         xfer_id = g_xfer_id_counter.fetch_add(1);
+-        // Ensure we don't exceed the mask after reset
+-        if (xfer_id > NIXL_XFER_ID_MASK) {
+-            xfer_id = 1;
+-        }
+-    }
+-
++    } while (xfer_id == NIXL_LIBFABRIC_UNNOTIFIED_XFER_ID);
+     return xfer_id;
+ }
+ 
+diff --git a/src/utils/libfabric/libfabric_common.h b/src/utils/libfabric/libfabric_common.h
+index abe0ef51..d9776f50 100644
+--- a/src/utils/libfabric/libfabric_common.h
++++ b/src/utils/libfabric/libfabric_common.h
+@@ -70,8 +70,15 @@ constexpr const char *NIXL_HANDSHAKE_TAG_CONN = "conn";
+ 
+ // Wire-protocol version of the libfabric plugin, exchanged in the handshake. Bump it on any
+ // incompatible imm_data or control-message change. 1: 8-bit agent index in imm_data (sends
+-// "idx", no "ver"). 2: senders are resolved from the completion's source address.
+-#define NIXL_LIBFABRIC_PROTO_VERSION 2u
++// "idx", no "ver"). 2: senders are resolved from the completion's source address. 3: the writes of
++// a transfer that carries no notification have XFER_ID NIXL_LIBFABRIC_UNNOTIFIED_XFER_ID, which
++// the target does not count, and no notified transfer is given that id.
++#define NIXL_LIBFABRIC_PROTO_VERSION 3u
++
++// The XFER_ID of every write of a transfer without a notification. Nothing on the target waits for
++// such a transfer's writes, so it keeps no pending entry for them (an entry that no notification
++// would ever complete); getNextXferId never returns it.
++#define NIXL_LIBFABRIC_UNNOTIFIED_XFER_ID 0u
+ 
+ // The immediate data associated with an RDMA operation is 32 bits and is divided as follows:
+ // | 4-bit MSG TYPE flag | 8-bit RESERVED | 16-bit XFER_ID | 4-bit SEQ_ID |

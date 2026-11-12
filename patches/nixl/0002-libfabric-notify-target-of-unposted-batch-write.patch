@@ -1,0 +1,485 @@
+libfabric: tell the target when a batch write cannot be posted
+
+When the deferred post of a batch write fails, the initiator sends the target an XFER_ERROR message with the number of
+writes that did complete, and the target of a notified transfer stops waiting for the rest. SGLang's KV transfers
+carry no NIXL notification, so it changes nothing for them; 0005 was written on top of it upstream and does not apply
+without it.
+
+Upstream: https://github.com/ai-dynamo/nixl/pull/2107 (merged; in v1.5.0, not in the release/1.5.0 branch the PyPI
+  1.5.0 wheels are built from)
+Tests: none in this patch
+
+diff --git a/src/plugins/libfabric/libfabric_backend.cpp b/src/plugins/libfabric/libfabric_backend.cpp
+index c9e009d6..15238dcc 100644
+--- a/src/plugins/libfabric/libfabric_backend.cpp
++++ b/src/plugins/libfabric/libfabric_backend.cpp
+@@ -389,6 +389,8 @@ nixlLibfabricBackendH::nixlLibfabricBackendH(nixl_xfer_op_t op, const std::strin
+     : completed_requests_(0),
+       submitted_requests_(0),
+       error_status_(NIXL_SUCCESS),
++      successful_requests_(0),
++      xfer_error_sent_(false),
+       operation_(op),
+       remote_agent_(remote_agent),
+       total_notif_msg_len(0) {
+@@ -409,6 +411,7 @@ void
+ nixlLibfabricBackendH::init_request_tracking(size_t num_requests) {
+     submitted_requests_.store(num_requests);
+     completed_requests_.store(0);
++    successful_requests_.store(0);
+     error_status_.store(NIXL_SUCCESS);
+     NIXL_DEBUG << "Initialized request tracking for " << num_requests << " requests";
+ }
+@@ -419,6 +422,8 @@ nixlLibfabricBackendH::complete_request(nixl_status_t status) {
+         nixl_status_t expected = NIXL_SUCCESS;
+         error_status_.compare_exchange_strong(
+             expected, status, std::memory_order_relaxed, std::memory_order_relaxed);
++    } else {
++        successful_requests_.fetch_add(1, std::memory_order_relaxed);
+     }
+     // Release ensures the error store above is visible to any thread that
+     // observes the incremented count via an acquire load in is_completed().
+@@ -433,6 +438,11 @@ nixlLibfabricBackendH::get_completed_requests_count() const {
+     return completed_requests_.load();
+ }
+ 
++size_t
++nixlLibfabricBackendH::get_successful_requests_count() const {
++    return successful_requests_.load(std::memory_order_acquire);
++}
++
+ size_t
+ nixlLibfabricBackendH::get_submitted_requests_count() const {
+     return submitted_requests_.load();
+@@ -449,6 +459,11 @@ nixlLibfabricBackendH::get_error_status() const {
+     return error_status_.load(std::memory_order_acquire);
+ }
+ 
++bool
++nixlLibfabricBackendH::claim_xfer_error_send() {
++    return !xfer_error_sent_.exchange(true);
++}
++
+ bool
+ nixlLibfabricBackendH::is_completed() const {
+     // Acquire pairs with release in complete_request() — guarantees we see
+@@ -533,6 +548,12 @@ nixlLibfabricEngine::nixlLibfabricEngine(const nixlBackendInitParams *init_param
+                 });
+         rail_manager_.getRail(0).setHandshakeCallback(
+             [this](const std::string &payload) { handleHandshake(payload); });
++        rail_manager_.getRail(notification_rail_id)
++            .setXferErrorCallback([this](uint16_t notif_xfer_id,
++                                         uint16_t sender_peer_idx,
++                                         uint32_t final_completions) {
++                handleXferError(notif_xfer_id, sender_peer_idx, final_completions);
++            });
+ 
+         // Set up XFER_ID tracking callbacks for all rails
+         NIXL_DEBUG << "Setting up XFER_ID tracking callbacks for " << rail_manager_.getNumRails()
+@@ -1655,7 +1676,8 @@ nixlLibfabricEngine::checkXfer(nixlBackendReqH *handle) const {
+         // Check if any request completed with error
+         nixl_status_t err = backend_handle->get_error_status();
+         if (err != NIXL_SUCCESS) {
+-            NIXL_ERROR << "Transfer completed with CQ error";
++            NIXL_ERROR << "Transfer completed with CQ error status " << err;
++            notifXferFailure(backend_handle, err);
+             return err;
+         }
+ 
+@@ -1868,6 +1890,111 @@ nixlLibfabricEngine::notifSendPriv(const std::string &remote_agent,
+     return NIXL_SUCCESS;
+ }
+ 
++nixl_status_t
++nixlLibfabricEngine::notifXferErrorPriv(const std::string &remote_agent,
++                                        uint16_t notif_xfer_id,
++                                        uint32_t final_completions) const {
++    std::shared_ptr<nixlLibfabricConnection> connection;
++    {
++        std::lock_guard<std::mutex> lock(connection_state_mutex_);
++        auto it = connections_.find(remote_agent);
++        if (it == connections_.end()) {
++            NIXL_ERROR << "No connection found for agent: " << remote_agent
++                       << ", cannot report transfer error for XFER_ID=" << notif_xfer_id;
++            return NIXL_ERR_NOT_FOUND;
++        }
++        connection = it->second;
++    }
++
++    const size_t rail_id = 0; // Control messages always travel on rail 0
++    nixlLibfabricReq *control_request = rail_manager_.getRail(rail_id).allocateControlRequest(
++        sizeof(XferErrorPayload), notif_xfer_id);
++    if (!control_request) {
++        NIXL_ERROR << "Failed to allocate control request for transfer error, XFER_ID="
++                   << notif_xfer_id;
++        return NIXL_ERR_BACKEND;
++    }
++
++    XferErrorPayload payload{};
++    payload.final_completions = final_completions;
++    memcpy(control_request->buffer, &payload, sizeof(payload));
++    control_request->buffer_size = sizeof(payload);
++
++    const uint16_t imm_agent_idx =
++        senderImmDataAgentIdx(const_cast<nixlLibfabricConnection &>(*connection));
++
++    // A successful postControlMessage() only means fi_senddata() accepted the message, so watch
++    // the send completion as well: if it lands in the CQ as an error the target is left waiting
++    // and nothing else reports it. This runs later on the progress thread, by which time the
++    // caller's backend handle may already have been released, so capture values only and never
++    // touch the handle.
++    auto send_completion = [agent = remote_agent,
++                            xfer_id = notif_xfer_id](nixl_status_t send_status) {
++        if (send_status == NIXL_SUCCESS) {
++            return;
++        }
++        NIXL_ERROR << "Transfer-error message to " << agent << " for XFER_ID=" << xfer_id
++                   << " failed in its send CQ with status " << send_status << "; that agent will "
++                   << "keep waiting for writes that never arrive and will not see this transfer's "
++                   << "notification";
++    };
++
++    nixl_status_t status =
++        rail_manager_.postControlMessage(nixlLibfabricRailManager::ControlMessageType::XFER_ERROR,
++                                         control_request,
++                                         connection->rail_remote_addr_list_[rail_id][0],
++                                         imm_agent_idx,
++                                         std::move(send_completion));
++    if (status != NIXL_SUCCESS) {
++        NIXL_ERROR << "Failed to send transfer-error message for XFER_ID=" << notif_xfer_id;
++        return NIXL_ERR_BACKEND;
++    }
++
++    // Without a progress thread, progress rail to ensure the message is sent
++    if (!progress_thread_enabled_) {
++        status = rail_manager_.getRail(rail_id).progressCompletionQueue();
++        if (status != NIXL_SUCCESS && status != NIXL_IN_PROG) {
++            NIXL_ERROR << "Failed to progress rail 0 in notifXferErrorPriv";
++            return status;
++        }
++    }
++
++    NIXL_DEBUG << "Sent transfer-error message to " << remote_agent << " XFER_ID=" << notif_xfer_id
++               << " final_completions=" << final_completions;
++    return NIXL_SUCCESS;
++}
++
++void
++nixlLibfabricEngine::notifXferFailure(nixlLibfabricBackendH *backend_handle,
++                                      nixl_status_t error_status) const {
++    if (!backend_handle->has_notif || backend_handle->operation_ != nixl_xfer_op_t::NIXL_WRITE ||
++        backend_handle->remote_agent_ == localAgent) {
++        return;
++    }
++
++    if (!backend_handle->claim_xfer_error_send()) {
++        return;
++    }
++
++    const uint32_t final_completions =
++        static_cast<uint32_t>(backend_handle->get_successful_requests_count());
++
++    NIXL_ERROR << "Transfer XFER_ID=" << backend_handle->post_xfer_id << " to "
++               << backend_handle->remote_agent_ << " failed with status " << error_status
++               << " after " << final_completions << " of "
++               << backend_handle->get_submitted_requests_count()
++               << " writes completed; notifying target so it does not wait for the rest";
++
++    nixl_status_t status = notifXferErrorPriv(
++        backend_handle->remote_agent_, backend_handle->post_xfer_id, final_completions);
++    if (status != NIXL_SUCCESS) {
++        NIXL_ERROR << "Could not notify " << backend_handle->remote_agent_
++                   << " of the transfer error for XFER_ID=" << backend_handle->post_xfer_id
++                   << " (status " << status
++                   << "); that agent will keep waiting for writes that never arrive";
++    }
++}
++
+ nixl_status_t
+ nixlLibfabricEngine::genNotif(const std::string &remote_agent, const std::string &msg) const {
+     // Use common fragmentation helper function
+@@ -2020,7 +2147,12 @@ nixlLibfabricEngine::processNotification(const std::string &serialized_notif,
+ 
+         // Update metadata from fragment 0 (agent_name will be extracted after reassembly)
+         if (notif_seq_id == 0) {
+-            it->second.expected_completions = expected_completions;
++            // A transfer-error message may have arrived first and lowered expected_completions to
++            // the number of writes that actually went out. That count is authoritative, so never
++            // raise it back to the count the initiator optimistically sent at postXfer time.
++            if (!it->second.xfer_failed) {
++                it->second.expected_completions = expected_completions;
++            }
+             it->second.total_message_length = total_payload_length;
+             it->second.agent_name_length = agent_name_length;
+         }
+@@ -2036,6 +2168,38 @@ nixlLibfabricEngine::processNotification(const std::string &serialized_notif,
+     checkPendingNotifications();
+ }
+ 
++void
++nixlLibfabricEngine::handleXferError(uint16_t notif_xfer_id,
++                                     uint16_t sender_peer_idx,
++                                     uint32_t final_completions) {
++    {
++        std::lock_guard<std::mutex> lock(receiver_tracking_mutex_);
++
++        const uint64_t key = makePendingKey(sender_peer_idx, notif_xfer_id);
++        auto [it, inserted] = pending_notifications_.try_emplace(key, notif_xfer_id);
++
++        if (inserted) {
++            it->second.remote_agent = "";
++            it->second.received_completions = 0;
++            it->second.expected_msg_fragments = 1; // Default to 1 fragment
++            it->second.received_msg_fragments = 0;
++        }
++
++        it->second.xfer_failed = true;
++        it->second.expected_completions = final_completions;
++
++        NIXL_ERROR << "Initiator reported a failed transfer: sender_peer_idx=" << sender_peer_idx
++                   << " notif_xfer_id=" << notif_xfer_id
++                   << " received_completions=" << it->second.received_completions
++                   << " expected_completions=" << it->second.expected_completions
++                   << (inserted ? " (error arrived before the notification)" : "")
++                   << "; data for this transfer is incomplete";
++    }
++
++    // Check if any notifications can now be completed
++    checkPendingNotifications();
++}
++
+ /****************************************
+  * Receiver Side XFER_ID Tracking Helper Methods
+  *****************************************/
+@@ -2089,6 +2253,14 @@ nixlLibfabricEngine::checkPendingNotifications() {
+                        << " writes=" << it->second.received_completions << "/"
+                        << it->second.expected_completions;
+ 
++            if (it->second.xfer_failed) {
++                NIXL_WARN << "Releasing the notification for notif_xfer_id="
++                          << it->second.notif_xfer_id
++                          << " whose transfer failed on the initiator; only "
++                          << it->second.received_completions
++                          << " writes arrived, so the data for this transfer is incomplete";
++            }
++
+             // Reassemble combined payload from fragments
+             std::string combined_payload;
+             combined_payload.reserve(it->second.total_message_length);
+diff --git a/src/plugins/libfabric/libfabric_backend.h b/src/plugins/libfabric/libfabric_backend.h
+index d8d5f7a7..08d06d7a 100644
+--- a/src/plugins/libfabric/libfabric_backend.h
++++ b/src/plugins/libfabric/libfabric_backend.h
+@@ -122,6 +122,8 @@ private:
+     std::atomic<size_t> completed_requests_; // Atomic count of completed requests
+     std::atomic<size_t> submitted_requests_; // Total number of submitted requests
+     std::atomic<nixl_status_t> error_status_; // Error status from CQ failures
++    std::atomic<size_t> successful_requests_; // Requests that completed without an error
++    std::atomic<bool> xfer_error_sent_; // Target already told about the failure
+ 
+ public:
+     uint16_t post_xfer_id;
+@@ -144,8 +146,9 @@ public:
+     init_request_tracking(size_t num_requests);
+ 
+     /** Record completion of one request (with status).
+-     *  Stores error before incrementing the counter so that is_completed()
+-     *  observers always see the error_status_ that caused the transition. */
++     *  Stores error and bumps successful_requests_ before incrementing the counter so that
++     *  is_completed() observers always see the error_status_ that caused the transition and the
++     *  final successful count. */
+     void
+     complete_request(nixl_status_t status);
+ 
+@@ -153,6 +156,11 @@ public:
+     size_t
+     get_completed_requests_count() const;
+ 
++    /** Get the number of requests that completed without an error. Meaningful once
++     *  is_completed() is true, when it is the count of writes that actually reached the target. */
++    size_t
++    get_successful_requests_count() const;
++
+     /** Get total number of requests submitted as part of this transfer */
+     size_t
+     get_submitted_requests_count() const;
+@@ -164,6 +172,13 @@ public:
+     /** Get error status */
+     nixl_status_t
+     get_error_status() const;
++
++    /** Claim the right to send the transfer-error message to the target.
++     * @return true for the first caller only, so the message is sent at most once however many
++     *         times checkXfer is polled. There is deliberately no way to give the claim back:
++     *         delivery is best effort. */
++    bool
++    claim_xfer_error_send();
+ };
+ 
+ class nixlLibfabricEngine : public nixlBackendEngine {
+@@ -233,6 +248,7 @@ private:
+         uint16_t received_msg_fragments; // Fragments received so far
+         uint32_t total_message_length; // Total length of complete message (all fragments)
+         uint16_t agent_name_length; // Length of agent_name in combined payload
++        bool xfer_failed; // Initiator reported the transfer failed; stop waiting for its writes
+ 
+         PendingNotification(uint16_t xfer_id)
+             : notif_xfer_id(xfer_id),
+@@ -241,7 +257,8 @@ private:
+               expected_msg_fragments(0),
+               received_msg_fragments(0),
+               total_message_length(0),
+-              agent_name_length(0) {}
++              agent_name_length(0),
++              xfer_failed(false) {}
+     };
+ 
+     // O(1) lookup with composite key = (sender_peer_idx << 16) | notif_xfer_id.
+@@ -279,6 +296,23 @@ private:
+                   uint16_t notif_xfer_id,
+                   uint32_t expected_completions) const;
+ 
++    // Tell the target that notif_xfer_id failed on this side and that only final_completions of
++    // its writes will arrive, so it stops waiting for the rest.
++    nixl_status_t
++    notifXferErrorPriv(const std::string &remote_agent,
++                       uint16_t notif_xfer_id,
++                       uint32_t final_completions) const;
++
++    // Receiver-side handler for NIXL_LIBFABRIC_MSG_XFER_ERROR
++    void
++    handleXferError(uint16_t notif_xfer_id, uint16_t sender_peer_idx, uint32_t final_completions);
++
++    // Tell the target once that this transfer failed, so it stops waiting for writes that never
++    // went out. Called only from checkXfer: an asynchronous post failure must not turn postXfer
++    // into an error.
++    void
++    notifXferFailure(nixlLibfabricBackendH *backend_handle, nixl_status_t error_status) const;
++
+     // Private function to fragment notification messages to binary notifications
+     void
+     fragmentNotificationMessage(const std::string &message,
+diff --git a/src/utils/libfabric/libfabric_common.h b/src/utils/libfabric/libfabric_common.h
+index 932b16e9..497f99ae 100644
+--- a/src/utils/libfabric/libfabric_common.h
++++ b/src/utils/libfabric/libfabric_common.h
+@@ -86,6 +86,7 @@ constexpr const char *NIXL_HANDSHAKE_TAG_CONN = "conn";
+ #define NIXL_SEQ_ID_MASK 0xFU // 0x0000000F (4 bits)
+ 
+ // Message type constants
++#define NIXL_LIBFABRIC_MSG_XFER_ERROR 1
+ #define NIXL_LIBFABRIC_MSG_NOTIFICTION 2
+ #define NIXL_LIBFABRIC_MSG_TRANSFER 4
+ // Peer-id handshake message. Sent once per (peer A, peer B) pair after
+@@ -125,6 +126,18 @@ struct BinaryNotificationHeader {
+     uint32_t payload_length; // Message bytes of this fragment
+ } __attribute__((packed));
+ 
++/**
++ * @brief Payload of a NIXL_LIBFABRIC_MSG_XFER_ERROR control message (4 bytes)
++ *
++ * The transfer this refers to is identified by the xfer_id embedded in the immediate data, so the
++ * payload only carries how many of the transfer's writes actually completed. The initiator's count
++ * is authoritative: the target lowers its expected completion count to final_completions so that it
++ * waits for exactly the writes that will arrive, and no longer waits for the ones that failed.
++ */
++struct XferErrorPayload {
++    uint32_t final_completions; // Writes that completed on the initiator and will reach the target
++} __attribute__((packed));
++
+ /**
+  * @brief Metadata for fragment 0 only (10 bytes)
+  *
+diff --git a/src/utils/libfabric/libfabric_rail.cpp b/src/utils/libfabric/libfabric_rail.cpp
+index 8a28b1e7..f6b0667e 100644
+--- a/src/utils/libfabric/libfabric_rail.cpp
++++ b/src/utils/libfabric/libfabric_rail.cpp
+@@ -764,6 +764,12 @@ nixlLibfabricRail::setXferIdCallback(std::function<void(uint64_t, uint16_t)> cal
+     xferIdCallback = callback;
+ }
+ 
++void
++nixlLibfabricRail::setXferErrorCallback(
++    std::function<void(uint16_t, uint16_t, uint32_t)> callback) {
++    xferErrorCallback = callback;
++}
++
+ // Per-rail completion processing - handles one rail's CQ with configurable blocking behavior
+ nixl_status_t
+ nixlLibfabricRail::progressCompletionQueue() {
+@@ -1013,6 +1019,22 @@ nixlLibfabricRail::processRecvCompletion(struct fi_cq_data_entry *comp) const {
+             NIXL_ERROR << "No notification callback set!";
+             result = NIXL_ERR_BACKEND;
+         }
++    } else if (msg_type == NIXL_LIBFABRIC_MSG_XFER_ERROR) {
++        if (comp->len < sizeof(XferErrorPayload)) {
++            NIXL_ERROR << "Transfer-error message too short on rail " << rail_id
++                       << " (len=" << comp->len << ")";
++            result = NIXL_ERR_BACKEND;
++        } else if (xferErrorCallback) {
++            XferErrorPayload payload;
++            memcpy(&payload, req->buffer, sizeof(payload));
++            NIXL_DEBUG << "Received transfer-error message on rail " << rail_id
++                       << " XFER_ID=" << xfer_id << " agent_idx=" << agent_idx
++                       << " final_completions=" << payload.final_completions;
++            xferErrorCallback(static_cast<uint16_t>(xfer_id), agent_idx, payload.final_completions);
++        } else {
++            NIXL_ERROR << "No transfer-error callback set on rail " << rail_id;
++            result = NIXL_ERR_BACKEND;
++        }
+     } else if (msg_type == NIXL_LIBFABRIC_MSG_HANDSHAKE) {
+         if (comp->len < 4) {
+             NIXL_ERROR << "Handshake message too short on rail " << rail_id << " (len=" << comp->len
+diff --git a/src/utils/libfabric/libfabric_rail.h b/src/utils/libfabric/libfabric_rail.h
+index c5f04758..ffa5c997 100644
+--- a/src/utils/libfabric/libfabric_rail.h
++++ b/src/utils/libfabric/libfabric_rail.h
+@@ -548,6 +548,14 @@ public:
+     void
+     setXferIdCallback(std::function<void(uint64_t, uint16_t)> callback);
+ 
++    /** Set callback for transfer-error messages from an initiator.
++     *  Signature: (xfer_id, sender_agent_idx_in_our_table, final_completions).
++     *  Called on receipt of a NIXL_LIBFABRIC_MSG_XFER_ERROR control message, which tells us that
++     *  the transfer failed on the initiator and that only final_completions of its writes will
++     *  ever arrive. */
++    void
++    setXferErrorCallback(std::function<void(uint16_t, uint16_t, uint32_t)> callback);
++
+     // Optimized resource management methods
+     /** Allocate control request with size validation */
+     [[nodiscard]] nixlLibfabricReq *
+@@ -596,6 +604,7 @@ private:
+     std::function<void(const std::string &, uint16_t)> notificationCallback;
+     std::function<void(uint64_t, uint16_t)> xferIdCallback;
+     std::function<void(const std::string &)> handshakeCallback;
++    std::function<void(uint16_t, uint16_t, uint32_t)> xferErrorCallback;
+ 
+     // Separate request pools for optimal performance
+     ControlRequestPool control_request_pool_;
+diff --git a/src/utils/libfabric/libfabric_rail_manager.cpp b/src/utils/libfabric/libfabric_rail_manager.cpp
+index f48df844..d49a6107 100644
+--- a/src/utils/libfabric/libfabric_rail_manager.cpp
++++ b/src/utils/libfabric/libfabric_rail_manager.cpp
+@@ -1021,6 +1021,9 @@ nixlLibfabricRailManager::postControlMessage(
+     case ControlMessageType::HANDSHAKE:
+         msg_type_value = NIXL_LIBFABRIC_MSG_HANDSHAKE;
+         break;
++    case ControlMessageType::XFER_ERROR:
++        msg_type_value = NIXL_LIBFABRIC_MSG_XFER_ERROR;
++        break;
+     default:
+         NIXL_ERROR << "Unknown message type";
+         return NIXL_ERR_INVALID_PARAM;
+diff --git a/src/utils/libfabric/libfabric_rail_manager.h b/src/utils/libfabric/libfabric_rail_manager.h
+index 9bb2761e..01980493 100644
+--- a/src/utils/libfabric/libfabric_rail_manager.h
++++ b/src/utils/libfabric/libfabric_rail_manager.h
+@@ -274,6 +274,7 @@ public:
+     enum class ControlMessageType : int {
+         NOTIFICATION, ///< User notification message
+         HANDSHAKE, ///< Peer-idx assignment (NIXL_LIBFABRIC_MSG_HANDSHAKE)
++        XFER_ERROR, ///< Batch had unpostable writes (NIXL_LIBFABRIC_MSG_XFER_ERROR)
+     };
+     /** Send control message via control rail
+      * @param msg_type Type of control message

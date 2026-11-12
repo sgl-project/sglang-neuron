@@ -1,0 +1,10 @@
+# The QA image's own requirements, the input to docker/lock_requirements.sh: pytest and its plugins, lm-eval with its
+# OpenAI-compatible client ([api]), torchmetrics (SSIM / PSNR) and boto3 (S3 checkpoints and references). Their own
+# dependencies are not listed: the tool resolves them against the public image's packages, so the QA image adds
+# packages and changes none, and qa-requirements-lock.txt records every one.
+boto3==1.43.123
+lm-eval[api]==0.4.13
+pytest==7.4.4
+pytest-timeout==2.4.0
+pytest-xdist==3.8.0
+torchmetrics==1.9.0

@@ -1,0 +1,467 @@
+libfabric: fail the request of every CQ error entry
+
+The rail's second CQ reader, pollForCompletions, which the post queue's drain runs on an FI_EAGAIN retry and every 32
+posts, read a CQ error entry with fi_cq_readerr, logged it and dropped it. The entry is the failed operation's only
+completion, so its request never completed: the transfer handle stayed in progress forever, and SGLang's prefill
+transfer worker waited on it forever, with every later transfer of that worker queued behind it. Both CQ readers now
+fail the entry's request through one helper, failCqErrorRequest: its completion callback runs with NIXL_ERR_BACKEND
+and the request is released, once. The handle then completes with the error, the prefill fails the room and its
+KV_STATUS tells the decode.
+
+Upstream: not proposed yet (the defect is in release/1.5.0 and main)
+Tests: test/unit/utils/libfabric/cq_error_test.cpp (in this patch; it needs a debug build: meson setup
+  -Dbuildtype=debug -Dbuild_tests=true, then meson test cq_error_test)
+
+diff --git a/src/utils/libfabric/libfabric_rail.cpp b/src/utils/libfabric/libfabric_rail.cpp
+index b66e32d3..ef19f398 100644
+--- a/src/utils/libfabric/libfabric_rail.cpp
++++ b/src/utils/libfabric/libfabric_rail.cpp
+@@ -826,25 +826,7 @@
+     if (ret < 0 && ret != -FI_EAGAIN) {
+         NIXL_ERROR << "fi_cq_readfrom returned error " << ret << " on rail " << rail_id << ": "
+                    << fi_strerror(-ret);
+-        if (err_ret > 0) {
+-            NIXL_ERROR << "CQ read failed on rail " << rail_id
+-                       << " with error: " << fi_strerror(err_entry.err)
+-                       << " prov_errno: " << err_entry.prov_errno << " len: " << err_entry.len;
+-
+-            // Notify the owning handle of the error and release the request. Done without the
+-            // EP lock: the callback and the request pool take their own locks.
+-            if (err_entry.op_context) {
+-                nixlLibfabricReq *req = findRequestFromContext(err_entry.op_context);
+-                if (req && req->in_use) {
+-                    if (req->completion_callback) {
+-                        req->completion_callback(NIXL_ERR_BACKEND);
+-                    }
+-                    releaseRequest(req);
+-                }
+-            }
+-        } else {
+-            NIXL_ERROR << "fi_cq_readerr failed with " << err_ret;
+-        }
++        failCqErrorRequest(err_ret, err_entry, "CQ read");
+         return NIXL_ERR_BACKEND;
+     }
+ 
+@@ -893,11 +875,12 @@
+     fi_addr_t src_addrs[NIXL_LIBFABRIC_CQ_BATCH_SIZE];
+     struct fi_cq_err_entry err_entry = {};
+     int cq_ret;
++    int err_ret = 0;
+     {
+         const std::lock_guard<std::mutex> ep_lock(ep_mutex_);
+         cq_ret = fi_cq_readfrom(cq, cq_buf, NIXL_LIBFABRIC_CQ_BATCH_SIZE, src_addrs);
+         if (cq_ret < 0 && cq_ret != -FI_EAGAIN) {
+-            fi_cq_readerr(cq, &err_entry, 0);
++            err_ret = fi_cq_readerr(cq, &err_entry, 0);
+         }
+     }
+     if (cq_ret > 0) {
+@@ -905,9 +888,36 @@
+             processCompletionQueueEntry(&cq_buf[c], src_addrs[c]);
+         }
+     } else if (cq_ret < 0 && cq_ret != -FI_EAGAIN) {
+-        NIXL_ERROR << "CQ error in drain interleave on rail " << rail_id << ": "
+-                   << fi_strerror(err_entry.err);
+-    }
++        // fi_cq_readerr has dequeued the entry: failing its request here is the only chance to
++        // complete it, otherwise its transfer never completes
++        failCqErrorRequest(err_ret, err_entry, "CQ error in drain interleave");
++    }
++}
++
++void
++nixlLibfabricRail::failCqErrorRequest(int err_ret,
++                                      const struct fi_cq_err_entry &err_entry,
++                                      const char *where) const {
++    if (err_ret <= 0) {
++        NIXL_ERROR << where << " on rail " << rail_id << ": fi_cq_readerr failed with "
++                   << err_ret;
++        return;
++    }
++    NIXL_ERROR << where << " on rail " << rail_id << " with error: " << fi_strerror(err_entry.err)
++               << " prov_errno: " << err_entry.prov_errno << " len: " << err_entry.len;
++    if (!err_entry.op_context) {
++        return;
++    }
++    nixlLibfabricReq *req = findRequestFromContext(err_entry.op_context);
++    if (!req || !req->in_use) {
++        NIXL_WARN << "CQ error entry on rail " << rail_id
++                  << " names no request in use; nothing to fail";
++        return;
++    }
++    if (req->completion_callback) {
++        req->completion_callback(NIXL_ERR_BACKEND);
++    }
++    releaseRequest(req);
+ }
+ 
+ // Route completion to appropriate handler (rail-specific)
+diff --git a/src/utils/libfabric/libfabric_rail.h b/src/utils/libfabric/libfabric_rail.h
+index ce58c937..174a89f6 100644
+--- a/src/utils/libfabric/libfabric_rail.h
++++ b/src/utils/libfabric/libfabric_rail.h
+@@ -640,6 +640,15 @@
+     void
+     pollForCompletions();
+ 
++    /** Fail the request named by a CQ error entry that fi_cq_readerr returned (err_ret, its
++     *  return value). The error entry is that operation's only completion, so the request's
++     *  completion callback runs here with NIXL_ERR_BACKEND and the request is released; a
++     *  request already released is left alone. Both CQ readers (progressCompletionQueue and
++     *  pollForCompletions) call it, without ep_mutex_ held: the callback and the request pools
++     *  take their own locks. */
++    void
++    failCqErrorRequest(int err_ret, const struct fi_cq_err_entry &err_entry, const char *where) const;
++
+     /** Record that fi_addr belongs to agent_idx. Called from insertAddress(). */
+     void
+     mapSourceAddress(fi_addr_t fi_addr, uint32_t agent_idx) const;
+diff --git a/test/unit/utils/libfabric/cq_error_test.cpp b/test/unit/utils/libfabric/cq_error_test.cpp
+new file mode 100644
+index 0000000..524617bd
+--- /dev/null
++++ b/test/unit/utils/libfabric/cq_error_test.cpp
+@@ -0,0 +1,316 @@
++/*
++ * SPDX-FileCopyrightText: Copyright (c) 2026 Amazon.com, Inc. and affiliates.
++ * SPDX-License-Identifier: Apache-2.0
++ *
++ * Licensed under the Apache License, Version 2.0 (the "License");
++ * you may not use this file except in compliance with the License.
++ * You may obtain a copy of the License at
++ *
++ * http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++
++/*
++ * Unit test: a CQ error entry fails the request it names, on both CQ readers.
++ *
++ * fi_cq_readerr dequeues an error entry, which is the failed operation's only completion, so a
++ * reader that logged the entry and dropped it would leave the request incomplete and its transfer
++ * in progress forever. Both readers, progressCompletionQueue and the post queue's drain
++ * (drainPostQueue -> pollForCompletions, on an FI_EAGAIN retry and every
++ * POST_POLL_INTERLEAVE_RATIO posts), run the request's completion callback with NIXL_ERR_BACKEND
++ * and release it, once; a later completion that names the released request changes nothing.
++ * libfabric is mocked out.
++ */
++
++#include "libfabric/libfabric_rail_manager.h"
++#include "libfabric/libfabric_common.h"
++#include "common/nixl_log.h"
++#include "libfabric_mock_stubs.h"
++
++#include <deque>
++#include <iostream>
++#include <string>
++#include <vector>
++
++static const size_t NUM_FAKE_RAILS = 1;
++
++extern "C" int
++__wrap_numa_max_node() {
++    return 1;
++}
++
++extern "C" int
++__wrap_numa_num_configured_nodes() {
++    return 2;
++}
++
++extern "C" int
++__wrap_fi_getinfo(uint32_t /*version*/,
++                  const char * /*node*/,
++                  const char * /*service*/,
++                  uint64_t /*flags*/,
++                  const struct fi_info * /*hints*/,
++                  struct fi_info **info) {
++    *info = mock_fi_info_chain(NUM_FAKE_RAILS, 100ull * NIXL_LIBFABRIC_GIGA);
++    return 0;
++}
++
++extern "C" int
++__wrap_fi_fabric(struct fi_fabric_attr * /*attr*/, struct fid_fabric **fabric, void * /*context*/) {
++    *fabric = mock_fabric_create();
++    return 0;
++}
++
++// --- Scripted completion queue: each read takes the next step, then FI_EAGAIN ---
++
++struct CqStep {
++    bool error; // the read fails with FI_EAVAIL and fi_cq_readerr returns err_entry
++    std::vector<struct fi_cq_data_entry> entries;
++    struct fi_cq_err_entry err_entry;
++    ssize_t readerr_ret;
++};
++
++static std::deque<CqStep> cq_script;
++static bool cq_error_pending = false;
++static struct fi_cq_err_entry cq_pending_err = {};
++static ssize_t cq_pending_readerr_ret = 0;
++
++static ssize_t
++fi_cq_readfrom_stub(struct fid_cq * /*cq*/, void *buf, size_t count, fi_addr_t *src_addr) {
++    if (cq_script.empty()) {
++        return -FI_EAGAIN;
++    }
++    CqStep step = cq_script.front();
++    cq_script.pop_front();
++    if (step.error) {
++        cq_error_pending = true;
++        cq_pending_err = step.err_entry;
++        cq_pending_readerr_ret = step.readerr_ret;
++        return -FI_EAVAIL;
++    }
++    auto *out = static_cast<struct fi_cq_data_entry *>(buf);
++    size_t n = 0;
++    for (; n < count && n < step.entries.size(); ++n) {
++        out[n] = step.entries[n];
++        if (src_addr != nullptr) {
++            src_addr[n] = FI_ADDR_NOTAVAIL;
++        }
++    }
++    return static_cast<ssize_t>(n);
++}
++
++static ssize_t
++fi_cq_readerr_stub(struct fid_cq * /*cq*/, struct fi_cq_err_entry *buf, uint64_t /*flags*/) {
++    if (!cq_error_pending) {
++        return -FI_EAGAIN;
++    }
++    cq_error_pending = false;
++    if (cq_pending_readerr_ret > 0) {
++        *buf = cq_pending_err;
++    }
++    return cq_pending_readerr_ret;
++}
++
++static void
++cq_push_error(void *op_context, ssize_t readerr_ret = 1) {
++    CqStep step{};
++    step.error = true;
++    step.err_entry.op_context = op_context;
++    step.err_entry.err = FI_ECANCELED;
++    step.err_entry.prov_errno = 1;
++    step.readerr_ret = readerr_ret;
++    cq_script.push_back(step);
++}
++
++static void
++cq_push_write_completion(void *op_context) {
++    CqStep step{};
++    struct fi_cq_data_entry e{};
++    e.op_context = op_context;
++    e.flags = FI_WRITE | FI_RMA;
++    step.entries.push_back(e);
++    cq_script.push_back(step);
++}
++
++// --- Scripted RMA posts: each fi_writemsg takes the next return value, then 0 ---
++
++static std::deque<ssize_t> writemsg_script;
++static size_t writemsg_calls = 0;
++// No test posts more often than this; a post loop that spins past it is a test failure, not a hang.
++static const size_t MAX_WRITEMSG_CALLS = 64;
++
++static ssize_t
++fi_writemsg_stub(struct fid_ep * /*ep*/, const struct fi_msg_rma * /*msg*/, uint64_t /*flags*/) {
++    if (++writemsg_calls > MAX_WRITEMSG_CALLS) {
++        std::cerr << "FAIL: fi_writemsg called " << writemsg_calls << " times: the post loop spins"
++                  << std::endl;
++        std::abort();
++    }
++    if (writemsg_script.empty()) {
++        return 0;
++    }
++    ssize_t ret = writemsg_script.front();
++    writemsg_script.pop_front();
++    return ret;
++}
++
++static fi_ops_rma rma_ops_stub = {};
++
++static void
++reset_scripts() {
++    cq_script.clear();
++    cq_error_pending = false;
++    writemsg_script.clear();
++    writemsg_calls = 0;
++}
++
++#define TEST_ASSERT(cond, msg)                                                           \
++    do {                                                                                 \
++        if (!(cond)) {                                                                   \
++            std::cerr << "FAIL: " << (msg) << " [" << __FILE__ << ":" << __LINE__ << "]" \
++                      << std::endl;                                                      \
++            return 1;                                                                    \
++        }                                                                                \
++    } while (0)
++
++// A data request whose completion statuses are recorded.
++struct Tracked {
++    nixlLibfabricReq *req = nullptr;
++    std::vector<nixl_status_t> statuses;
++};
++
++static bool
++tracked_write(nixlLibfabricRail &rail, Tracked &t, uint32_t id) {
++    t.req = rail.allocateDataRequest(nixlLibfabricReq::WRITE, id);
++    if (t.req == nullptr) {
++        return false;
++    }
++    t.req->completion_callback = [&t](nixl_status_t s) { t.statuses.push_back(s); };
++    return true;
++}
++
++static nixlLibfabricPostRequest
++queued_write(nixlLibfabricReq *req) {
++    nixlLibfabricPostRequest pr{};
++    pr.type = nixlLibfabricPostRequest::WRITE;
++    pr.length = 64;
++    pr.dest_addr = 0;
++    pr.req = req;
++    return pr;
++}
++
++// The drain's poll (an FI_EAGAIN retry of a queued post) dequeues the CQ error entry of an
++// earlier request: that request completes with an error and is released, and the queued post
++// still goes out.
++static int
++testDrainPollFailsTheRequest(nixlLibfabricRail &rail) {
++    NIXL_INFO << "  testDrainPollFailsTheRequest";
++    reset_scripts();
++    Tracked earlier, queued;
++    TEST_ASSERT(tracked_write(rail, earlier, 1) && tracked_write(rail, queued, 2),
++                "requests allocated");
++
++    writemsg_script = {-FI_EAGAIN};
++    cq_push_error(&earlier.req->ctx);
++    rail.enqueuePost(queued_write(queued.req));
++    TEST_ASSERT(rail.drainPostQueue() == NIXL_SUCCESS, "the drain posts the queued write");
++
++    TEST_ASSERT(earlier.statuses == std::vector<nixl_status_t>{NIXL_ERR_BACKEND},
++                "the request of the error entry completes once, with NIXL_ERR_BACKEND");
++    TEST_ASSERT(!earlier.req->in_use, "the failed request is released");
++    TEST_ASSERT(writemsg_calls == 2, "the queued write is retried after the poll");
++    TEST_ASSERT(queued.statuses.empty() && queued.req->in_use,
++                "the queued write is posted and waits for its own completion");
++
++    // A completion that names the released request (none follows an error entry of the same
++    // operation; this is a provider that sends one anyway) changes nothing.
++    cq_push_write_completion(&earlier.req->ctx);
++    rail.progressCompletionQueue();
++    TEST_ASSERT(earlier.statuses.size() == 1, "a late completion does not complete it twice");
++
++    cq_push_write_completion(&queued.req->ctx);
++    TEST_ASSERT(rail.progressCompletionQueue() == NIXL_SUCCESS, "the queued write completes");
++    TEST_ASSERT(queued.statuses == std::vector<nixl_status_t>{NIXL_SUCCESS}, "with success");
++    TEST_ASSERT(!queued.req->in_use, "and is released");
++    return 0;
++}
++
++// progressCompletionQueue keeps failing the request of an error entry (the shared handling).
++static int
++testProgressFailsTheRequest(nixlLibfabricRail &rail) {
++    NIXL_INFO << "  testProgressFailsTheRequest";
++    reset_scripts();
++    Tracked t;
++    TEST_ASSERT(tracked_write(rail, t, 3), "request allocated");
++    cq_push_error(&t.req->ctx);
++    TEST_ASSERT(rail.progressCompletionQueue() == NIXL_ERR_BACKEND,
++                "the CQ read reports the error");
++    TEST_ASSERT(t.statuses == std::vector<nixl_status_t>{NIXL_ERR_BACKEND},
++                "the request fails once");
++    TEST_ASSERT(!t.req->in_use, "and is released");
++    return 0;
++}
++
++// An error entry that cannot be read, or that names no request, fails nothing.
++static int
++testUnattributableErrors(nixlLibfabricRail &rail) {
++    NIXL_INFO << "  testUnattributableErrors";
++    reset_scripts();
++    Tracked t, queued;
++    TEST_ASSERT(tracked_write(rail, t, 4) && tracked_write(rail, queued, 5), "requests allocated");
++
++    writemsg_script = {-FI_EAGAIN, -FI_EAGAIN};
++    cq_push_error(&t.req->ctx, /*readerr_ret=*/-FI_EAGAIN); // fi_cq_readerr returns no entry
++    cq_push_error(nullptr); // an entry without a context
++    rail.enqueuePost(queued_write(queued.req));
++    TEST_ASSERT(rail.drainPostQueue() == NIXL_SUCCESS, "the drain posts the queued write");
++    TEST_ASSERT(t.statuses.empty() && t.req->in_use, "an unreadable error entry fails no request");
++    TEST_ASSERT(queued.statuses.empty() && queued.req->in_use, "the queued write is posted");
++
++    cq_push_write_completion(&t.req->ctx);
++    cq_push_write_completion(&queued.req->ctx);
++    rail.progressCompletionQueue();
++    rail.progressCompletionQueue();
++    TEST_ASSERT(t.statuses == std::vector<nixl_status_t>{NIXL_SUCCESS},
++                "its own completion still counts");
++    TEST_ASSERT(queued.statuses == std::vector<nixl_status_t>{NIXL_SUCCESS},
++                "so does the queued write's");
++    return 0;
++}
++
++int
++main() {
++    NIXL_INFO << "=== CQ error handling test ===";
++    cq_ops_stub.size = sizeof(fi_ops_cq);
++    cq_ops_stub.readfrom = fi_cq_readfrom_stub;
++    cq_ops_stub.readerr = fi_cq_readerr_stub;
++    rma_ops_stub.size = sizeof(fi_ops_rma);
++    rma_ops_stub.writemsg = fi_writemsg_stub;
++
++    nixlLibfabricRailManager mgr(0);
++    TEST_ASSERT(mgr.getNumRails() == NUM_FAKE_RAILS, "one rail");
++    nixlLibfabricRail &rail = mgr.getRail(0);
++    rail.endpoint->rma = &rma_ops_stub;
++    // drainPostQueue belongs to the progress-thread model, where the engine sizes each rail's post queue
++    // (initPostQueue); a rail without one has a zero-capacity ring, on which enqueuePost waits forever.
++    rail.setProgressThreadEnabled(true);
++    TEST_ASSERT(rail.initPostQueue(64), "the post queue is initialized");
++
++    int res;
++    if ((res = testDrainPollFailsTheRequest(rail)) != 0) {
++        return res;
++    }
++    if ((res = testProgressFailsTheRequest(rail)) != 0) {
++        return res;
++    }
++    if ((res = testUnattributableErrors(rail)) != 0) {
++        return res;
++    }
++    NIXL_INFO << "=== All CQ error handling tests PASSED ===";
++    return 0;
++}
+diff --git a/test/unit/utils/libfabric/meson.build b/test/unit/utils/libfabric/meson.build
+index 88eef316..2fa27deb 100644
+--- a/test/unit/utils/libfabric/meson.build
++++ b/test/unit/utils/libfabric/meson.build
+@@ -85,4 +85,21 @@
+ 
+     test('src_addr_resolution_test', src_addr_resolution_test_bin)
+ 
++    cq_error_test_link_args = [
++        '-Wl,--wrap=fi_getinfo',
++        '-Wl,--wrap=numa_max_node',
++        '-Wl,--wrap=numa_num_configured_nodes',
++        '-Wl,--wrap=fi_fabric' ]
++
++    cq_error_test_bin = executable('cq_error_test',
++               'cq_error_test.cpp',
++               dependencies: libfabric_utils_dep,
++               include_directories: [nixl_inc_dirs, utils_inc_dirs],
++               link_with: libfabric_utils_lib,
++               cpp_args: libfabric_test_cpp_args,
++               link_args: cq_error_test_link_args,
++               install: true)
++
++    test('cq_error_test', cq_error_test_bin)
++
+ endif

@@ -1,0 +1,102 @@
+# The Neuron SDK release this plugin is validated on: each part of it, where it is published, and the hashes that
+# identify it. A launch of a model with its own launch rules refuses a compiler, nki or Neuron runtime
+# other than the ones named here (sglang_neuron/release/neuron_sdk.py), and `tools/neuron_release.py check` compares
+# an environment's installed files with the hashes. Moving to another release means changing this file, then
+# rerunning the hardware gates on the new release.
+
+[release]
+name = "Neuron SDK 2.33.0"
+date = 2026-10-19
+notes = "https://awsdocs-neuron.readthedocs-hosted.com/en/latest/release-notes/2.33.0.html"
+
+# The release's own torch-neuronx container (aws-neuron/deep-learning-containers, tag 2.33.0). Its layers carry the
+# same neuronx-cc, nki, runtime, collectives and tools as below; pull it by digest, as a tag can be moved.
+[image]
+reference = "public.ecr.aws/neuron/torch-neuronx:2.14.0-neuronx-py314-sdk2.33.0-ubuntu26.04"
+digest = "sha256:b4648437b8c7dbfa2acde18301a4bb4ae9658da5a412da75c59693ed4fd308ec"
+dockerfile = "https://github.com/aws-neuron/deep-learning-containers/blob/2.33.0/pytorch/torch-neuronx/2.14.0/Dockerfile.neuronx"
+
+# The Python packages, from https://pip.repos.neuron.amazonaws.com. sha256 is the wheel file's. content is the sha256
+# of the wheel's RECORD entries that install into site-packages, one "path,hash" line each in sorted order
+# (neuron_sdk.content_digest). pip copies those files unchanged, so an installed package has the same content digest
+# as its wheel, and tools/neuron_release.py check can identify an install without the wheel.
+[wheels.neuronx-cc]
+module = "neuronxcc"
+version = "2.28.7631.0+8f7b0cf5"
+url = "https://pip.repos.neuron.amazonaws.com/neuronx-cc/neuronx_cc-2.28.7631.0%2B8f7b0cf5-cp314-cp314-linux_x86_64.whl"
+sha256 = "0bdd698e6ea94d98b76b47d108d1d5650d14284d6642014f345367db8b77e054"
+content = "5db83fe5643ea08a73f0902825beb840e0b6248cc74b70c3a13029e12a6f2c9f"
+
+[wheels.nki]
+module = "nki"
+version = "0.7.0+37713544100.gfede04bb"
+url = "https://pip.repos.neuron.amazonaws.com/nki/nki-0.7.0%2B37713544100.gfede04bb-cp314-cp314-linux_x86_64.whl"
+sha256 = "15ba7dd61aa8cd822dbcfc14ac9d9b3932a4619a99767914ce1e382efa638744"
+content = "b39d27333813863fdd2c9be6fde932a8335e8d7df980644f1858a911b32af660"
+
+# The system packages, from https://apt.repos.neuron.amazonaws.com (the same files in its jammy and noble indexes).
+# sha256 is the .deb's, as the index's Packages file lists it. library is the soname a process loads the package's
+# runtime by, program the command a launch runs from it; files are the package's libraries and programs, by their path
+# in the package, with their sha256.
+[debs.aws-neuronx-runtime-lib]
+version = "2.35.30.0-d2725ccb8"
+url = "https://apt.repos.neuron.amazonaws.com/pool/main/a/aws-neuronx-runtime-lib/aws-neuronx-runtime-lib_2.35.30.0-d2725ccb8_amd64.deb"
+sha256 = "5ca3f204f9e672e2b4006029ad97cfaeaef310b1275849c42fcd519cfeda9f29"
+library = "libnrt.so.1"
+
+[debs.aws-neuronx-runtime-lib.files]
+"opt/aws/neuron/lib/libnrt.so.2.35.30.0" = "237c447692f84b18194dddb4ca8a21619e3467cf90efbbf51ed5c92f1d38683f"
+"opt/aws/neuron/lib/libnrtucode_extisa.so" = "18364a53d913831841a7c00a50ed87f750055d49d98127627ba81f51d9e07c95"
+"opt/aws/neuron/lib/libncfw.so" = "37246dc75057182bf09cd44aa528f0079ad42351383f58054925de296201f585"
+
+[debs.aws-neuronx-collectives]
+version = "2.35.43.0-354ad3064"
+url = "https://apt.repos.neuron.amazonaws.com/pool/main/a/aws-neuronx-collectives/aws-neuronx-collectives_2.35.43.0-354ad3064_amd64.deb"
+sha256 = "021c6ac4642fb0db8c4733bbe39c54adfacf003296906ab6348a761c647e6a11"
+library = "libnccom.so.2"
+
+[debs.aws-neuronx-collectives.files]
+"opt/aws/neuron/lib/libnccom.so.2.35.43.0" = "0f0c3718af9c960ad8caa5c73489bfe7c91c67adcd1536abb984affcbd8cd511"
+"opt/aws/neuron/lib/libnccom-net.so" = "d16bb837cbf885725ab2c7f9d108ee3313a0141fd6186fa3652c50d155d11acd"
+
+# neuron-ls, which a launch runs to read the node's devices.
+[debs.aws-neuronx-tools]
+version = "2.33.38.0-f874d5618"
+url = "https://apt.repos.neuron.amazonaws.com/pool/main/a/aws-neuronx-tools/aws-neuronx-tools_2.33.38.0-f874d5618_amd64.deb"
+sha256 = "dd64d69dcf4e25806d805e580ec6d3a67d64d6563b426d89aedb1cb88356347c"
+program = "neuron-ls"
+
+[debs.aws-neuronx-tools.files]
+"opt/aws/neuron/bin/neuron-ls" = "82791bf72fb7e4d7516bd66bee23176787d7c211f9081e7a3808879c365d348d"
+
+# The Neuron driver, a kernel module of the host rather than a part of any container.
+[driver]
+package = "aws-neuronx-dkms"
+version = "2.31.7.0"
+url = "https://apt.repos.neuron.amazonaws.com/pool/main/a/aws-neuronx-dkms/aws-neuronx-dkms_2.31.7.0_all.deb"
+sha256 = "a97c02a9fef4c066db4ae904f5b95067d977ac996d2061a1783866011011c3c4"
+
+# torch, the release container's build: the plugin's in-process wraps (backend/torch_pins.py) and the direct submit's
+# skip of dynamo's frame (backend/direct_submit.py) are written against it, by its git revision.
+[torch]
+version = "2.14.0+cu130"
+git_version = "08187d9e0fba026dc8217405802ab5381dc88d90"
+
+# torch-neuronx, the PyTorch device plugin the graphs compile and run through. The release publishes it for glibc
+# 2.43 (2.14.3.0.282+dc70ffa for Python 3.14) and its container builds it from the public v2.33.0 source
+# (2.14.3.0.1+b1b6c66); a launch takes any build of the release's line.
+[torch-neuronx]
+line = "2.14.3"
+
+# What the hardware gates ran beside the release, each with the reason the release's own build is not used yet. These
+# are reported, not enforced: the release's own builds are what a user installs.
+[deviations.torch-neuronx]
+version = "2.14.3.0.2115+149b6fca1"
+release = "2.14.3.0.282+dc70ffa"
+reason = """The gates ran a pre-release build of the same torch-neuronx line, built for glibc 2.39 (Ubuntu 24.04, \
+the container they ran in). The release's 2.14.3.0.282 wheels need glibc 2.43 (Ubuntu 26.04)."""
+
+[deviations.nixl]
+version = "1.5.0"
+reason = """The release ships no NIXL. The PD transfer runs NIXL 1.5.0 (nixl-cu13) as tools/build_nixl.sh builds it: \
+upstream release/1.5.0 at the commit the PyPI 1.5.0 wheels were built at, with patches/nixl applied."""

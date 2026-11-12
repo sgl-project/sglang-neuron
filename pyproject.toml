@@ -1,0 +1,42 @@
+[build-system]
+requires = ["setuptools>=77"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "sglang-neuron"
+version = "0.1.0"
+description = "AWS Neuron (Trainium) platform plugin for SGLang"
+# the wheel's License-Expression and licence file (PEP 639), which licence scanners read
+license = "Apache-2.0"
+license-files = ["LICENSE"]
+requires-python = ">=3.11"
+dependencies = [
+  "sglang",
+]
+
+[project.entry-points."sglang.srt.platforms"]
+neuron = "sglang_neuron:activate"
+
+[project.entry-points."sglang.srt.plugins"]
+neuron_hooks = "sglang_neuron.general_plugin:register"
+
+[project.entry-points."sglang.multimodal_gen.platforms"]
+neuron_diffusion = "sglang_neuron.diffusion:activate"
+
+[project.entry-points."sglang.multimodal_gen.plugins"]
+neuron_diffusion_pipelines = "sglang_neuron.diffusion.plugin:register"
+
+[tool.setuptools.packages.find]
+# every subpackage (models, kernels, patches, ...), so a non-editable install has the whole plugin
+include = ["sglang_neuron", "sglang_neuron.*"]
+
+[tool.setuptools.package-data]
+# the data files the plugin reads at run time, in whichever package holds them: the Neuron SDK pin
+# (release/neuron_sdk.toml), the giga-kernel decode's DMA order, the expert placements and the upstream SGLang source
+# pins (sglang_patches/upstream_pins.json)
+"*" = ["*.json", "*.toml"]
+
+[tool.setuptools.exclude-package-data]
+# the repository's records of the vendored kernels, which nothing reads at run time: each copy's file manifest
+# (tools/<model>/kernel_manifests.py). Their PROVENANCE.md and READMEs stay in the repository too (no *.md is data).
+"*" = ["MANIFEST.json", "SHARED_MANIFEST.json"]
