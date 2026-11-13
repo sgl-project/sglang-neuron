@@ -1,0 +1,5 @@
+# The PD KV transfer packages the image adds to SGLang's runtime set, beside the patched NIXL it builds from source
+# (tools/build_nixl.sh): Mooncake's transfer engine, whose EFA transport moves Neuron HBM for
+# --disaggregation-transfer-backend mooncake (sglang_neuron/disaggregation/mooncake.py; 0.3.14 is the first release
+# that registers Neuron HBM as FI_HMEM_NEURON). docker/lock_requirements.sh locks it with the rest for the image.
+mooncake-transfer-engine-non-cuda==0.3.14

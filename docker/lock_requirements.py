@@ -2,8 +2,9 @@
 """Write the image's dependency locks, exact and hashed, so a build installs the same files every time and pip
 resolves nothing. Run by docker/lock_requirements.sh inside the Dockerfile's base image, with network access.
 
-- requirements-lock.txt: what SGLang's runtime set (tools/sglang_runtime_requirements.py) and SGLang Diffusion's
-  packages (docker/diffusion-requirements.txt) add to the base;
+- requirements-lock.txt: what SGLang's runtime set (tools/sglang_runtime_requirements.py), SGLang Diffusion's
+  packages (docker/diffusion-requirements.txt) and the PD transfer packages (docker/pd-requirements.txt) add to the
+  base;
 - qa-requirements-lock.txt: what docker/qa-requirements.txt (the QA image's own requirements) adds on top of those;
 - torchvision-lock.txt: torchvision's CPU build;
 - wheel-build-lock.txt: the tools the two wheels are built with (docker/wheel-build-requirements.txt), resolved in an
@@ -212,6 +213,7 @@ def main() -> None:
             [sys.executable, str(args.repo / "tools/sglang_runtime_requirements.py"), str(sglang / "python")],
             check=True, capture_output=True, text=True).stdout.splitlines()
         runtime += requirement_lines(docker / "diffusion-requirements.txt")
+        runtime += requirement_lines(docker / "pd-requirements.txt")
         added = resolve(runtime, docker / "requirements-lock.txt", args.upgrade, upgrade_packages)
         problems = base_changes(added, base)
         if problems:
