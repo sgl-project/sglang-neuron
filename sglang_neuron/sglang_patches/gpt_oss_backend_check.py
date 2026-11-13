@@ -1,15 +1,15 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Let SGLang's GPT-OSS attention-backend check accept the Neuron backend.
+"""Let SGLang's GPT-OSS and Gemma 4 attention-backend checks accept the Neuron backend.
 
-``model_hook.handle_model_specific_adjustments`` asserts that a ``GptOssForCausalLM`` server's prefill and decode
-attention backends are on a fixed list of SGLang's own backends, and ``neuron`` is not on it. For a GPT-OSS launch
+``model_hook.handle_model_specific_adjustments`` asserts that a ``GptOssForCausalLM`` or Gemma 4 server's prefill and
+decode attention backends are on a fixed list of SGLang's own backends, and ``neuron`` is not on it. For such a launch
 whose two backends are both ``neuron``, the module swaps ``attention_backends_of`` (the function the adjustment reads
 the backends through) for one that answers a listed backend, for that one call only. Any other launch runs the
 adjustment unchanged. The server arguments are never modified.
 
 The wrapped target is md5-pinned against upstream SGLang 43881a7.
 
-Upstream: SGLang's GPT-OSS check could accept the attention backend an out-of-tree platform registers; this module
+Upstream: SGLang's GPT-OSS and Gemma 4 checks could accept the attention backend an out-of-tree platform registers; this module
 then goes away.
 """
 
@@ -20,7 +20,9 @@ import importlib
 
 TARGET = "sglang.srt.arg_groups.model_hook.handle_model_specific_adjustments"
 _TARGET_MD5 = "a735fb8d579c5fb17e107828e2546b4b"
-# a listed backend; on a GPT-OSS launch the adjustment reads the backends for this check only
+# the architectures whose adjustment asserts a listed backend (both lists contain triton)
+_CHECKED = ("GptOssForCausalLM", "Gemma4ForConditionalGeneration")
+# a listed backend; on such a launch the adjustment reads the backends for this check only
 _LISTED = ("triton", "triton")
 
 
@@ -41,7 +43,7 @@ def handle_model_specific_adjustments(original_fn, server_args, *args, **kwargs)
     from sglang_neuron.models import catalog
 
     # other models' adjustments read the backends for checks of their own, which a stand-in backend would mislead
-    if "GptOssForCausalLM" not in catalog.architectures(server_args):
+    if not any(arch in catalog.architectures(server_args) for arch in _CHECKED):
         return original_fn(server_args, *args, **kwargs)
     try:
         pair = tuple(model_hook.attention_backends_of(model_hook.resolved_view(server_args)))

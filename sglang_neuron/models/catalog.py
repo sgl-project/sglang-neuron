@@ -204,6 +204,10 @@ MODELS = {
         hybrid_swa_memory=True,
     ),
     "Qwen3ForCausalLM": ModelSpec(package="sglang_neuron.models.qwen3", kv_cache_dtypes=("auto", "bf16", "bfloat16")),
+    # the language model of the Gemma 4 dense checkpoint (text only)
+    "Gemma4ForConditionalGeneration": ModelSpec(package="sglang_neuron.models.gemma4",
+                                                kv_cache_dtypes=("auto", "bf16", "bfloat16"),
+                                                launch_hooks="sglang_neuron.models.gemma4.launch"),
     "Glm4ForCausalLM": ModelSpec(package="sglang_neuron.models.glm4", kv_cache_dtypes=("auto", "bf16", "bfloat16")),
     "Qwen3MoeForCausalLM": ModelSpec(package="sglang_neuron.models.qwen3_moe",
                                      kv_cache_dtypes=("auto", "bf16", "bfloat16")),
