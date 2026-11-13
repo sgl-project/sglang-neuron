@@ -8,13 +8,11 @@ and scaled by router_scaling_factor. The shared expert is a SiLU-gated MLP on ev
 sharded over the attention TP; its partial output joins the routed experts' before the one all-reduce of the block."""
 
 import torch
-import torch.nn.functional as F
 from torch import nn
 
 from sglang_neuron.models.hy_v3.fp8 import dequantizing, with_scales
+from sglang_neuron.models.hy_v3.mlp import ShardedMLP
 from sglang_neuron.models.qwen3_moe.moe import SparseMoE
-from sglang_neuron.models.transformer import weights
-from sglang_neuron.models.transformer.config import DTYPE
 from sglang_neuron.ops.moe.moe_cte_bf16 import moe_experts_blockwise
 from sglang_neuron.ops.moe.moe_tkg_bf16 import moe_experts
 from sglang_neuron.parallel import collectives as neuron_collectives
@@ -40,17 +38,9 @@ class HyV3MoE(SparseMoE):
                          intermediate_size=intermediate_size, norm_topk_prob=False, prefill=prefill)
         self.route_norm, self.scaling, self.fp8 = route_norm, scaling, fp8
         self.expert_bias = nn.Parameter(torch.empty(num_experts, dtype=torch.float32))
-        tp = self.attn_tp_group.world_size
-        if shared_intermediate_size % tp:
-            raise ValueError(f"a shared-expert intermediate size of {shared_intermediate_size} does not shard over "
-                             f"{tp} ranks")
-        rows = shared_intermediate_size // tp
-        self.shared_gate_up_weight = nn.Parameter(torch.empty(hidden_size, 2 * rows, dtype=DTYPE))
-        self.shared_down_weight = nn.Parameter(torch.empty(rows, hidden_size, dtype=DTYPE))
-        set_weight_loader(self.shared_gate_up_weight, weights.gate_up_loader(rows, fused=False))
-        set_weight_loader(self.shared_down_weight, weights.row_parallel_loader(rows))
+        self.shared = ShardedMLP(hidden_size, shared_intermediate_size)
         if fp8:
-            for p in (self.gate_up_weight, self.down_weight, self.shared_gate_up_weight, self.shared_down_weight):
+            for p in (self.gate_up_weight, self.down_weight, self.shared.gate_up_weight, self.shared.down_weight):
                 set_weight_loader(p, dequantizing(get_weight_loader(p)))
 
     def forward(self, x, real=None):
@@ -66,8 +56,7 @@ class HyV3MoE(SparseMoE):
         else:
             out = moe_experts(x, gate_up=self.gate_up_weight, down=self.down_weight, affinities=affinities,
                               index=experts.to(torch.int32), rank_id=self._ep_rank_id())
-        gate, up = (x @ self.shared_gate_up_weight).chunk(2, dim=-1)
-        out = out + (F.silu(gate) * up) @ self.shared_down_weight
+        out = out + self.shared.partial(x)
         return neuron_collectives.all_reduce(self.attn_tp_group, out)
 
     def weight_mappings(self, src: str, dst: str) -> dict:
@@ -80,7 +69,7 @@ class HyV3MoE(SparseMoE):
             f"{dst}.gate_up_weight": scaled([f"{experts}.{e}.gate_proj.weight" for e in local]
                                                  + [f"{experts}.{e}.up_proj.weight" for e in local]),
             f"{dst}.down_weight": scaled([f"{experts}.{e}.down_proj.weight" for e in local]),
-            f"{dst}.shared_gate_up_weight": scaled([f"{mlp}.shared_mlp.gate_proj.weight",
-                                                         f"{mlp}.shared_mlp.up_proj.weight"]),
-            f"{dst}.shared_down_weight": scaled([f"{mlp}.shared_mlp.down_proj.weight"]),
+            f"{dst}.shared.gate_up_weight": scaled([f"{mlp}.shared_mlp.gate_proj.weight",
+                                                    f"{mlp}.shared_mlp.up_proj.weight"]),
+            f"{dst}.shared.down_weight": scaled([f"{mlp}.shared_mlp.down_proj.weight"]),
         }

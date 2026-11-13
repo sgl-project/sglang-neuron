@@ -18,10 +18,10 @@ from sglang_neuron.models.hy_v3.attention import Fp8Attention
 from sglang_neuron.models.hy_v3.fp8 import dequantizing, with_scales
 from sglang_neuron.models.hy_v3.kv_scales import load_kv_scales
 from sglang_neuron.models.hy_v3.launch import FP8_CAST
+from sglang_neuron.models.hy_v3.mlp import ShardedMLP
 from sglang_neuron.models.hy_v3.moe import HyV3MoE
 from sglang_neuron.models.qwen3_moe.sglang_model import Qwen3MoeGraph
 from sglang_neuron.models.transformer.config import TransformerConfig, check_bf16_launch, rope_theta_of
-from sglang_neuron.models.transformer.model import MLP
 from sglang_neuron.utils.weight_loader import get_weight_loader, set_weight_loader
 
 NAME = "Hy3"
@@ -103,13 +103,6 @@ def check_layout(dense: TransformerConfig, moe: HyV3MoEConfig, tp: int, ep: int,
         raise ValueError(f"{NAME}: " + "; ".join(problems))
 
 
-class DenseMLP(MLP):
-    """A dense layer's MLP; it takes the prefill's real-token mask the MoE layers read, and ignores it."""
-
-    def forward(self, x, real=None):
-        return super().forward(x)
-
-
 def fp8_kv_cache() -> bool:
     """Whether the launch's KV cache is FP8 (--kv-cache-dtype fp8_e4m3)."""
     from sglang.srt.runtime_context import get_server_args
@@ -129,14 +122,14 @@ class HyV3Graph(Qwen3MoeGraph):
             # the MoE blocks wrap their own loaders
             for layer in self.layers:
                 params = [layer.self_attn.qkv_weight, layer.self_attn.o_weight]
-                if isinstance(layer.mlp, DenseMLP):
+                if isinstance(layer.mlp, ShardedMLP):
                     params += [layer.mlp.gate_up_weight, layer.mlp.down_weight]
                 for p in params:
                     set_weight_loader(p, dequantizing(get_weight_loader(p)))
 
     def build_mlp(self, config: TransformerConfig, layer_idx: int) -> nn.Module:
         if layer_idx < self.moe.first_k_dense_replace:
-            return DenseMLP(config, fused_gate_up=False)
+            return ShardedMLP(config.hidden_size, config.intermediate_size)
         return HyV3MoE(hidden_size=config.hidden_size, num_experts=self.moe.num_experts, top_k=self.moe.top_k,
                        intermediate_size=self.moe.intermediate_size, route_norm=self.moe.route_norm,
                        scaling=self.moe.scaling, shared_intermediate_size=self.moe.shared_intermediate_size,
