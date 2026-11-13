@@ -75,6 +75,28 @@ def hy3_config(hf_config) -> tuple:
     return dense, moe, bool(quant)
 
 
+def check_layout(dense: TransformerConfig, moe: HyV3MoEConfig, tp: int, ep: int, attn_dp: int) -> None:
+    """Refuse a parallel layout the graphs cannot shard, before any weight loads."""
+    problems = []
+    if attn_dp > 1:
+        problems.append("DP attention is not served; the experts run on attention TP")
+    if dense.num_attention_heads % tp:
+        problems.append(f"{dense.num_attention_heads} attention heads do not shard over --tp-size {tp}")
+    kv = dense.num_key_value_heads
+    if kv % tp and tp % kv:
+        problems.append(f"{kv} KV heads neither shard over nor replicate across --tp-size {tp}")
+    if moe.num_experts % ep or tp % ep:
+        problems.append(f"{moe.num_experts} experts do not split over --ep-size {ep} within --tp-size {tp}")
+    elif moe.intermediate_size % (tp // ep):
+        problems.append(f"an expert intermediate size of {moe.intermediate_size} does not shard over the {tp // ep} "
+                        "ranks of each expert")
+    for what, size in (("dense", dense.intermediate_size), ("shared-expert", moe.shared_intermediate_size)):
+        if size % tp:
+            problems.append(f"a {what} intermediate size of {size} does not shard over --tp-size {tp}")
+    if problems:
+        raise ValueError(f"{NAME}: " + "; ".join(problems))
+
+
 class DenseMLP(MLP):
     """A dense layer's MLP; it takes the prefill's real-token mask the MoE layers read, and ignores it."""
 
@@ -126,8 +148,12 @@ class HYV3ForCausalLM(ModelHost):
     decode_context_ladder = True
 
     def check_launch(self, config) -> None:
+        from sglang_neuron import sglang_tree
+
         check_bf16_launch(config, self.name)
-        hy3_config(config)
+        dense, moe, _ = hy3_config(config)
+        pc = sglang_tree.parallel_config()
+        check_layout(dense, moe, int(pc.tp_size), int(pc.ep_size or 1), sglang_tree.attention_dp_size(pc))
 
     def build_graph(self, phase: str, config) -> nn.Module:
         return HyV3Graph(*hy3_config(config), phase)

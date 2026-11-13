@@ -65,7 +65,7 @@ the same attention TP on both sides.
 - A router without the sigmoid or the expert bias, attention biases, or no QK-norm.
 - A scaled RoPE.
 - A dtype other than bfloat16.
-- DP attention.
+- DP attention, and a layout whose heads, experts or intermediate sizes do not shard over the TP and EP sizes.
 - A KV cache dtype other than bf16.
 
 ## Status
