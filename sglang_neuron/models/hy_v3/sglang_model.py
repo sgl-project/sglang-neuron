@@ -7,6 +7,7 @@ attention-TP ranks than its 8 KV heads each KV head is replicated (models/transf
 linear weight is dequantized to bf16 as it loads (fp8.py); the graphs compute in bf16. The checkpoint's MTP layer
 (``num_nextn_predict_layers``) is not loaded."""
 
+import os
 from dataclasses import dataclass
 
 import torch
@@ -16,6 +17,7 @@ from sglang_neuron.models.host import ModelHost
 from sglang_neuron.models.hy_v3.attention import Fp8Attention
 from sglang_neuron.models.hy_v3.fp8 import dequantizing, with_scales
 from sglang_neuron.models.hy_v3.kv_scales import load_kv_scales
+from sglang_neuron.models.hy_v3.launch import FP8_CAST
 from sglang_neuron.models.hy_v3.moe import HyV3MoE
 from sglang_neuron.models.qwen3_moe.sglang_model import Qwen3MoeGraph
 from sglang_neuron.models.transformer.config import TransformerConfig, check_bf16_launch, rope_theta_of
@@ -23,6 +25,8 @@ from sglang_neuron.models.transformer.model import MLP
 from sglang_neuron.utils.weight_loader import get_weight_loader, set_weight_loader
 
 NAME = "Hy3"
+# neuronx-cc compiles a graph's float8_e4m3fn tensors (the FP8 KV cache) on Trn2 only as its own e4m3
+FP8_FN_AS_E4M3 = "--experimental-unsafe-fp8e4m3fn-as-fp8e4m3"
 
 
 @dataclass(frozen=True)
@@ -176,6 +180,13 @@ class HYV3ForCausalLM(ModelHost):
 
     def build_graph(self, phase: str, config) -> nn.Module:
         return HyV3Graph(*hy3_config(config), phase)
+
+    def neuron_compiler_args(self, phase: str, default_args: list[str]) -> list[str]:
+        """An FP8 KV cache on Trn2 compiles its float8_e4m3fn tensors as Trn2's e4m3 (launch.py)."""
+        args = super().neuron_compiler_args(phase, default_args)
+        if fp8_kv_cache() and os.environ.get(FP8_CAST) == "1" and FP8_FN_AS_E4M3 not in args:
+            args = [*args, FP8_FN_AS_E4M3]
+        return args
 
 
 EntryClass = [HYV3ForCausalLM]

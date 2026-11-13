@@ -210,7 +210,7 @@ MODELS = {
     # per-tensor FP8 weights, dequantized to bf16 as they load (models/hy_v3/fp8.py)
     "HYV3ForCausalLM": ModelSpec(package="sglang_neuron.models.hy_v3",
                                  kv_cache_dtypes=("auto", "bf16", "bfloat16", "fp8_e4m3"),
-                                 quantizations=("fp8",)),
+                                 quantizations=("fp8",), launch_hooks="sglang_neuron.models.hy_v3.launch"),
     # the paged giga prefill writes each forward's final GDN state into SGLang's tracking slot, so the chunk-keyed tree
     # keeps an exact checkpoint at every chunk boundary (models/qwen35/prefix.py)
     "Qwen3_5MoeForCausalLM": ModelSpec(package="sglang_neuron.models.qwen35",
