@@ -13,20 +13,35 @@ same kernels take the FP8 arguments instead:
   scales), with the K scale folded into the softmax scale and the V scale into the output projection.
 
 The per-layer scales are dequantization scales (``x ~= fp8 * scale``) for the platform's FP8 range, read from a KV
-scale profile (``kv_scales.py``). These paths run on a NeuronCore only."""
+scale profile (``kv_scales.py``). Under ``--dcp-size D`` (an FP8 cache only) each rank keeps every D-th 128-token block of a sequence
+(distributed.decode_context_parallel.DcpLayout) and the attention runs over the DCP group's shards:
+
+- prefill: the chunk's K and V go to their owners' slots (the metadata's localized slot mapping), then nkilib's
+  ``attention_kv_parallel_segmented_cte`` all-gathers the group's query heads, attends over this rank's shard of the
+  prior and the chunk (round-robin blocks, ``kvp_group_size`` D) and merges the partial softmaxes;
+- decode: ``attention_block_tkg`` with ``CP = D`` over the decode mask of this rank's share, the decoded token counted
+  on its owner only (the runtime's ``dcp_kv_end`` / ``dcp_active_owner``).
+
+These paths run on a NeuronCore only."""
+
+from dataclasses import dataclass
 
 import nki
+import nki.collectives as ncc
 import torch
+from nkilib.core.attention.attention_kv_parallel_segmented_cte import attention_kv_parallel_segmented_cte
 from nkilib.core.qkv.qkv_cte import qkv_cte
 from nkilib.core.utils.common_types import NormType, QKNormConfig, QuantizationType
 from nkilib.experimental.transformer.attention_block_tkg import attention_block_tkg
 import nki.language as nl
 
 import sglang_neuron.ops as NF
-from sglang_neuron.backend.stack import wrap_nki
+from sglang_neuron.backend.stack import resolve_full_mesh, wrap_nki
+from sglang_neuron.ops.attention.attention_decode import dcp_collective_mode
 from sglang_neuron.models.transformer.model import Attention
 from sglang_neuron.ops.attention.attention_decode_mask import P_MAX
 from sglang_neuron.parallel import collectives as neuron_collectives
+from sglang_neuron.parallel import groups
 from sglang_neuron.utils.dtype_utils import FP8_CLAMP_MAX
 from sglang_neuron.utils.hardware_config import get_logical_nc_config
 
@@ -61,6 +76,58 @@ def _decode_fp8(X, W_qkv, q_norm, k_norm, norm_eps, cos, sin, active_blocks_tabl
     )
 
 
+@nki.jit
+def _decode_fp8_dcp(X, W_qkv, q_norm, k_norm, norm_eps, cos, sin, active_blocks_table, K_cache, V_cache, attention_mask,
+                    kv_cache_update_idx, softmax_scale, W_out, k_scale, v_scale, dcp_size, dcp_mesh, dcp_mode):
+    cells = []
+    for cell in dcp_mesh:  # NKI's tracer takes no list comprehension
+        cells.append(list(cell))
+    return attention_block_tkg(
+        X=X, X_hidden_dim_actual=None, rmsnorm_X_enabled=False, rmsnorm_X_eps=None, rmsnorm_X_gamma=None,
+        W_qkv=W_qkv, bias_qkv=None, quantization_type_qkv=QuantizationType.NONE, weight_dequant_scale_qkv=None,
+        input_dequant_scale_qkv=None, rmsnorm_QK_pre_rope_enabled=True, rmsnorm_QK_pre_rope_eps=norm_eps,
+        rmsnorm_QK_pre_rope_W_Q=q_norm, rmsnorm_QK_pre_rope_W_K=k_norm, cos=cos, sin=sin, rope_contiguous_layout=True,
+        rmsnorm_QK_post_rope_enabled=False, rmsnorm_QK_post_rope_eps=0.0, rmsnorm_QK_post_rope_W_Q=None,
+        rmsnorm_QK_post_rope_W_K=None, K_cache_transposed=False, active_blocks_table=active_blocks_table,
+        K_cache=K_cache, V_cache=V_cache, attention_mask=attention_mask, sink=None, update_cache=True,
+        kv_cache_update_idx=kv_cache_update_idx, W_out=W_out, bias_out=None,
+        quantization_type_out=QuantizationType.NONE, weight_dequant_scale_out=None, input_dequant_scale_out=None,
+        transposed_out=False, out_in_sb=False, softmax_scale=softmax_scale, fp8_packed=True, k_scale=k_scale,
+        v_scale=v_scale, CP=dcp_size, CP_replica_group=ncc.ReplicaGroup(cells), CP_collective_mode=dcp_mode,
+    )
+
+
+@nki.jit
+def _prefill_kv_parallel(q, k_cache, v_cache, block_tables, kvp_q_offset, kvp_rank_id, valid_num_prior_tokens, k_scale,
+                         v_scale, scale, block_size, seg_size, dcp_size, dcp_mesh):
+    cells = []
+    for cell in dcp_mesh:
+        cells.append(list(cell))
+    return attention_kv_parallel_segmented_cte(
+        q=q, k_cache=k_cache, v_cache=v_cache, block_tables=block_tables, kvp_q_offset=kvp_q_offset,
+        replica_groups=ncc.ReplicaGroup(cells), group_size=dcp_size, block_size=block_size, seg_size=seg_size,
+        scale=scale, global_q_offset=0, kvp_rank_id=kvp_rank_id, kvp_group_size=dcp_size, apc_mode=True,
+        valid_num_prior_tokens=valid_num_prior_tokens, fp8_packed=True, k_scale=k_scale, v_scale=v_scale,
+    )
+
+
+@dataclass
+class DcpDecodeInputs:
+    """A DCP decode step's kernel inputs, shared by every layer: ``table`` [B, blocks] int32 virtual pages, ``update_idx``
+    [B, 1] uint32 this rank's slot of each row's token (the reserved slot where another rank keeps it) and ``mask`` the
+    group's decode mask (models/gpt_oss/attention_masks.decode_attention_masks)."""
+
+    table: torch.Tensor
+    update_idx: torch.Tensor
+    mask: torch.Tensor
+
+
+def dcp_group():
+    """This rank's DCP group, or None without decode context parallelism."""
+    group = groups.get_neuron_dcp_group()
+    return group if group is not None and group.world_size > 1 else None
+
+
 class Fp8Attention(Attention):
     """The dense transformer's attention over the FP8 pool; ``set_kv_scales`` gives it its layer's scales."""
 
@@ -69,6 +136,10 @@ class Fp8Attention(Attention):
         if self.q_norm is None or self.qkv_bias is not None:
             raise ValueError("Hy3's FP8 KV attention runs with the QK-norm and without QKV biases")
         self.k_scale_float = self.v_scale_float = 1.0
+        self.dcp_group = dcp_group()
+        self.dcp_size = 1 if self.dcp_group is None else self.dcp_group.world_size
+        if self.dcp_size > 1 and self.num_kv_heads != 1:
+            raise ValueError(f"Hy3's DCP attention runs one KV head per rank, not {self.num_kv_heads}")
 
     def set_kv_scales(self, k_scale: float, v_scale: float) -> None:
         self.k_scale_float, self.v_scale_float = float(k_scale), float(v_scale)
@@ -94,8 +165,11 @@ class Fp8Attention(Attention):
             fp8_max=FP8_CLAMP_MAX, fp8_min=-FP8_CLAMP_MAX, kv_dtype=nl.float8_e4m3fn, block_size=page,
             slot_mapping=slots.to(torch.int32).reshape(1, tokens),
         )
+        q = q.view(tokens, self.num_heads, self.head_dim).transpose(0, 1)
+        if self.dcp_size > 1:
+            return self._prefill_dcp(q, k_cache, v_cache, md, page, tokens)
         out = NF.segmented_attention(
-            q.view(tokens, self.num_heads, self.head_dim).transpose(0, 1), k_cache=k_cache, v_cache=v_cache,
+            q, k_cache=k_cache, v_cache=v_cache,
             block_tables=md["block_table_tensor"], prior_tokens=md["cached_seq_len"], block_size=page,
             kv_segment_size=md["kv_segment_size"], scale=self.scaling * self.k_scale_float, sliding_window=None,
             sink=None,
@@ -103,7 +177,45 @@ class Fp8Attention(Attention):
         out = (out * self.v_scale_float).transpose(0, 1).reshape(tokens, -1) @ self.o_weight
         return neuron_collectives.all_reduce(self.attn_tp_group, out)
 
+    def _mesh(self) -> tuple:
+        return tuple(tuple(int(r) for r in cell) for cell in resolve_full_mesh(self.dcp_group))
+
+    def _prefill_dcp(self, q, k_cache, v_cache, md, page, tokens):
+        """The chunk's attention over the DCP group's shards: the chunk starts at global position ``cached`` (a whole
+        number of virtual pages), whose first ``cached / D`` tokens this rank keeps."""
+        size = self.dcp_size
+        cached = md["cached_seq_len"].to(torch.int32).reshape(1, 1)
+        table = md["block_table_tensor"].to(torch.int32)
+        table = torch.where(table < 0, torch.zeros_like(table), table)
+        out = wrap_nki(_prefill_kv_parallel)[get_logical_nc_config()](
+            q, k_cache=k_cache, v_cache=v_cache, block_tables=table[:1], kvp_q_offset=cached,
+            kvp_rank_id=self.dcp_group.rank_in_group_tensor.to(torch.int32).reshape(1, 1),
+            valid_num_prior_tokens=torch.div(cached, size, rounding_mode="floor"),
+            k_scale=self._scale_tensor(self.k_scale_float, P_MAX, q.device),
+            v_scale=self._scale_tensor(self.v_scale_float, P_MAX, q.device),
+            scale=self.scaling, block_size=page, seg_size=min(tokens, size * page), dcp_size=size,
+            dcp_mesh=self._mesh(),
+        )
+        out = out.transpose(0, 1).reshape(tokens, -1) @ self.o_weight
+        return neuron_collectives.all_reduce(self.attn_tp_group, out)
+
+    def _decode_dcp(self, x, cos, sin, inputs: DcpDecodeInputs):
+        out, _, _ = wrap_nki(_decode_fp8_dcp)[get_logical_nc_config()](
+            x.unsqueeze(1), W_qkv=self.qkv_weight, q_norm=self.q_norm.weight.unsqueeze(0),
+            k_norm=self.k_norm.weight.unsqueeze(0), norm_eps=self.norm_eps,
+            cos=cos.t().unsqueeze(-1).contiguous(), sin=sin.t().unsqueeze(-1).contiguous(),
+            active_blocks_table=inputs.table, K_cache=self.k_cache, V_cache=self.v_cache,
+            attention_mask=inputs.mask, kv_cache_update_idx=inputs.update_idx,
+            softmax_scale=self.scaling * self.k_scale_float, W_out=self.o_weight * self.v_scale_float,
+            k_scale=self._scale_tensor(1.0 / self.k_scale_float, 1, x.device).reshape(1, 1),
+            v_scale=self._scale_tensor(1.0 / self.v_scale_float, 1, x.device).reshape(1, 1),
+            dcp_size=self.dcp_size, dcp_mesh=self._mesh(), dcp_mode=dcp_collective_mode(self.dcp_size),
+        )
+        return neuron_collectives.all_reduce(self.attn_tp_group, out)
+
     def decode(self, x, cos, sin, inputs):
+        if isinstance(inputs, DcpDecodeInputs):
+            return self._decode_dcp(x, cos, sin, inputs)
         out, _, _ = wrap_nki(_decode_fp8)[get_logical_nc_config()](
             x.unsqueeze(1), W_qkv=self.qkv_weight, q_norm=self.q_norm.weight.unsqueeze(0),
             k_norm=self.k_norm.weight.unsqueeze(0), norm_eps=self.norm_eps,

@@ -14,7 +14,7 @@ import torch
 from torch import nn
 
 from sglang_neuron.models.host import ModelHost
-from sglang_neuron.models.hy_v3.attention import Fp8Attention
+from sglang_neuron.models.hy_v3.attention import DcpDecodeInputs, Fp8Attention, dcp_group
 from sglang_neuron.models.hy_v3.fp8 import dequantizing, with_scales
 from sglang_neuron.models.hy_v3.kv_scales import load_kv_scales
 from sglang_neuron.models.hy_v3.launch import FP8_CAST
@@ -144,6 +144,28 @@ class HyV3Graph(Qwen3MoeGraph):
                     mappings[key] = with_scales(mappings[key])
         return mappings
 
+    @torch.no_grad()
+    def forward(self, input_ids, positions, attn_metadata, sampling_positions, rank):
+        """The dense core's forward; a DCP decode (an FP8 cache under --dcp-size) builds the group's decode mask once
+        for every layer (attention.DcpDecodeInputs)."""
+        attn = self.layers[0].self_attn
+        if self.phase != "decode" or getattr(attn, "dcp_size", 1) == 1:
+            return super().forward(input_ids, positions, attn_metadata, sampling_positions, rank)
+        from sglang_neuron.models.gpt_oss.attention_masks import decode_attention_masks
+
+        md = attn_metadata[attn.name]
+        rows = md["block_table_tensor"].shape[0]
+        _, mask = decode_attention_masks(attn_metadata, positions, sliding_window=0,
+                                         q_heads=attn.num_heads * attn.dcp_size, swa_layer=None, full_layer=attn.name)
+        inputs = DcpDecodeInputs(table=md["block_table_tensor"].to(torch.int32),
+                                 update_idx=md["slot_mapping"].view(rows, 1).to(torch.uint32), mask=mask)
+        hidden = self.embed_tokens(input_ids, scatter_tokens=False, rank=rank)
+        cos, sin = self.rotary_emb(positions)
+        for layer in self.layers:
+            hidden = layer(hidden, lambda x, a=layer.self_attn: a.decode(x, cos, sin, inputs))
+        hidden = self.norm(hidden.index_select(0, sampling_positions))
+        return self.lm_head(hidden)
+
     def load_weights(self, checkpoint_path: str, device: torch.device) -> None:
         super().load_weights(checkpoint_path, device)
         if self.fp8_kv:
@@ -170,6 +192,16 @@ class HYV3ForCausalLM(ModelHost):
         dense, moe, _ = hy3_config(config)
         pc = sglang_tree.parallel_config()
         check_layout(dense, moe, int(pc.tp_size), int(pc.ep_size or 1), sglang_tree.attention_dp_size(pc))
+        dcp = int(getattr(pc, "attn_dcp_size", 1) or 1)
+        if dcp > 1:
+            from sglang_neuron.distributed.decode_context_parallel import validate_dcp_heads
+
+            if not fp8_kv_cache():
+                raise ValueError(f"{NAME}: --dcp-size {dcp} is served with the FP8 KV cache (--kv-cache-dtype fp8_e4m3)")
+            validate_dcp_heads(NAME, dense.num_attention_heads, dense.num_key_value_heads, int(pc.tp_size), dcp)
+            # the KV-parallel prefill walks its chunk in segments of whole virtual pages (D blocks), so every prefill
+            # runs the whole chunk
+            self.prefill_ladder = False
 
     def build_graph(self, phase: str, config) -> nn.Module:
         return HyV3Graph(*hy3_config(config), phase)
