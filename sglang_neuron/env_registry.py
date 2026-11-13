@@ -25,6 +25,8 @@ KNOBS: dict = {
     "SGLANG_NEURON_MAX_TOP_LOGPROBS": CONFIG,
     # GPT-OSS's expert numeric format (models/gpt_oss/config.expert_format)
     "SGLANG_NEURON_GPT_OSS_EXPERTS": CONFIG,
+    # Hy3's FP8 KV scale profile (models/hy_v3/kv_scales.py)
+    "SGLANG_NEURON_HY3_KV_SCALES": CONFIG,
     # GLM-5.2 (models/glm52): the decode's weight store, the prefill's MTP rows for a drafting decode, the decode
     # point, the benchmark's pinned MTP acceptance and the decode's FP8 attention weights
     "SGLANG_NEURON_GLM52_WEIGHT_STORE": CONFIG,
