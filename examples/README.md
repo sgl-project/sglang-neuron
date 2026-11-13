@@ -10,6 +10,7 @@ A model's README gives its layout, the launch commands and the accuracy check; t
 | Qwen3-8B | [qwen3_8b](qwen3_8b/) | one prefill and one decode server | TP4 |
 | Qwen3-0.6B | [qwen3_0p6b](qwen3_0p6b/) | one prefill and five decode servers | TP4 |
 | GLM-4-9B | [glm4_9b](glm4_9b/) | one prefill and two decode servers | TP4 |
+| Gemma 4 31B | [gemma4_31b](gemma4_31b/) | - | TP4 on a trn2.3xlarge |
 | DeepSeek-V2-Lite | [deepseek_v2_lite](deepseek_v2_lite/) | one prefill and five decode servers | TP4 |
 | Qwen3.5-397B-A17B | [qwen35](qwen35/) | one prefill and one decode server, up to 256K tokens | - |
 | Kimi-K3 | [kimi_k3](kimi_k3/) | one prefill server and a decode server over two nodes, up to 1M tokens (three nodes) | - |
