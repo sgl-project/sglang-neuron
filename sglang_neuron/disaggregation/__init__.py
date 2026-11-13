@@ -1,12 +1,14 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Disaggregated serving over NIXL: the launch settings of a prefill or decode server and the hooks it runs
-(docs/design/disaggregated-inference.md). The platform applies the settings in the launching process, and the
-plugin registers the hooks in every process."""
+"""Disaggregated serving over NIXL (or Mooncake, disaggregation.mooncake): the launch settings of a prefill or decode
+server and the hooks it runs (docs/design/disaggregated-inference.md). The platform applies the settings in the
+launching process, and the plugin registers the hooks in every process."""
 
 from __future__ import annotations
 
 import logging
 import os
+
+from sglang_neuron.disaggregation import mooncake
 
 logger = logging.getLogger(__name__)
 
@@ -20,6 +22,10 @@ GIGA_DECODE_NIXL_PROGRESS_DELAY_US = 2000
 # (SGLang's SGLANG_WAITING_PREFIX_REFRESH_BOOTSTRAP_MAX, default 512; see apply_launch_settings).
 PREFILL_BOOTSTRAP_PREFIX_REFRESH_MAX = 0
 WAITING_PREFIX_REFRESH_BOOTSTRAP_MAX_ENV = "SGLANG_WAITING_PREFIX_REFRESH_BOOTSTRAP_MAX"
+# The KV transfer backends a prefill or decode server takes (--disaggregation-transfer-backend), and the variable the
+# launching process names its backend in for the schedulers (register_hooks)
+TRANSFER_BACKENDS = ("nixl", "mooncake", "fake")
+TRANSFER_BACKEND_ENV = "SGLANG_NEURON_PD_TRANSFER_BACKEND"
 
 
 def apply_launch_settings(server_args) -> None:
@@ -47,15 +53,20 @@ def apply_launch_settings(server_args) -> None:
         return
     # SGLang's fake backend moves no KV: a decode measured alone, its requests decoding over the KV its pool holds, or a
     # prefill without a decode peer (sglang_patches.pd_fake_prefill)
-    if backend != "nixl" and backend != "fake":
-        raise ValueError(f"--disaggregation-transfer-backend {backend}: Neuron moves the KV with NIXL only "
-                         "(--disaggregation-transfer-backend nixl); SGLang's fake backend serves a decode alone and a "
-                         "prefill without a decode peer")
-    # also on a fake-backend role: a pipelined prefill's stage boundaries move over NIXL (distributed.pp_seam)
-    set_launch_setting("SGLANG_DISAGGREGATION_NIXL_BACKEND", "LIBFABRIC",
-                       "the KV moves over EFA, and a failed transfer reads settled only once LIBFABRIC reports it")
-    set_launch_setting("NIXL_LIBFABRIC_EFA_UNSOLICITED_WRITE_RECV", "1",
-                       "a decode rank that takes many KV writes at once runs out of posted receives without it")
+    if backend not in TRANSFER_BACKENDS:
+        raise ValueError(f"--disaggregation-transfer-backend {backend}: Neuron moves the KV with NIXL "
+                         "(--disaggregation-transfer-backend nixl) or, for the models disaggregation.mooncake serves, "
+                         "Mooncake over EFA (mooncake); SGLang's fake backend serves a decode alone and a prefill "
+                         "without a decode peer")
+    set_launch_setting(TRANSFER_BACKEND_ENV, backend, "the schedulers register the hooks of the launch's backend")
+    if backend == mooncake.BACKEND:
+        mooncake.apply_launch_settings(server_args, set_launch_setting)
+    else:
+        # also on a fake-backend role: a pipelined prefill's stage boundaries move over NIXL (distributed.pp_seam)
+        set_launch_setting("SGLANG_DISAGGREGATION_NIXL_BACKEND", "LIBFABRIC",
+                           "the KV moves over EFA, and a failed transfer reads settled only once LIBFABRIC reports it")
+        set_launch_setting("NIXL_LIBFABRIC_EFA_UNSOLICITED_WRITE_RECV", "1",
+                           "a decode rank that takes many KV writes at once runs out of posted receives without it")
     set_launch_setting("SGLANG_DISAGGREGATION_DEFERRED_DECODE_KV_RELEASE", "1",
                        "a failed transfer's WRITEs may still land in its decode pages, and a prefill without it acks "
                        "no ABORT")
@@ -223,6 +234,11 @@ def register_hooks(registry, hook_type) -> None:
         from sglang_neuron.managers import dp_identity
 
         dp_identity.register_hooks(registry, around)
+    if os.environ.get(TRANSFER_BACKEND_ENV) == mooncake.BACKEND:
+        # the NIXL hooks above wrap NixlKVManager, which a Mooncake server never builds; it has no PP seam either
+        # (mooncake.launch_problems), so no NIXL agent at all
+        mooncake.register_hooks(registry, around)
+        return
     # a fake-transfer decode (a decode-only benchmark) builds no NIXL agent; a fake-transfer prefill still moves its PP
     # stage boundaries over NIXL (distributed.pp_seam)
     if not (policy.fake_kv_transfer and policy.role == "decode"):
