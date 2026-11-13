@@ -23,6 +23,17 @@ from sglang_neuron.utils.hardware_config import get_logical_nc_config
 from sglang_neuron.utils.weight_loader import SafetensorsWeightLoader, set_weight_loader
 
 FP8 = torch.float8_e4m3fn
+# SGLANG_NEURON_HY3_EXPERTS=bf16 dequantizes the routed experts to bf16 instead (an accuracy and speed reference)
+EXPERTS_ENV = "SGLANG_NEURON_HY3_EXPERTS"
+
+
+def enabled() -> bool:
+    import os
+
+    value = os.environ.get(EXPERTS_ENV, "fp8")
+    if value not in ("fp8", "bf16"):
+        raise ValueError(f"{EXPERTS_ENV}={value!r}: set fp8 (the checkpoint's) or bf16")
+    return value == "fp8"
 MAX_TOKENS = 128
 
 

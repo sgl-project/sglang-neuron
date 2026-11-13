@@ -41,12 +41,18 @@ class HyV3MoE(SparseMoE):
         super().__init__(hidden_size=hidden_size, num_experts=num_experts, top_k=top_k,
                          intermediate_size=intermediate_size, norm_topk_prob=False, prefill=prefill)
         self.route_norm, self.scaling, self.fp8 = route_norm, scaling, fp8
+        self.fp8_experts = fp8
         self.expert_bias = nn.Parameter(torch.empty(num_experts, dtype=torch.float32))
         self.shared = ShardedMLP(hidden_size, shared_intermediate_size)
         if fp8:
             for p in (self.shared.gate_up_weight, self.shared.down_weight):
                 set_weight_loader(p, dequantizing(get_weight_loader(p)))
-            experts_fp8.make_fp8(self)
+            if experts_fp8.enabled():
+                experts_fp8.make_fp8(self)
+            else:
+                self.fp8_experts = False
+                for p in (self.gate_up_weight, self.down_weight):
+                    set_weight_loader(p, dequantizing(get_weight_loader(p)))
 
     def forward(self, x, real=None):
         affinities, experts = hy3_route(x, self.router_weight, self.expert_bias, self.top_k, self.route_norm,
@@ -55,11 +61,11 @@ class HyV3MoE(SparseMoE):
         if self.prefill:
             local = (torch.arange(self.num_local_experts, device=x.device, dtype=torch.int32)
                      + self._ep_rank_id().reshape(1) * self.num_local_experts)
-            gate_up, down = experts_fp8.bf16_weights(self) if self.fp8 else (self.gate_up_weight, self.down_weight)
+            gate_up, down = experts_fp8.bf16_weights(self) if self.fp8_experts else (self.gate_up_weight, self.down_weight)
             out = moe_experts_blockwise(x, gate_up=gate_up, down=down,
                                         affinities=affinities.index_select(1, local), top_k=self.top_k,
                                         padding_mask=real, reload_weights=True)
-        elif self.fp8:
+        elif self.fp8_experts:
             out = experts_fp8.decode_experts(self, x, affinities, experts.to(torch.int32))
         else:
             out = moe_experts(x, gate_up=self.gate_up_weight, down=self.down_weight, affinities=affinities,
@@ -74,10 +80,11 @@ class HyV3MoE(SparseMoE):
         return {
             f"{dst}.router_weight": f"{mlp}.router.gate.weight",
             f"{dst}.expert_bias": f"{mlp}.expert_bias",
-            f"{dst}.gate_up_weight": ([f"{experts}.{e}.gate_proj.weight" for e in local]
-                                      + [f"{experts}.{e}.up_proj.weight" for e in local]),
-            f"{dst}.down_weight": [f"{experts}.{e}.down_proj.weight" for e in local],
-            **(experts_fp8.scale_mappings(experts, local, dst) if self.fp8 else {}),
+            f"{dst}.gate_up_weight": (scaled if not self.fp8_experts else list)(
+                [f"{experts}.{e}.gate_proj.weight" for e in local] + [f"{experts}.{e}.up_proj.weight" for e in local]),
+            f"{dst}.down_weight": (scaled if not self.fp8_experts else list)(
+                [f"{experts}.{e}.down_proj.weight" for e in local]),
+            **(experts_fp8.scale_mappings(experts, local, dst) if self.fp8_experts else {}),
             f"{dst}.shared.gate_up_weight": scaled([f"{mlp}.shared_mlp.gate_proj.weight",
                                                     f"{mlp}.shared_mlp.up_proj.weight"]),
             f"{dst}.shared.down_weight": scaled([f"{mlp}.shared_mlp.down_proj.weight"]),

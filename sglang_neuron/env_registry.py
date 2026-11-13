@@ -27,6 +27,8 @@ KNOBS: dict = {
     "SGLANG_NEURON_GPT_OSS_EXPERTS": CONFIG,
     # Hy3's FP8 KV scale profile (models/hy_v3/kv_scales.py)
     "SGLANG_NEURON_HY3_KV_SCALES": CONFIG,
+    # Hy3's routed expert format: fp8 (the checkpoint's) or bf16 (models/hy_v3/experts_fp8.py)
+    "SGLANG_NEURON_HY3_EXPERTS": CONFIG,
     # Hy3's block-sparse decode under DCP: the fraction of a decode table's pages a step attends to (models/hy_v3/sparse.py)
     "SGLANG_NEURON_HY3_SPARSE_DECODE": CONFIG,
     # GLM-5.2 (models/glm52): the decode's weight store, the prefill's MTP rows for a drafting decode, the decode
