@@ -108,8 +108,8 @@ RUN --mount=type=bind,from=torch-neuronx,target=/torch-neuronx \
     python3 -m pip install --quiet --no-cache-dir --no-deps "$1"
 # SGLang's runtime dependencies in the base's own Python (DLC users run plain `python`): exactly the files
 # docker/requirements-lock.txt names, by sha256, with nothing resolved at build time (docker/lock_requirements.sh writes
-# it from SGLang's runtime set and SGLang Diffusion's packages, docker/diffusion-requirements.txt). torch and
-# torch-neuronx are not touched.
+# it from SGLang's runtime set, SGLang Diffusion's packages, docker/diffusion-requirements.txt, and the PD transfer
+# packages, docker/pd-requirements.txt). torch and torch-neuronx are not touched.
 RUN --mount=type=bind,source=docker/requirements-lock.txt,target=/tmp/requirements-lock.txt \
     --mount=type=tmpfs,target=/root/.cache \
     python3 -m pip install --quiet --no-cache-dir --no-deps --require-hashes -r /tmp/requirements-lock.txt

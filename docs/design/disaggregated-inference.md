@@ -437,6 +437,40 @@ notifications that ride on them. SGLang's transfers carry no notification: the p
 from its own handles and reports it in `KV_STATUS` over ZMQ. Two ends that disagree on the setting fall back to slower
 emulated writes without an error, which is why the platform fixes it on both roles.
 
+## Mooncake over EFA
+
+`--disaggregation-transfer-backend mooncake` moves the KV with SGLang's own `MooncakeKVManager` over Mooncake's EFA
+transport (`sglang_neuron/disaggregation/mooncake.py`). Mooncake's transfer engine (mooncake-transfer-engine-non-cuda
+0.3.14 or later) recognizes Neuron HBM by its `/dev/neuron<N>` mapping and registers it with libfabric as
+`FI_HMEM_NEURON`, so the prefill writes each page from its HBM into the decode's HBM, as NIXL's LIBFABRIC backend does.
+Both servers need the package installed (`pip install mooncake-transfer-engine-non-cuda==0.3.14`); the image's
+`LD_LIBRARY_PATH` already puts `/opt/aws/neuron/lib` and the EFA libfabric first, which libfabric needs to load its
+Neuron HMEM support.
+
+The platform sets `MOONCAKE_PROTOCOL=efa` (SGLang's default is `rdma`) and refuses another value and `MC_FORCE_TCP=1`:
+EFA is the only Mooncake transport that reads Neuron HBM. Mooncake finds the node's EFA devices itself;
+`--disaggregation-ib-device` passes a list of them through.
+
+The plugin's other PD patches wrap `NixlKVManager`, so a Mooncake launch is served only where upstream's own transfer is
+correct for the Neuron pools, and refused at launch otherwise:
+
+- the models: Qwen3, Qwen3-MoE and GLM-4 (one MHA pool of head-major pages, paired positionally between peers);
+- no `--pp-size` above 1, `--dcp-size` above 1, `--attn-cp-size` above 1, declared decode layout, giga-kernel decode or
+  kernel-cache hand-off;
+- no `SGLANG_DISAGG_STAGING_BUFFER` (a CUDA buffer).
+
+A prefill and a decode must also run the same attention TP. Upstream's head-slice transfer, which pairs peers of
+different attention TP, cuts each page into token rows, but a Neuron page is head-major; the prefill learns its
+decode's TP only when the decode registers, so it fails each room for such a decode with an error that names both TP
+sizes.
+
+```bash
+# on both nodes, the same model flags as the NIXL launch, then the role's
+python3 -m sglang.launch_server --model-path /models/Qwen3-30B-A3B --tp-size 4 --ep-size 4 ... \
+  --disaggregation-mode prefill --disaggregation-transfer-backend mooncake --disaggregation-bootstrap-port 8998 \
+  --host <prefill node> --port 30000
+```
+
 ## Routing and balancing
 
 ### The load balancer
@@ -837,7 +871,7 @@ environment also with `SGLANG_PLATFORM=neuron` and the NIXL overlay first on `PY
 | Setting | Prefill | Decode |
 |---|---|---|
 | `--disaggregation-mode` | `prefill` | `decode` |
-| `--disaggregation-transfer-backend` | `nixl`, the only backend the platform accepts (SGLang's default is `mooncake`) | `nixl`, or `fake` for a decode measured alone |
+| `--disaggregation-transfer-backend` | `nixl` (SGLang's default is `mooncake`, which the platform serves for the models [Mooncake over EFA](#mooncake-over-efa) lists) | the prefill's backend, or `fake` for a decode measured alone |
 | `--disaggregation-bootstrap-port` | where its bootstrap server listens, 8998 by default | each request carries its prefill's port (`bootstrap_port`); pass the same flag to both roles |
 | `--dp-size` | its replicas, each its own TP world | its DP-attention replicas, with `--enable-dp-attention` |
 | `--host`, `--port` | an address the decode node reaches; the bootstrap server listens on the same host | the server's own |
@@ -1004,7 +1038,8 @@ The rest of a model's onboarding is in [Onboarding a model](../model-dev/onboard
 - SGLang's other PD options are not refused at launch and are not tested: `--enable-pd-role-switch`,
   `--disaggregation-enable-kv-checksum`, `--optimistic-prefill-attempts` above 0, and
   `--disaggregation-decode-enable-offload-kvcache` (the Neuron pools refuse a host copy only when one is made).
-- NIXL is the only transfer backend, and LIBFABRIC its only backend; both servers must run the NIXL overlay.
+- NIXL is the transfer backend of every model, LIBFABRIC its only backend, and both servers must run the NIXL overlay;
+  Mooncake serves only the layouts [Mooncake over EFA](#mooncake-over-efa) lists.
 - A prefill pairs only with decodes running the plugin, and a decode only with such prefills; between different
   attention-TP sizes, only with equal per-head page bytes.
 - The decode has no hierarchical cache unless its model's catalog entry opts it in (Qwen3.5, with

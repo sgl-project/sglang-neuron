@@ -17,6 +17,7 @@ It checks:
 4. the NIXL this image imports is the patched build (tools/build_nixl.sh): one NIXL, the plugin's own launch rule
    passes, the LIBFABRIC plugin a NIXL agent loads carries patches/nixl/0009 (distributed/pp_seam.py), and the PD
    launch's NIXL hook wraps that binding;
+   Mooncake's transfer engine is docker/pd-requirements.txt's release and imports beside torch-neuronx;
 5. every installed requirement holds but the two known ones (PIP_CHECK_KNOWN), and SGLang's runtime set holds;
 6. SGLang's serving modules import, SGLang Diffusion's and the plugin's diffusion pipelines included
    (tools/import_sglang_entrypoints.py --diffusion);
@@ -251,6 +252,28 @@ def nixl() -> None:
           api.__file__)
 
 
+def mooncake() -> None:
+    """Mooncake's transfer engine (docker/pd-requirements.txt) is the pinned release, imports beside torch-neuronx, and
+    the plugin's Mooncake launch rule finds what it needs (disaggregation/mooncake.py)."""
+    want = next(line.split("==", 1) for line in (Path(__file__).parent / "pd-requirements.txt").read_text().splitlines()
+                if line.startswith("mooncake-transfer-engine-non-cuda=="))
+    try:
+        have = md.version(want[0])
+    except md.PackageNotFoundError:
+        have = None
+    check(f"{want[0]} is {want[1]}", have == want[1], have)
+    import torch  # noqa: F401  (torch-neuronx loads first, as in a rank)
+
+    from mooncake.engine import TransferEngine
+
+    check("Mooncake's TransferEngine imports beside torch-neuronx",
+          callable(getattr(TransferEngine, "initialize", None)))
+    from sglang_neuron.disaggregation.mooncake import NEURON_LIB_DIR
+
+    check(f"LD_LIBRARY_PATH has {NEURON_LIB_DIR} (libfabric's Neuron HMEM support)",
+          NEURON_LIB_DIR in os.environ.get("LD_LIBRARY_PATH", "").split(":"), os.environ.get("LD_LIBRARY_PATH", ""))
+
+
 def requirements(runtime_requirements: Path) -> None:
     """Every installed distribution's requirements hold but PIP_CHECK_KNOWN's, and SGLang's runtime set
     (tools/sglang_runtime_requirements.py) holds in their place."""
@@ -317,6 +340,7 @@ def main() -> int:
         section("the repository copy's sglang_neuron/", public_repo_package, root)
     section("the torch / torch-neuronx source pins", source_pins)
     section("the patched NIXL", nixl)
+    section("Mooncake's transfer engine", mooncake)
     section("the requirements", requirements, args.runtime_requirements)
     section("the environment", environment)
     run_tool("SGLang's serving modules import",
