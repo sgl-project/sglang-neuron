@@ -87,8 +87,8 @@ class SparseState(nn.Module):
         """The layer's summaries for its cache, one tensor for both graphs of an aggregated server."""
         key = (name, k_cache.data_ptr())
         if key not in _SUMMARIES:
-            _SUMMARIES[key] = torch.full((k_cache.shape[0], 2, self.head_dim), _EMPTY, dtype=torch.bfloat16,
-                                         device=k_cache.device)
+            empty = torch.tensor([_EMPTY, -_EMPTY], dtype=torch.bfloat16).view(1, 2, 1)
+            _SUMMARIES[key] = empty.expand(k_cache.shape[0], 2, self.head_dim).contiguous().to(k_cache.device)
         self.summary = _SUMMARIES[key]
 
     def query(self, x: torch.Tensor, positions: torch.Tensor) -> torch.Tensor:
