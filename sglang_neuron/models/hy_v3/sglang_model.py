@@ -14,6 +14,7 @@ import torch
 from torch import nn
 
 from sglang_neuron.models.host import ModelHost
+from sglang_neuron.models.hy_v3 import sparse
 from sglang_neuron.models.hy_v3.attention import DcpDecodeInputs, Fp8Attention, dcp_group
 from sglang_neuron.models.hy_v3.fp8 import dequantizing, with_scales
 from sglang_neuron.models.hy_v3.kv_scales import load_kv_scales
@@ -122,6 +123,8 @@ class HyV3Graph(Qwen3MoeGraph):
             # the MoE blocks wrap their own loaders
             for layer in self.layers:
                 params = [layer.self_attn.qkv_weight, layer.self_attn.o_weight]
+                if getattr(layer.self_attn, "sparse", None) is not None:
+                    params.append(layer.self_attn.sparse.wq)
                 if isinstance(layer.mlp, ShardedMLP):
                     params += [layer.mlp.gate_up_weight, layer.mlp.down_weight]
                 for p in params:
@@ -137,6 +140,12 @@ class HyV3Graph(Qwen3MoeGraph):
 
     def hf_weight_mappings(self) -> dict:
         mappings = super().hf_weight_mappings()
+        for i, layer in enumerate(self.layers):
+            if getattr(layer.self_attn, "sparse", None) is not None:
+                attn = f"model.layers.{i}.self_attn"
+                q = [f"{attn}.q_proj.weight"]
+                mappings[f"layers.{i}.self_attn.sparse.wq"] = with_scales(q) if self.fp8 else q
+                mappings[f"layers.{i}.self_attn.sparse.q_norm"] = f"{attn}.q_norm.weight"
         if self.fp8:
             for i in range(len(self.layers)):
                 for name in ("qkv_weight", "o_weight"):
@@ -150,6 +159,10 @@ class HyV3Graph(Qwen3MoeGraph):
         for every layer (attention.DcpDecodeInputs)."""
         attn = self.layers[0].self_attn
         if self.phase != "decode" or getattr(attn, "dcp_size", 1) == 1:
+            if getattr(attn, "sparse", None) is not None:
+                # the sparse summaries of a prefill chunk need the request's length so far
+                end = (positions.max() + 1).reshape(1)
+                attn_metadata = {k: dict(v, positions_end=end) for k, v in attn_metadata.items()}
             return super().forward(input_ids, positions, attn_metadata, sampling_positions, rank)
         from sglang_neuron.models.gpt_oss.attention_masks import decode_attention_masks
 
@@ -157,14 +170,22 @@ class HyV3Graph(Qwen3MoeGraph):
         rows = md["block_table_tensor"].shape[0]
         _, mask = decode_attention_masks(attn_metadata, positions, sliding_window=0,
                                          q_heads=attn.num_heads * attn.dcp_size, swa_layer=None, full_layer=attn.name)
-        inputs = DcpDecodeInputs(table=md["block_table_tensor"].to(torch.int32),
-                                 update_idx=md["slot_mapping"].view(rows, 1).to(torch.uint32), mask=mask)
+        table = md["block_table_tensor"].to(torch.int32)
+        inputs = DcpDecodeInputs(table=table, update_idx=md["slot_mapping"].view(rows, 1).to(torch.uint32), mask=mask,
+                                 owner=md["dcp_active_owner"], local_prior=md["dcp_kv_end"].view(rows),
+                                 positions=positions, n_keep=sparse.kept_pages(table.shape[1]))
         hidden = self.embed_tokens(input_ids, scatter_tokens=False, rank=rank)
         cos, sin = self.rotary_emb(positions)
         for layer in self.layers:
             hidden = layer(hidden, lambda x, a=layer.self_attn: a.decode(x, cos, sin, inputs))
         hidden = self.norm(hidden.index_select(0, sampling_positions))
         return self.lm_head(hidden)
+
+    def bind_kv_cache(self, kv_caches: dict) -> None:
+        super().bind_kv_cache(kv_caches)
+        for layer in self.layers:
+            if getattr(layer.self_attn, "sparse", None) is not None:
+                layer.self_attn.sparse.bind(layer.self_attn.name, layer.self_attn.k_cache)
 
     def load_weights(self, checkpoint_path: str, device: torch.device) -> None:
         super().load_weights(checkpoint_path, device)

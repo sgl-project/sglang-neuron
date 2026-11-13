@@ -36,6 +36,8 @@ from nkilib.experimental.transformer.attention_block_tkg import attention_block_
 import nki.language as nl
 
 import sglang_neuron.ops as NF
+from sglang_neuron.models.hy_v3 import sparse
+from sglang_neuron.ops.attention.attention_decode_mask import gen_attention_decode_mask
 from sglang_neuron.backend.stack import resolve_full_mesh, wrap_nki
 from sglang_neuron.ops.attention.attention_decode import dcp_collective_mode
 from sglang_neuron.models.transformer.model import Attention
@@ -44,6 +46,7 @@ from sglang_neuron.parallel import collectives as neuron_collectives
 from sglang_neuron.parallel import groups
 from sglang_neuron.utils.dtype_utils import FP8_CLAMP_MAX
 from sglang_neuron.utils.hardware_config import get_logical_nc_config
+from sglang_neuron.utils.weight_loader import SafetensorsWeightLoader, set_weight_loader
 
 
 @nki.jit
@@ -115,11 +118,20 @@ def _prefill_kv_parallel(q, k_cache, v_cache, block_tables, kvp_q_offset, kvp_ra
 class DcpDecodeInputs:
     """A DCP decode step's kernel inputs, shared by every layer: ``table`` [B, blocks] int32 virtual pages, ``update_idx``
     [B, 1] uint32 this rank's slot of each row's token (the reserved slot where another rank keeps it) and ``mask`` the
-    group's decode mask (models/gpt_oss/attention_masks.decode_attention_masks)."""
+    group's decode mask (models/gpt_oss/attention_masks.decode_attention_masks). For sparse decode (sparse.py):
+    ``owner`` [B] the rows whose token this rank keeps, ``local_prior`` [B] the prior tokens it keeps, ``positions``
+    [B], ``n_keep`` the pages a sparse step keeps (``table``'s width: dense), and the current selection
+    (``sparse_table``, ``sparse_mask``), which a selecting layer sets for the layers after it."""
 
     table: torch.Tensor
     update_idx: torch.Tensor
     mask: torch.Tensor
+    owner: torch.Tensor = None
+    local_prior: torch.Tensor = None
+    positions: torch.Tensor = None
+    n_keep: int = 0
+    sparse_table: torch.Tensor = None
+    sparse_mask: torch.Tensor = None
 
 
 def dcp_group():
@@ -140,6 +152,13 @@ class Fp8Attention(Attention):
         self.dcp_size = 1 if self.dcp_group is None else self.dcp_group.world_size
         if self.dcp_size > 1 and self.num_kv_heads != 1:
             raise ValueError(f"Hy3's DCP attention runs one KV head per rank, not {self.num_kv_heads}")
+        self.sparse = (sparse.SparseState(config.hidden_size, self.num_heads, self.head_dim, config.rms_norm_eps,
+                                          config.rope_theta)
+                       if sparse.enabled() and self.dcp_size > 1 else None)
+        if self.sparse is not None:
+            rows = self.num_heads * self.head_dim
+            set_weight_loader(self.sparse.wq, SafetensorsWeightLoader(
+                transform=lambda slices, rank: slices[0][rank * rows:(rank + 1) * rows].t()))
 
     def set_kv_scales(self, k_scale: float, v_scale: float) -> None:
         self.k_scale_float, self.v_scale_float = float(k_scale), float(v_scale)
@@ -187,6 +206,8 @@ class Fp8Attention(Attention):
         cached = md["cached_seq_len"].to(torch.int32).reshape(1, 1)
         table = md["block_table_tensor"].to(torch.int32)
         table = torch.where(table < 0, torch.zeros_like(table), table)
+        if self.sparse is not None:
+            self._refresh_prefill(k_cache, table[0], cached, md, page, tokens)
         out = wrap_nki(_prefill_kv_parallel)[get_logical_nc_config()](
             q, k_cache=k_cache, v_cache=v_cache, block_tables=table[:1], kvp_q_offset=cached,
             kvp_rank_id=self.dcp_group.rank_in_group_tensor.to(torch.int32).reshape(1, 1),
@@ -199,18 +220,56 @@ class Fp8Attention(Attention):
         out = out.transpose(0, 1).reshape(tokens, -1) @ self.o_weight
         return neuron_collectives.all_reduce(self.attn_tp_group, out)
 
+    def _refresh_prefill(self, k_cache, table, cached, md, page, tokens):
+        """The summaries of this rank's pages the chunk wrote: local pages from cached / D on, filled up to this rank's
+        share of the request's length so far (the chunk's last real position + 1)."""
+        size = self.dcp_size
+        rank = self.dcp_group.rank_in_group_tensor
+        first = torch.div(cached.reshape(-1)[0].to(torch.int64), size * page, rounding_mode="floor")
+        end = sparse.local_count(md["positions_end"], size, rank, page)
+        idx = first + torch.arange(tokens // (size * page) + 1, device=table.device, dtype=torch.int64)
+        valid = torch.clamp(end - idx * page, min=0, max=page)
+        width = table.shape[0]
+        blocks = torch.where((idx < width) & (valid > 0), table.to(torch.int64)[torch.clamp(idx, max=width - 1)],
+                             torch.full_like(idx, -1))
+        self.sparse.refresh(k_cache, blocks, valid)
+
+    def _sparse_inputs(self, x, inputs: DcpDecodeInputs) -> tuple:
+        """(table, mask) of this layer's decode: the step's selection, made here on a selecting layer."""
+        if self.sparse is None or inputs.n_keep >= inputs.table.shape[1]:
+            return inputs.table, inputs.mask
+        if self.layer_idx % sparse.SELECT_EVERY == 0 or inputs.sparse_table is None:
+            page = self.k_cache.shape[2] * 2
+            bound = sparse.scores(self.sparse, x, inputs.positions, inputs.table, self.dcp_group)
+            kept, prior = sparse.compact(bound, inputs.table, inputs.local_prior, page, inputs.n_keep)
+            rows = kept.shape[0]
+            inputs.sparse_table = kept
+            inputs.sparse_mask = gen_attention_decode_mask(
+                prior.reshape(1, rows).to(torch.float32), bs=rows, q_head=self.num_heads * self.dcp_size, s_active=1,
+                s_prior=inputs.n_keep * page, block_len=page, active_gate=inputs.owner)
+        return inputs.sparse_table, inputs.sparse_mask
+
     def _decode_dcp(self, x, cos, sin, inputs: DcpDecodeInputs):
-        out, _, _ = wrap_nki(_decode_fp8_dcp)[get_logical_nc_config()](
+        table, mask = self._sparse_inputs(x, inputs)
+        out, k_written, _ = wrap_nki(_decode_fp8_dcp)[get_logical_nc_config()](
             x.unsqueeze(1), W_qkv=self.qkv_weight, q_norm=self.q_norm.weight.unsqueeze(0),
             k_norm=self.k_norm.weight.unsqueeze(0), norm_eps=self.norm_eps,
             cos=cos.t().unsqueeze(-1).contiguous(), sin=sin.t().unsqueeze(-1).contiguous(),
-            active_blocks_table=inputs.table, K_cache=self.k_cache, V_cache=self.v_cache,
-            attention_mask=inputs.mask, kv_cache_update_idx=inputs.update_idx,
+            active_blocks_table=table, K_cache=self.k_cache, V_cache=self.v_cache,
+            attention_mask=mask, kv_cache_update_idx=inputs.update_idx,
             softmax_scale=self.scaling * self.k_scale_float, W_out=self.o_weight * self.v_scale_float,
             k_scale=self._scale_tensor(1.0 / self.k_scale_float, 1, x.device).reshape(1, 1),
             v_scale=self._scale_tensor(1.0 / self.v_scale_float, 1, x.device).reshape(1, 1),
             dcp_size=self.dcp_size, dcp_mesh=self._mesh(), dcp_mode=dcp_collective_mode(self.dcp_size),
         )
+        if self.sparse is not None:
+            # the page the row's token landed in, on its owner (the full table's local page)
+            page = self.k_cache.shape[2] * 2
+            n = inputs.local_prior.to(torch.int64)
+            idx = torch.div(n, page, rounding_mode="floor").view(-1, 1)
+            blocks = inputs.table.to(torch.int64).gather(1, torch.clamp(idx, max=inputs.table.shape[1] - 1)).view(-1)
+            blocks = torch.where(inputs.owner.view(-1) > 0, blocks, torch.full_like(blocks, -1))
+            self.sparse.refresh(k_written, blocks, n - idx.view(-1) * page + 1)
         return neuron_collectives.all_reduce(self.attn_tp_group, out)
 
     def decode(self, x, cos, sin, inputs):
