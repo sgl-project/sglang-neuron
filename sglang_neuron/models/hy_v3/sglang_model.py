@@ -13,7 +13,9 @@ import torch
 from torch import nn
 
 from sglang_neuron.models.host import ModelHost
+from sglang_neuron.models.hy_v3.attention import Fp8Attention
 from sglang_neuron.models.hy_v3.fp8 import dequantizing, with_scales
+from sglang_neuron.models.hy_v3.kv_scales import load_kv_scales
 from sglang_neuron.models.hy_v3.moe import HyV3MoE
 from sglang_neuron.models.qwen3_moe.sglang_model import Qwen3MoeGraph
 from sglang_neuron.models.transformer.config import TransformerConfig, check_bf16_launch, rope_theta_of
@@ -104,10 +106,21 @@ class DenseMLP(MLP):
         return super().forward(x)
 
 
+def fp8_kv_cache() -> bool:
+    """Whether the launch's KV cache is FP8 (--kv-cache-dtype fp8_e4m3)."""
+    from sglang.srt.runtime_context import get_server_args
+
+    return str(getattr(get_server_args(), "kv_cache_dtype", "auto")).startswith("fp8")
+
+
 class HyV3Graph(Qwen3MoeGraph):
     def __init__(self, config: TransformerConfig, moe: HyV3MoEConfig, fp8: bool, phase: str):
         self.fp8 = fp8
         super().__init__(config, moe, phase)
+        self.fp8_kv = fp8_kv_cache()
+        if self.fp8_kv:
+            for i, layer in enumerate(self.layers):
+                layer.self_attn = Fp8Attention(config, i)
         if fp8:
             # the MoE blocks wrap their own loaders
             for layer in self.layers:
@@ -133,6 +146,12 @@ class HyV3Graph(Qwen3MoeGraph):
                     key = f"layers.{i}.self_attn.{name}"
                     mappings[key] = with_scales(mappings[key])
         return mappings
+
+    def load_weights(self, checkpoint_path: str, device: torch.device) -> None:
+        super().load_weights(checkpoint_path, device)
+        if self.fp8_kv:
+            for layer, (k, v) in zip(self.layers, load_kv_scales(checkpoint_path, len(self.layers))):
+                layer.self_attn.set_kv_scales(k, v)
 
     def mlp_weight_mappings(self, src: str, dst: str) -> dict:
         mlp = self.layers[int(dst.split(".")[1])].mlp
