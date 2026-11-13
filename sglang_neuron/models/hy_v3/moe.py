@@ -52,7 +52,7 @@ class HyV3MoE(SparseMoE):
                      + self._ep_rank_id().reshape(1) * self.num_local_experts)
             out = moe_experts_blockwise(x, gate_up=self.gate_up_weight, down=self.down_weight,
                                         affinities=affinities.index_select(1, local), top_k=self.top_k,
-                                        padding_mask=real)
+                                        padding_mask=real, reload_weights=True)
         else:
             out = moe_experts(x, gate_up=self.gate_up_weight, down=self.down_weight, affinities=affinities,
                               index=experts.to(torch.int32), rank_id=self._ep_rank_id())
