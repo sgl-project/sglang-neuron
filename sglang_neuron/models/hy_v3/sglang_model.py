@@ -207,10 +207,10 @@ class HYV3ForCausalLM(ModelHost):
         return HyV3Graph(*hy3_config(config), phase)
 
     def neuron_compiler_args(self, phase: str, default_args: list[str]) -> list[str]:
-        """An FP8 KV cache on Trn2 compiles its float8_e4m3fn tensors as Trn2's e4m3 (launch.py): a frontend option,
+        """FP8 experts or an FP8 KV cache on Trn2 compile their float8_e4m3fn tensors as Trn2's e4m3 (launch.py): a frontend option,
         passed through the hlo2tensorizer options."""
         args = super().neuron_compiler_args(phase, default_args)
-        if not (fp8_kv_cache() and os.environ.get(FP8_CAST) == "1"):
+        if os.environ.get(FP8_CAST) != "1":
             return args
         prefix = "--internal-hlo2tensorizer-options="
         for i, arg in enumerate(args):

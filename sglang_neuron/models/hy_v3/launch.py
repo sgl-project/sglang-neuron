@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 """Hy3's launch rules (catalog.ModelSpec.launch_hooks).
 
-An FP8 KV cache on a Trn2 target: its kernels compile ``float8_e4m3fn`` only as the target's own FP8 format
+FP8 experts or an FP8 KV cache on a Trn2 target: their kernels compile ``float8_e4m3fn`` only as the target's own FP8 format
 (``UNSAFE_FP8FNCAST=1``, NKI's legacy cast to Trn2's e4m3, whose clamp of 240 the KV scales and the platform's
 FP8_CLAMP_MAX are for); a Trn3 target has the format natively. A launch with an FP8 cache also needs a KV scale profile
 (kv_scales.py). Imports stay inside the functions: the launching process reads this module first."""
@@ -41,9 +41,10 @@ def launch_problems(server_args, checkpoint_config, environ=os.environ) -> list:
 def launch_settings(server_args) -> tuple:
     from sglang_neuron.models import catalog
 
-    if _fp8_kv(server_args) and _trn2():
-        return (catalog.LaunchSetting(FP8_CAST, "1", "the FP8 KV kernels compile float8_e4m3fn as Trn2's e4m3 "
-                                      "(clamp 240, the range of the KV scales)"),)
+    fp8_weights = catalog.checkpoint_quantization(server_args) == "fp8"
+    if (fp8_weights or _fp8_kv(server_args)) and _trn2():
+        return (catalog.LaunchSetting(FP8_CAST, "1", "the FP8 expert and KV kernels compile float8_e4m3fn as Trn2's "
+                                      "e4m3 (clamp 240: the experts are halved, the KV scales are for it)"),)
     return ()
 
 
