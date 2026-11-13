@@ -200,7 +200,8 @@ close to a cold prefill's but not bit-identical. Two other backends are availabl
 [The decode radix cache](docs/design/disaggregated-inference.md#the-decode-radix-cache) covers a PD decode with
 `--disaggregation-decode-enable-radix-cache`. HiCache can keep evicted prefixes in host memory
 (`--enable-hierarchical-cache`, see the [features guide](docs/guides/features-guide.md)) and in another node's DRAM
-([HiCache remote DRAM tier](docs/guides/hicache-remote-dram.md)).
+([HiCache remote DRAM tier](docs/guides/hicache-remote-dram.md)) or in a shared Mooncake Store pool
+([HiCache L3 on Mooncake Store](docs/guides/hicache-mooncake.md)).
 
 ### Parallelism and speculative decoding
 

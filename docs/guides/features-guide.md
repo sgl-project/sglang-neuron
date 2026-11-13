@@ -276,7 +276,8 @@ one that ends a prompt, so a prefix-cache hit still runs a compiled shape.
   above 1); the hierarchical cache on a decode server (served for a model whose catalog entry opts its decode in,
   Qwen3.5), pipelined or on `neuron-chunk` (both served for a model that keeps state checkpoints at chunk ends,
   Qwen3.5 and Kimi-K3), and with an L3 storage backend
-  (`--hicache-storage-backend`) other than the [remote DRAM tier](hicache-remote-dram.md). `--radix-cache-backend
+  (`--hicache-storage-backend`) other than the [remote DRAM tier](hicache-remote-dram.md) and
+  [Mooncake Store](hicache-mooncake.md). `--radix-cache-backend
   neuron-chunk` is refused on a decode without
   `--disaggregation-decode-enable-radix-cache` or with `--enable-streaming-session`, with `--disable-radix-cache`,
   `--enable-lmcache` or `--enable-flexkv`, and on DeepSeek-V2. Any other `--radix-cache-backend` but `kimi-prompt`
