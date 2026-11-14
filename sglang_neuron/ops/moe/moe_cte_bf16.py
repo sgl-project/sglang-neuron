@@ -34,6 +34,10 @@ BLOCK_SIZE = 128
 # torch path on a NeuronCore (trn3, LNC2): I 768 up to 8192 tokens; I 1408 and 1536 up to 2048, past which (4096
 # tokens) it returns NaN rows from about token 2600 on and garbage in others
 VALIDATED_SHAPES = ((768, 8192), (1536, 2048))
+# the same on trn2 (LNC2): I 768 up to 4096 tokens (Qwen3-30B-A3B at TP8 EP8 and Qwen3-235B-A22B at TP32 EP16 serve
+# right). I 1536 is wrong at every prefill tile: Qwen3-235B-A22B at TP32 EP32 answers garbage for one prompt of 800
+# tokens in the 1024 tile and of 512 in the 512 tile, and every later request on that server is garbage too.
+VALIDATED_SHAPES_TRN2 = ((768, 4096),)
 
 
 @nki.jit(mode="trace")
@@ -83,11 +87,32 @@ def moe_experts_blockwise(hidden: Tensor, *, gate_up: Tensor, down: Tensor, affi
     return out[:, 0]
 
 
+def _resolve_validated_shapes():
+    """The shapes validated on this launch's target: trn2's where it reports trn2, else trn3's (a CPU run included,
+    which takes the torch path)."""
+    from sglang_neuron.backend.stack import get_platform_target
+
+    try:
+        target = get_platform_target()
+    except (RuntimeError, ImportError):  # no runtime to ask: a CPU run
+        return VALIDATED_SHAPES
+    return VALIDATED_SHAPES_TRN2 if target.startswith("trn2") else VALIDATED_SHAPES
+
+
+# resolved once at import, as dtype_utils.FP8_CLAMP_MAX: the check runs while the prefill graph traces, where the
+# runtime's target query cannot be called
+_VALIDATED_ON_TARGET = _resolve_validated_shapes()
+
+
 def _check_validated(tokens: int, intermediate: int) -> None:
-    if not any(intermediate <= i and tokens <= t for i, t in VALIDATED_SHAPES):
+    shapes = _VALIDATED_ON_TARGET
+    if not any(intermediate <= i and tokens <= t for i, t in shapes):
+        smaller_shard = ("launch with more ranks per expert (a smaller --ep-size or a larger --tp-size) for a smaller "
+                         "shard")
+        fix = (smaller_shard if not any(intermediate <= i for i, _ in shapes)
+               else f"launch with a smaller --chunked-prefill-size, or {smaller_shard}")
         raise ValueError(f"the bf16 moe_cte kernel is not validated for {tokens} tokens of an expert intermediate "
-                         f"shard of {intermediate} (validated: {VALIDATED_SHAPES}); launch with a smaller "
-                         "--chunked-prefill-size")
+                         f"shard of {intermediate} (validated on this target: {shapes}); {fix}")
 
 
 @nki.jit(mode="trace")
