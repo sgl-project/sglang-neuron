@@ -3,8 +3,8 @@
 
 Each layer keeps, next to its FP8 cache, a summary of every local KV page: the per-dimension min and max of the page's
 K (quantized units: the layer's one K scale is positive, so it does not change the ranking). The prefill writes the
-summaries of the pages its chunk fills on this rank; every decode step refreshes the page its token lands in on the
-token's owner. Every ``SELECT_EVERY`` layers a decode step scores each row's local pages with the bound
+summaries of the pages its chunk fills on this rank; every decode step folds its token into the summary of the page
+it lands in, on the token's owner. Every ``SELECT_EVERY`` layers a decode step scores each row's local pages with the bound
 
     max_k q . k <= relu(q) . max + min(q, 0) . min
 
@@ -31,8 +31,10 @@ FRACTION = float(os.environ.get("SGLANG_NEURON_HY3_SPARSE_DECODE", "0") or 0)
 SELECT_EVERY = 4
 SINK_PAGES = 1
 RECENT_PAGES = 2
-# the kernel reads the packed FP8 K cache in tiles of 2 x LNC x P_MAX tokens: 4 pages of 128
-PAGE_QUANTUM = 4
+# the kept pages are whole quanta of 32 pages (4096 tokens): the kernel reads the packed FP8 K cache in tiles of
+# 2 x LNC x P_MAX tokens (4 pages), and a row of s_prior tokens in blocks of gcd(page, s_prior / 256), 16 at 4096
+# (runtime.LOCAL_ALIGN)
+PAGE_QUANTUM = 32
 _EMPTY = 3.0e38
 # (layer name, its K cache's address) -> the layer's summaries, shared by the prefill and decode graphs
 _SUMMARIES: dict = {}
@@ -106,6 +108,22 @@ class SparseState(nn.Module):
         blocks = torch.where(blocks < 0, torch.zeros_like(blocks), blocks).to(torch.int64)
         summ = page_summary(k_cache.index_select(0, blocks).squeeze(1), valid)
         self.summary.index_copy_(0, blocks, summ)
+
+    def add_token(self, k_cache: torch.Tensor, blocks: torch.Tensor, slot: torch.Tensor) -> None:
+        """Fold each row's decoded token, at ``slot`` [B] of local page ``blocks`` [B] (-1 for none), into its page's
+        summary: the page's min and max so far with the token's K, or the token's K alone at a page's first slot. It
+        reads the token's K row of the packed cache, not the page (refresh), which at a batch of 16 cost most of a
+        decode step."""
+        blocks = torch.where(blocks < 0, torch.zeros_like(blocks), blocks).to(torch.int64)
+        slot = slot.to(torch.int64)
+        half, d = k_cache.shape[2], k_cache.shape[3]
+        pairs = k_cache.reshape(-1, d, 2).index_select(0, blocks * half + torch.div(slot, 2, rounding_mode="floor"))
+        k = pairs.gather(2, (slot % 2).view(-1, 1, 1).expand(-1, d, 1)).squeeze(2).to(torch.float32)
+        old = self.summary.index_select(0, blocks).to(torch.float32)
+        first = (slot == 0).view(-1, 1)
+        kmin = torch.where(first, k, torch.minimum(old[:, 0], k))
+        kmax = torch.where(first, k, torch.maximum(old[:, 1], k))
+        self.summary.index_copy_(0, blocks, torch.stack([kmin, kmax], dim=1).to(torch.bfloat16))
 
 
 def scores(state: SparseState, x, positions, table, dcp_group) -> torch.Tensor:

@@ -206,6 +206,12 @@ class HYV3ForCausalLM(ModelHost):
     name = NAME
     decode_context_ladder = True
 
+    @property
+    def runtime_class(self):
+        from sglang_neuron.models.hy_v3.runtime import HyV3Runtime
+
+        return HyV3Runtime
+
     def check_launch(self, config) -> None:
         from sglang_neuron import sglang_tree
 

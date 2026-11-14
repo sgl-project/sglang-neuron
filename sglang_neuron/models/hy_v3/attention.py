@@ -269,7 +269,7 @@ class Fp8Attention(Attention):
             idx = torch.div(n, page, rounding_mode="floor").view(-1, 1)
             blocks = inputs.table.to(torch.int64).gather(1, torch.clamp(idx, max=inputs.table.shape[1] - 1)).view(-1)
             blocks = torch.where(inputs.owner.view(-1) > 0, blocks, torch.full_like(blocks, -1))
-            self.sparse.refresh(k_written, blocks, n - idx.view(-1) * page + 1)
+            self.sparse.add_token(k_written, blocks, n - idx.view(-1) * page)
         return neuron_collectives.all_reduce(self.attn_tp_group, out)
 
     def decode(self, x, cos, sin, inputs):
