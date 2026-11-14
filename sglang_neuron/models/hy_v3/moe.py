@@ -8,16 +8,16 @@ and scaled by router_scaling_factor. The shared expert is a SiLU-gated MLP on ev
 sharded over the attention TP; its partial output joins the routed experts' before the one all-reduce of the block.
 
 With the FP8 checkpoint the routed experts keep their per-tensor FP8 weights (experts_fp8.py): the decode runs
-nkilib's static-FP8 moe_tkg, and the prefill dequantizes this rank's experts in the graph for the bf16 moe_cte."""
+nkilib's static-FP8 moe_tkg, and the prefill nkilib's hybrid I-sharded moe_cte (experts_cte.py), which takes them as
+they are."""
 
 import torch
 from torch import nn
 
-from sglang_neuron.models.hy_v3 import experts_fp8
+from sglang_neuron.models.hy_v3 import experts_cte, experts_fp8
 from sglang_neuron.models.hy_v3.fp8 import dequantizing, with_scales
 from sglang_neuron.models.hy_v3.mlp import ShardedMLP
 from sglang_neuron.models.qwen3_moe.moe import SparseMoE
-from sglang_neuron.ops.moe.moe_cte_bf16 import moe_experts_blockwise
 from sglang_neuron.ops.moe.moe_tkg_bf16 import moe_experts
 from sglang_neuron.parallel import collectives as neuron_collectives
 from sglang_neuron.utils.weight_loader import get_weight_loader, set_weight_loader
@@ -61,10 +61,11 @@ class HyV3MoE(SparseMoE):
         if self.prefill:
             local = (torch.arange(self.num_local_experts, device=x.device, dtype=torch.int32)
                      + self._ep_rank_id().reshape(1) * self.num_local_experts)
-            gate_up, down = experts_fp8.bf16_weights(self) if self.fp8_experts else (self.gate_up_weight, self.down_weight)
-            out = moe_experts_blockwise(x, gate_up=gate_up, down=down,
-                                        affinities=affinities.index_select(1, local), top_k=self.top_k,
-                                        padding_mask=real, reload_weights=True)
+            if real is None:
+                real = torch.ones(x.shape[0], dtype=torch.bool, device=x.device)
+            scales = (self.gate_up_scale, self.down_scale) if self.fp8_experts else (None, None)
+            out = experts_cte.prefill_experts(x, self.gate_up_weight, self.down_weight,
+                                              affinities.index_select(1, local), self.top_k, real, *scales)
         elif self.fp8_experts:
             out = experts_fp8.decode_experts(self, x, affinities, experts.to(torch.int32))
         else:

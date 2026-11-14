@@ -8,7 +8,7 @@ activations do not clip at 240 (as the vllm-neuron port does). The tensors stay 
 compile as Trn2's e4m3 (launch.py).
 
 - decode: nkilib's moe_tkg in its static-FP8 mode, every local expert (``is_all_expert``) over up to 128 tokens a call;
-- prefill: the graph dequantizes this rank's experts (``bf16_weights``) for the bf16 moe_cte."""
+- prefill: nkilib's hybrid I-sharded moe_cte takes them as they are (experts_cte.py)."""
 
 import nki
 import torch
@@ -18,7 +18,6 @@ from torch import nn
 
 from sglang_neuron.backend.stack import wrap_nki
 from sglang_neuron.models.qwen3_moe.moe import _down_loader, _gate_up_loader
-from sglang_neuron.models.transformer.config import DTYPE
 from sglang_neuron.utils.hardware_config import get_logical_nc_config
 from sglang_neuron.utils.weight_loader import SafetensorsWeightLoader, set_weight_loader
 
@@ -90,14 +89,6 @@ def scale_mappings(experts: str, local, dst: str) -> dict:
         f"{dst}.gate_up_in_scale": keys("gate_proj", "input_scale") + keys("up_proj", "input_scale"),
         f"{dst}.down_in_scale": keys("down_proj", "input_scale"),
     }
-
-
-def bf16_weights(moe) -> tuple:
-    """This rank's experts dequantized, ``(gate_up [E_l, H, 2, I], down [E_l, I, H])`` in bf16, for the prefill."""
-    e = moe.num_local_experts
-    gate_up = moe.gate_up_weight.to(DTYPE) * moe.gate_up_scale.reshape(e, 1, 2, 1).to(DTYPE)
-    down = moe.down_weight.to(DTYPE) * moe.down_scale.reshape(e, 1, 1).to(DTYPE)
-    return gate_up, down
 
 
 @nki.jit
