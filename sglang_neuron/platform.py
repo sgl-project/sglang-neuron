@@ -69,14 +69,30 @@ def _storage_extra_config(server_args) -> dict:
     return config if isinstance(config, dict) else {}
 
 
+def _plugin_storage_backend(server_args) -> Optional[str]:
+    """The plugin's HiCache storage backend that --hicache-storage-backend dynamic names, or None: the remote DRAM
+    tier (mem_cache/remote_dram/backend.py) or Mooncake Store (mem_cache/mooncake_store.py). Both read and write the
+    Neuron host pool's layer-first pages themselves; SGLang's own backends read a page-first host buffer it lacks."""
+    from sglang_neuron.mem_cache import storage_tiers
+    from sglang_neuron.mem_cache.remote_dram import backend
+
+    if getattr(server_args, "hicache_storage_backend", None) != "dynamic":
+        return None
+    config = _storage_extra_config(server_args)
+    named = (config.get("backend_name"), config.get("module_path"), config.get("class_name"))
+    if named == (backend.BACKEND_NAME, backend.MODULE_PATH, backend.CLASS_NAME):
+        return backend.BACKEND_NAME
+    tier = storage_tiers.MOONCAKE
+    if named == (tier["backend_name"], tier["module_path"], tier["class_name"]):
+        return tier["backend_name"]
+    return None
+
+
 def _is_remote_dram(server_args) -> bool:
     """--hicache-storage-backend dynamic naming the remote DRAM backend (mem_cache/remote_dram/backend.py)."""
     from sglang_neuron.mem_cache.remote_dram import backend
 
-    config = _storage_extra_config(server_args)
-    return (getattr(server_args, "hicache_storage_backend", None) == "dynamic"
-            and config.get("backend_name") == backend.BACKEND_NAME
-            and config.get("module_path") == backend.MODULE_PATH and config.get("class_name") == backend.CLASS_NAME)
+    return _plugin_storage_backend(server_args) == backend.BACKEND_NAME
 
 
 def _unserved_speculative(server_args, spec=None) -> bool:
@@ -137,12 +153,13 @@ def refuse_unserved(server_args, spec=None) -> None:
         # torch-neuronx fixes the set of ranks when the runtime starts
         "--elastic-ep-backend / --elastic-ep-join-mode": bool(getattr(server_args, "elastic_ep_backend", None)
                                                               or getattr(server_args, "ep_join_mode", None)),
-        # HiCache's one storage tier is the remote DRAM backend (mem_cache/remote_dram); no host-pool retraction
-        # backup on a decode
-        "--hicache-storage-backend other than the remote DRAM tier": bool(
+        # HiCache's storage tiers are the plugin's own backends, which read the layer-first host pool: the remote DRAM
+        # tier (mem_cache/remote_dram) and Mooncake Store (mem_cache/mooncake_store); no host-pool retraction backup
+        # on a decode
+        "--hicache-storage-backend other than the remote DRAM tier or Mooncake Store (mem_cache/mooncake_store)": bool(
             getattr(server_args, "enable_hierarchical_cache", False)
             and getattr(server_args, "hicache_storage_backend", None)
-            and not _is_remote_dram(server_args)),
+            and _plugin_storage_backend(server_args) is None),
         # untested on a decode, whose only tree caches the KV its prefills sent; SGLang would still build the pinned
         # host pool and run its per-step TP-wide transfer check. A model whose pools build their own host tier opts its
         # decode in through its catalog entry's switch (ModelSpec.decode_hicache_env).
@@ -211,13 +228,14 @@ def resolve_hicache(server_args) -> None:
             logger.info("[neuron] --%s %s (was %s): the Neuron host pool's", name.replace("_", "-"), value,
                         getattr(server_args, name, None))
             setattr(server_args, name, value)
-    if getattr(server_args, "hicache_storage_backend", None) and _is_remote_dram(server_args):
+    tier = _plugin_storage_backend(server_args)
+    if tier is not None:
         # the backend moves host pages by host index itself (SGLang's batch_*_v1 interface)
         config = _storage_extra_config(server_args)
         if not config.get("interface_v1"):
             config["interface_v1"] = 1
             server_args.hicache_storage_backend_extra_config = json.dumps(config)
-            logger.info("[neuron] the remote DRAM tier reads and writes host pages itself: interface_v1 set")
+            logger.info("[neuron] the %s HiCache tier reads and writes host pages itself: interface_v1 set", tier)
 
 
 def check_kv_cache(server_args, architecture: str, spec) -> None:

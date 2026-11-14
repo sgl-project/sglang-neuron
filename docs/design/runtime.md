@@ -1314,7 +1314,8 @@ aggregated server; the forward that reads a load waits for it. On an aggregated 
 forward's batch back while the load runs and decodes the running batch meanwhile
 (`sglang_neuron/mem_cache/hicache_hold.py`; `SGLANG_NEURON_HICACHE_ASYNC_LOAD=0` turns it off). It is served on
 aggregated and prefill servers over the MHA pool, with one KV pool. It is refused with an L3 storage backend other than
-the remote DRAM tier (`--hicache-storage-backend`; [HiCache remote DRAM tier](../guides/hicache-remote-dram.md)). It is
+the remote DRAM tier and Mooncake Store (`--hicache-storage-backend`; [HiCache remote DRAM tier](../guides/hicache-remote-dram.md),
+[HiCache L3 on Mooncake Store](../guides/hicache-mooncake.md)). It is
 refused on a decode server, unless the model's catalog entry names a switch that opts its decode in
 (`ModelSpec.decode_hicache_env`; Qwen3.5's `SGLANG_NEURON_QWEN35_HICACHE`). It is refused with `--pp-size` above 1 and
 with `--radix-cache-backend neuron-chunk`, unless the model keeps chunk state checkpoints (Qwen3.5, Kimi-K3). Over a
