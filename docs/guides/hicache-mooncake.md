@@ -68,6 +68,23 @@ Qwen3-8B TP4 on one trn2.48xlarge, two servers (cores 0-3 and 4-7) attached to o
 An L3 hit reads 2,944 tokens of KV (about 100 MiB per rank on TP4) from the pool in a few milliseconds, far under
 the 105 ms it adds over a device hit; the rest is the load from the host pool to the device and its scheduling, the same path an L2 hit takes.
 
+InferenceX AgentX (agentx-harness 1.0.13, `semianalysis_cc_traces_weka_062126_256k`, concurrency 4, 900 s, every run
+`submission_valid`) on one server of Qwen3-30B-A3B-Instruct-2507, TP8 EP8, `--context-length 262144`,
+`--max-running-requests 4`, `SGLANG_NEURON_SAMPLER=topk_topp` (the model's sampling defaults), with the paged decode
+not passing `max_context_len` (sglang-neuron#4: the nkilib flash-attention early exit is wrong past 8K tokens). The
+three servers ran at the same time, each on its own two trn2 devices; HiCache L2 is `--hicache-ratio 2`:
+
+| HiCache | Requests | Output tok/s | Total tok/s | Interactivity p50 | TTFT p50 / p90 | ITL p50 | Prompt cache read |
+|---|---|---|---|---|---|---|---|
+| off | 77 | 50.66 | 3,936 | 15.41 | 24.4 s / 47.1 s | 64.9 ms | 89.3% |
+| L2 | 77 | 50.82 | 3,999 | 15.26 | 23.3 s / 47.9 s | 65.5 ms | 90.4% |
+| L2 + Mooncake L3 | 77 | 50.84 | 4,001 | 15.30 | 23.1 s / 47.8 s | 65.4 ms | 90.4% |
+
+The device pool (524K tokens) and the host pool hold this single server's working set: L2 serves 0.45 to 0.51 million
+prompt tokens (prefill computes 1.13 instead of 1.43 million), and L3 is written (9,151 pages) but never read. On one
+server the Mooncake tier costs nothing; it pays where the host pool cannot serve a prefix: another server of the same
+model (the cross-engine row above), a restart, or a working set beyond the host pool.
+
 ## Limits
 
 - The MHA host pool only (as the remote DRAM tier); the MLA / DSA host pools stay L2 only.
