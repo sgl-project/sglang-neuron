@@ -87,6 +87,7 @@ KNOBS: dict = {
     "SGLANG_NEURON_MAX_INFLIGHT_LAUNCHES": CONFIG,
     # no Neuron device: the CPU tests run the torch paths
     "SGLANG_NEURON_CPU_MODE": DEBUG,
+    "SGLANG_NEURON_PRECOMPILE": CONFIG,
     # diagnostics and profiling
     "SGLANG_NEURON_DEBUG_MESH": DEBUG,
     # GLM-5.2's logit test: teacher forcing and raw logits (models/glm52/logit_probe)
