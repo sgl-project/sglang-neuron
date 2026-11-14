@@ -5,8 +5,14 @@ token, the K/V write and the output projection in one call per layer.
 
 A rank may hold several KV heads. The cache is [pages, kv_heads, page, d], which the kernel reads as kv_heads blocks per
 page: a row's block table and its write slot are folded per KV head (``page * kv_heads + head``). The kernel masks the
-prior by position (``pos_ids``) over every block of the graph's table; ``max_context_len`` ends its loop early only on
-nkilib's flash-attention path, a prior above its 8K tile. On a CPU the torch path computes the same attention."""
+prior by position (``pos_ids``) over every block of the graph's table. On a CPU the torch path computes the same
+attention.
+
+``max_context_len`` is not passed. On nkilib's flash-attention path (a prior above its 8K tile) it ends the tile loop
+early after the tiles that hold the batch's longest context, but that dynamic early exit gives wrong attention: a
+decode whose context crosses 8K tokens on a long ``--context-length`` (Qwen3-30B-A3B-Instruct-2507 at 262,144, TP8)
+degenerates after its first token, and with the early exit off the output is right up to 240K tokens. Without it the
+kernel reads every tile of the graph's prior, which the decode context ladder bounds."""
 
 from dataclasses import dataclass
 
@@ -25,14 +31,13 @@ from sglang_neuron.utils.neuron_utils import can_run_kernel
 class PagedDecodeInputs:
     """A decode step's kernel inputs, shared by every layer: ``table`` [B, kv_heads, blocks] folded block ids (-1 for a
     block that starts at or after the row's new token), ``update_idx`` the new token's folded slot row per KV head
-    ([B, kv_heads, 1], or [B, 1] with one KV head, as the kernel takes them), ``pos_ids`` [B, 1] fp32 its position,
-    ``active_mask`` [1, B, q_heads, 1] and ``max_context`` [1] int32."""
+    ([B, kv_heads, 1], or [B, 1] with one KV head, as the kernel takes them), ``pos_ids`` [B, 1] fp32 its position and
+    ``active_mask`` [1, B, q_heads, 1]."""
 
     table: Tensor
     update_idx: Tensor
     pos_ids: Tensor
     active_mask: Tensor
-    max_context: Tensor
 
 
 def paged_decode_inputs(block_table: Tensor, slots: Tensor, positions: Tensor, *, kv_heads: int, q_heads: int,
@@ -56,14 +61,12 @@ def paged_decode_inputs(block_table: Tensor, slots: Tensor, positions: Tensor, *
         update_idx=(update.unsqueeze(-1) if kv_heads > 1 else update).to(torch.int32),
         pos_ids=positions.to(torch.float32).view(rows, 1),
         active_mask=torch.ones((1, rows, q_heads, 1), dtype=torch.uint8, device=block_table.device),
-        max_context=(positions.max() + 1).to(torch.int32).reshape(1),
     )
 
 
 @nki.jit
 def _attention_block_tkg(X, W_qkv, bias_qkv, q_norm, k_norm, norm_eps, cos, sin, active_blocks_table, K_cache,
-                         V_cache, attention_mask, kv_cache_update_idx, pos_ids, max_context_len, softmax_scale,
-                         W_out):
+                         V_cache, attention_mask, kv_cache_update_idx, pos_ids, softmax_scale, W_out):
     qk_norm = q_norm is not None
     return attention_block_tkg(
         X=X,
@@ -104,7 +107,6 @@ def _attention_block_tkg(X, W_qkv, bias_qkv, q_norm, k_norm, norm_eps, cos, sin,
         out_in_sb=False,
         softmax_scale=softmax_scale,
         pos_ids=pos_ids,
-        max_context_len=max_context_len,
     )
 
 
@@ -119,7 +121,7 @@ def attention_decode_paged(x: Tensor, *, w_qkv: Tensor, bias_qkv: Tensor | None,
     args = dict(W_qkv=w_qkv, bias_qkv=bias_qkv, q_norm=q_norm, k_norm=k_norm, norm_eps=norm_eps, cos=cos, sin=sin,
                 active_blocks_table=inputs.table, K_cache=k_cache, V_cache=v_cache,
                 attention_mask=inputs.active_mask, kv_cache_update_idx=inputs.update_idx, pos_ids=inputs.pos_ids,
-                max_context_len=inputs.max_context, softmax_scale=softmax_scale, W_out=w_out)
+                softmax_scale=softmax_scale, W_out=w_out)
     if not can_run_kernel(x):
         return _torch_attention_decode_paged(x, **args)
     out, _, _ = wrap_nki(_attention_block_tkg)[get_logical_nc_config()](x, **args)
@@ -132,11 +134,11 @@ def _rms(x: Tensor, gamma: Tensor, eps: float) -> Tensor:
 
 
 def _torch_attention_decode_paged(x, *, W_qkv, bias_qkv, q_norm, k_norm, norm_eps, cos, sin, active_blocks_table,
-                                  K_cache, V_cache, attention_mask, kv_cache_update_idx, pos_ids, max_context_len,
-                                  softmax_scale, W_out) -> Tensor:
+                                  K_cache, V_cache, attention_mask, kv_cache_update_idx, pos_ids, softmax_scale,
+                                  W_out) -> Tensor:
     """The kernel's result by plain attention over every block the table lists, keys masked by position. Static shapes
     and no ``.item()``, so it traces."""
-    del attention_mask, max_context_len  # the reference masks by position over every listed block
+    del attention_mask  # the reference masks by position over every listed block
     rows = x.shape[0]
     pages, kv_heads, page, d = K_cache.shape
     q_heads = W_out.shape[0] // d
