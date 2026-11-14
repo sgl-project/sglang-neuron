@@ -220,9 +220,6 @@ class HYV3ForCausalLM(ModelHost):
             if not fp8_kv_cache():
                 raise ValueError(f"{NAME}: --dcp-size {dcp} is served with the FP8 KV cache (--kv-cache-dtype fp8_e4m3)")
             validate_dcp_heads(NAME, dense.num_attention_heads, dense.num_key_value_heads, int(pc.tp_size), dcp)
-            # the KV-parallel prefill walks its chunk in segments of whole virtual pages (D blocks), so every prefill
-            # runs the whole chunk
-            self.prefill_ladder = False
 
     def build_graph(self, phase: str, config) -> nn.Module:
         return HyV3Graph(*hy3_config(config), phase)

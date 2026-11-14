@@ -38,6 +38,10 @@ VALIDATED_SHAPES = ((768, 8192), (1536, 2048))
 # right). I 1536 is wrong at every prefill tile: Qwen3-235B-A22B at TP32 EP32 answers garbage for one prompt of 800
 # tokens in the 1024 tile and of 512 in the 512 tile, and every later request on that server is garbage too.
 VALIDATED_SHAPES_TRN2 = ((768, 4096),)
+# the same with every block's weights reloaded (reload_weights): I 1536 matched up to 8192 tokens (trn2, LNC2), under
+# one hot expert, a 60/40 or 30/70 split and sparse random routing; the 4096-token NaN rows above come from the skipped
+# weight loads, which the reload replaces
+VALIDATED_RELOAD_SHAPES = ((1536, 8192),)
 
 
 def _moe_cte_bf16_kernel(skip_weight: bool):
@@ -100,7 +104,7 @@ def moe_experts_blockwise(hidden: Tensor, *, gate_up: Tensor, down: Tensor, affi
                       else padding_mask))
     if not can_run_kernel(hidden):
         return _torch_moe_experts_blockwise(hidden, gate_up, down, affinities, token_position_to_id, block_to_expert)
-    _check_validated(tokens, gate_up.shape[-1])
+    _check_validated(tokens, gate_up.shape[-1], reload_weights)
     out = wrap_nki(_moe_cte_bf16_reload if reload_weights else _moe_cte_bf16)[get_logical_nc_config()](
         hidden, affinities.to(hidden.dtype).reshape(-1, 1), gate_up, down, token_position_to_id,
         block_to_expert.reshape(-1, 1))
@@ -125,8 +129,8 @@ def _resolve_validated_shapes():
 _VALIDATED_ON_TARGET = _resolve_validated_shapes()
 
 
-def _check_validated(tokens: int, intermediate: int) -> None:
-    shapes = _VALIDATED_ON_TARGET
+def _check_validated(tokens: int, intermediate: int, reload_weights: bool = False) -> None:
+    shapes = _VALIDATED_ON_TARGET + (VALIDATED_RELOAD_SHAPES if reload_weights else ())
     if not any(intermediate <= i and tokens <= t for i, t in shapes):
         smaller_shard = ("launch with more ranks per expert (a smaller --ep-size or a larger --tp-size) for a smaller "
                          "shard")
