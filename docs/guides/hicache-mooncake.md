@@ -92,3 +92,8 @@ model (the cross-engine row above), a restart, or a working set beyond the host 
 - `clear()` does nothing: the pool is shared, so one rank's clear would drop pages other servers still serve. Remove a
   model's pages with the Mooncake master's tools.
 - Pages are shared only between servers of the same model and the same TP / PP / DP layout (the key carries the rank).
+- The tier sits under the L2 host pool, whose batched device-host copies have failed under long-context agentic load:
+  InferenceX AgentX at 256K context, Qwen3-30B-A3B-Instruct-2507 TP8 EP8 at concurrency 8 and 16 with
+  `--hicache-ratio 2`, and Qwen3-235B-A22B-Instruct-2507 TP64 EP32 at concurrency 8 (`ncdev_mem_buf_zerocopy64_batch:
+  batch zero-copy DMA failed ... -5`, `NDL batch copy (copyout) failed: -12`), each taking the server down. At TP64 the
+  four KV heads replicate on every rank, so `--hicache-ratio 2` also asks for about 1.6 TB of host memory.
