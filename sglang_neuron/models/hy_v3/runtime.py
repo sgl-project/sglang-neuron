@@ -10,8 +10,9 @@ decode step's KV comes in two-token DMAs. A share of whole ``LOCAL_ALIGN`` token
 Under NEURON_MTP every decode step is the MTP step: the worker's ``run_mtp_step`` builds the step's tables over the
 positions the device may reach (the host's length lags the device's by up to one step's tokens, and a step writes
 ``SPEC`` more), and the step's carry slots and control ride in the decode inputs (``mtp_row_slots``, ``mtp_ctrl``). The
-graph takes its tokens from its carry and returns each row's kept run at the decode width ([width, SPEC]), so the
-runtime keeps the width and neither assembles ids nor pads tokens."""
+graph takes its tokens from its carry, draws every span token with its row's sampling inputs, and returns each row's
+kept run at the decode width ([width, SPEC]), so the runtime keeps the width and neither assembles ids nor pads
+tokens."""
 
 import torch
 
@@ -67,6 +68,7 @@ class HyV3Runtime(NeuronModelRuntime):
         self._mtp_host = mtp_step.host_rows(batch, slots, fresh, bucket, self.mtp_num_slots)
         try:
             kwargs = self.build_model_inputs(md, token_ids=torch.zeros(n, dtype=torch.int32), bucket=bucket,
+                                             **self._sampling_kwargs(batch),
                                              context=self.buckets.decode_context(int(reach.max())))
             return self._run(kwargs, n_real=n, phase="decode")
         finally:
@@ -92,7 +94,4 @@ class HyV3Runtime(NeuronModelRuntime):
                 self.mtp_num_slots if t.dim() == 1 else 0)]) for t in host)
         dev = neuron_device()
         out["mtp_row_slots"], out["mtp_ctrl"] = row_slots.to(dev), ctrl.to(dev)
-        # the step samples in its own forward (greedy for now)
-        for name in ("sampling_temperatures", "sampling_seeds", "sampling_filters"):
-            out.pop(name, None)
         return out

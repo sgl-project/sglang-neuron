@@ -137,7 +137,10 @@ class HyV3Graph(Qwen3MoeGraph):
 
                 # the decode samples in its own forward: every step is the MTP step (mtp_step.py), whose carry is
                 # each request slot's next tokens and committed length, one more row for the padding rows
+                from sglang_neuron import sampling as neuron_sampling
+
                 self.samples_in_forward = True
+                self.sampler_modes = neuron_sampling.SAMPLER_MODES
                 self.mtp_slots = int(get_server_args().max_running_requests)
                 self.mtp_width = self.mtp_slots
                 self.register_buffer("mtp_carry", torch.zeros(self.mtp_slots + 1, mtp_step.SPEC, dtype=torch.int32))
@@ -209,14 +212,15 @@ class HyV3Graph(Qwen3MoeGraph):
 
     @torch.no_grad()
     def forward(self, input_ids, positions, attn_metadata, sampling_positions, rank, mtp_row_slots=None,
-                mtp_ctrl=None):
+                mtp_ctrl=None, sampling_temperatures=None, sampling_seeds=None, sampling_filters=None):
         """The dense core's forward; a DCP decode (an FP8 cache under --dcp-size) builds the group's decode mask once
         for every layer (attention.DcpDecodeInputs). Under NEURON_MTP the decode is the MTP step (mtp_step.py)."""
         attn = self.layers[0].self_attn
         if self.mtp is not None and self.phase == "prefill":
             return self._prefill_with_mtp(input_ids, positions, attn_metadata, sampling_positions, rank)
         if self.mtp is not None:
-            return self._mtp_decode(attn_metadata, rank, mtp_row_slots, mtp_ctrl)
+            return self._mtp_decode(attn_metadata, rank, mtp_row_slots, mtp_ctrl,
+                                    (sampling_temperatures, sampling_seeds, sampling_filters))
         if self.phase != "decode" or getattr(attn, "dcp_size", 1) == 1:
             if getattr(attn, "sparse", None) is not None:
                 # the sparse summaries of a prefill chunk need the request's length so far
@@ -254,7 +258,31 @@ class HyV3Graph(Qwen3MoeGraph):
         self.mtp.prefill(self, hidden, input_ids, positions, logits, attn_metadata, cos, sin, rank)
         return logits
 
-    def _mtp_decode(self, attn_metadata, rank, row_slots, ctrl):
+    def _span_sample(self, logits, positions, params, width: int, spec: int) -> torch.Tensor:
+        """[width, spec] the target's draw at each span token under its row's sampling parameters ``params``
+        (temperatures, seeds, filters [width] rows; the launch's sampler, greedy without them): each token's noise is
+        keyed by its row's seed and its position, as the decode without MTP draws."""
+        from sglang_neuron import sampling
+
+        temperatures, seeds, filters = params
+        mode = sampling.sampler_mode()
+        if mode == "greedy" or temperatures is None:
+            return self.greedy_token(logits).reshape(width, spec).to(torch.int64)
+        group = self.lm_head_tp_group
+        rank = group.rank_in_group_tensor
+        per_token = lambda t: t.reshape(width, 1, *t.shape[1:]).expand(width, spec, *t.shape[1:]).reshape(
+            width * spec, *t.shape[1:])
+        keys = sampling.noise_row_keys(per_token(seeds), positions.reshape(-1))
+        if mode == "topk_topp":
+            out = sampling.sample_filtered_sharded_logits(logits, group, rank, self.config.vocab_size,
+                                                          per_token(temperatures), keys, per_token(filters),
+                                                          top_logprobs=0)
+        else:
+            out = sampling.sample_sharded_logits(logits, group, rank, self.config.vocab_size,
+                                                 per_token(temperatures), keys, top_logprobs=0)
+        return out["token_ids"].reshape(width, spec).to(torch.int64)
+
+    def _mtp_decode(self, attn_metadata, rank, row_slots, ctrl, params):
         """One MTP step (mtp_step.py): ``{"token_ids": [width, SPEC]}`` int32, each row's kept run, -1 after it, at the
         decode width."""
         from sglang_neuron.models.hy_v3 import mtp_step
@@ -283,7 +311,7 @@ class HyV3Graph(Qwen3MoeGraph):
         for layer in self.layers:
             hidden = layer(hidden, lambda x, a=layer.self_attn: a.decode(x, cos, sin, inputs))
         normed = self.norm(hidden)
-        sampled = self.greedy_token(self.lm_head(normed)).reshape(width, spec).to(torch.int64)
+        sampled = self._span_sample(self.lm_head(normed), span["positions"], params, width, spec)
         out, kept = mtp_step.accept(span["tokens"], sampled, span)
         bonus = sampled.gather(1, kept.reshape(-1, 1))
         drafts = self._mtp_drafts(span, share, sampled, normed, kept, table, page, mask, inputs, cos, sin, rank)
