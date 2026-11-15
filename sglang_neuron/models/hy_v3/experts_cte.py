@@ -13,7 +13,8 @@ experts would build the mapping in torch; one never-chosen expert column pads it
 blocks (the pad gets none).
 
 FP8 experts (experts_fp8.py) go to the kernel as they are, with their per-tensor scales spread per channel; the
-kernel applies them after each matmul."""
+kernel applies them after each matmul. They run on its copy that feeds the FP8 tiles to the matmul directly
+(kernels/moe_cte_fp8w.py, kernels/PROVENANCE.md)."""
 
 import nki
 import nki.language as nl
@@ -24,6 +25,7 @@ from nkilib.core.moe.moe_cte.moe_cte import (ActFnType, ExpertAffinityScaleMode,
 from nkilib.core.moe.moe_cte.moe_cte import moe_cte as _nki_moe_cte
 
 from sglang_neuron.backend.stack import wrap_nki
+from sglang_neuron.models.hy_v3.kernels.moe_cte_fp8w import moe_cte_fp8w
 from sglang_neuron.ops.moe.moe_blockwise import build_blockwise_mapping
 from sglang_neuron.utils.hardware_config import get_logical_nc_config
 
@@ -64,7 +66,15 @@ def prefill_experts(x: torch.Tensor, gate_up: torch.Tensor, down: torch.Tensor, 
     if gate_up_scale is not None:
         gate_up_scale = gate_up_scale.float().expand(experts, 2, intermediate).reshape(experts, 1, 2 * intermediate)
         down_scale = down_scale.float().expand(experts, hidden).reshape(experts, 1, hidden)
-    out = wrap_nki(_moe_cte_hybrid)[get_logical_nc_config()](
-        x, affinities.to(x.dtype).reshape(-1, 1), gate_up, down, token_position_to_id,
-        block_to_expert.reshape(-1, 1), conditions, gate_up_scale, down_scale, num_static_block=experts)
+    masked = affinities.to(x.dtype).reshape(-1, 1)
+    if gate_up_scale is not None:
+        # FP8: the hybrid kernel's copy that feeds the FP8 weight tiles to the matmul as they are
+        # (kernels/moe_cte_fp8w.py; nkilib's copies each tile to bf16 first, most of the experts' time)
+        out = wrap_nki(moe_cte_fp8w)[get_logical_nc_config()](
+            conditions, x, masked, gate_up, down, token_position_to_id, block_to_expert.reshape(-1, 1),
+            gate_up_scale, down_scale, block_size=BLOCK_SIZE, num_static_block=experts, skip_token=True)
+    else:
+        out = wrap_nki(_moe_cte_hybrid)[get_logical_nc_config()](
+            x, masked, gate_up, down, token_position_to_id, block_to_expert.reshape(-1, 1), conditions, None, None,
+            num_static_block=experts)
     return (out[:, 0] if out.dim() == 3 else out)[:tokens]
