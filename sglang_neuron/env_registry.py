@@ -31,6 +31,8 @@ KNOBS: dict = {
     "SGLANG_NEURON_HY3_EXPERTS": CONFIG,
     # Hy3's block-sparse decode under DCP: the fraction of a decode table's pages a step attends to (models/hy_v3/sparse.py)
     "SGLANG_NEURON_HY3_SPARSE_DECODE": CONFIG,
+    # Hy3's decode MoE block in one kernel (models/hy_v3/moe_fused.py)
+    "SGLANG_NEURON_HY3_DECODE_MOE_FUSED": CONFIG,
     # GLM-5.2 (models/glm52): the decode's weight store, the prefill's MTP rows for a drafting decode, the decode
     # point, the benchmark's pinned MTP acceptance and the decode's FP8 attention weights
     "SGLANG_NEURON_GLM52_WEIGHT_STORE": CONFIG,

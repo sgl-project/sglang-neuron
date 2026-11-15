@@ -14,7 +14,7 @@ they are."""
 import torch
 from torch import nn
 
-from sglang_neuron.models.hy_v3 import experts_cte, experts_fp8
+from sglang_neuron.models.hy_v3 import experts_cte, experts_fp8, moe_fused
 from sglang_neuron.models.hy_v3.fp8 import dequantizing, with_scales
 from sglang_neuron.models.hy_v3.mlp import ShardedMLP
 from sglang_neuron.models.qwen3_moe.moe import SparseMoE
@@ -44,11 +44,17 @@ class HyV3MoE(SparseMoE):
         self.fp8_experts = fp8
         self.expert_bias = nn.Parameter(torch.empty(num_experts, dtype=torch.float32))
         self.shared = ShardedMLP(hidden_size, shared_intermediate_size)
+        self.shared_intermediate = shared_intermediate_size
+        self.fused = False
         if fp8:
             for p in (self.shared.gate_up_weight, self.shared.down_weight):
                 set_weight_loader(p, dequantizing(get_weight_loader(p)))
             if experts_fp8.enabled():
                 experts_fp8.make_fp8(self)
+                if moe_fused.enabled() and moe_fused.applies(self):
+                    # the decode's MoE block runs in one kernel (moe_fused.py)
+                    moe_fused.make(self)
+                    self.fused = not prefill
             else:
                 self.fp8_experts = False
                 for p in (self.gate_up_weight, self.down_weight):
@@ -74,6 +80,10 @@ class HyV3MoE(SparseMoE):
         out = out + self.shared.partial(x)
         return neuron_collectives.all_reduce(self.attn_tp_group, out)
 
+    def fused_decode(self, x, ln_w, eps):
+        """The decode block in one kernel (moe_fused.py) on the residual stream ``x`` (before the norm)."""
+        return neuron_collectives.all_reduce(self.attn_tp_group, moe_fused.decode(self, x, ln_w, eps))
+
     def weight_mappings(self, src: str, dst: str) -> dict:
         mlp, experts = f"{src}.mlp", f"{src}.mlp.experts"
         local = self.local_experts
@@ -89,4 +99,5 @@ class HyV3MoE(SparseMoE):
             f"{dst}.shared.gate_up_weight": scaled([f"{mlp}.shared_mlp.gate_proj.weight",
                                                     f"{mlp}.shared_mlp.up_proj.weight"]),
             f"{dst}.shared.down_weight": scaled([f"{mlp}.shared_mlp.down_proj.weight"]),
+            **(moe_fused.mappings(self, src, dst) if hasattr(self, "sh_scales") else {}),
         }

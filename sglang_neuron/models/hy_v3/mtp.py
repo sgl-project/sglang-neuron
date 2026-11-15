@@ -90,5 +90,5 @@ class HyV3Mtp(nn.Module):
         its KV under the target's DCP ``inputs``; returns its final-normed states [N, H]."""
         x = self.project(graph.embed_tokens(next_ids.to(torch.int32), scatter_tokens=False, rank=rank), prev,
                          positions)
-        x = self.layer(x, lambda h: self.attn.decode(h, cos, sin, inputs))
+        x = graph.decode_layer(self.layer, x, lambda h: self.attn.decode(h, cos, sin, inputs))
         return self.final_layernorm(x)

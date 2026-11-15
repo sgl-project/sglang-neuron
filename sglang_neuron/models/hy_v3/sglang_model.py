@@ -160,6 +160,16 @@ class HyV3Graph(Qwen3MoeGraph):
         """The target's decoder layers, then the MTP layer's under NEURON_MTP."""
         return [*self.layers, *([self.mtp.layer] if self.mtp is not None else [])]
 
+    @staticmethod
+    def decode_layer(layer, x, attention):
+        """A decoder layer's decode: its MoE block in one kernel where it has it (HyV3MoE.fused_decode), which takes the
+        residual stream before the norm."""
+        if not getattr(layer.mlp, "fused", False):
+            return layer(x, attention)
+        x = x + attention(layer.input_layernorm(x))
+        norm = layer.post_attention_layernorm
+        return x + layer.mlp.fused_decode(x, norm.weight, norm.eps)
+
     def greedy_token(self, logits: torch.Tensor) -> torch.Tensor:
         """The greedy token of each row of the LM head's ``logits`` (its vocabulary shard on the device sampler)."""
         from sglang_neuron import sampling
@@ -240,7 +250,7 @@ class HyV3Graph(Qwen3MoeGraph):
         hidden = self.embed_tokens(input_ids, scatter_tokens=False, rank=rank)
         cos, sin = self.rotary_emb(positions)
         for layer in self.layers:
-            hidden = layer(hidden, lambda x, a=layer.self_attn: a.decode(x, cos, sin, inputs))
+            hidden = self.decode_layer(layer, hidden, lambda x, a=layer.self_attn: a.decode(x, cos, sin, inputs))
         hidden = self.norm(hidden.index_select(0, sampling_positions))
         return self.lm_head(hidden)
 
@@ -309,7 +319,7 @@ class HyV3Graph(Qwen3MoeGraph):
         hidden = self.embed_tokens(span["tokens"].reshape(-1).to(torch.int32), scatter_tokens=False, rank=rank)
         cos, sin = self.rotary_emb(positions)
         for layer in self.layers:
-            hidden = layer(hidden, lambda x, a=layer.self_attn: a.decode(x, cos, sin, inputs))
+            hidden = self.decode_layer(layer, hidden, lambda x, a=layer.self_attn: a.decode(x, cos, sin, inputs))
         normed = self.norm(hidden)
         sampled = self._span_sample(self.lm_head(normed), span["positions"], params, width, spec)
         out, kept = mtp_step.accept(span["tokens"], sampled, span)
