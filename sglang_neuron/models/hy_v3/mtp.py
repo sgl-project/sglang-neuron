@@ -1,0 +1,84 @@
+# SPDX-License-Identifier: Apache-2.0
+"""Hy3's MTP layer (``num_nextn_predict_layers`` 1: ``model.layers.<num_hidden_layers>`` of the checkpoint), the draft
+of ``--speculative-algorithm NEURON_MTP``.
+
+One pass at position i predicts the token at i + 2 from the target's state at i and the token at i + 1:
+
+    h = eh_proj(cat(enorm(embed(t[i + 1])), hnorm(norm(h_i))))     h_i: the target's last layer output, norm its final norm
+    h = final_layernorm(decoder_layer(h));  logits = lm_head(h)
+
+with the target's embedding, final norm and LM head, and the embedding zeroed at position 0. The decoder layer is a
+target layer (attention, MoE and shared expert) at index ``num_hidden_layers``, so its attention is the KV pool's layer
+after the target's (the host sizes the pool one layer deeper). Its attention reads the whole table, never the
+block-sparse one: the draft only proposes, the target checks every token.
+
+The prefill writes the layer's KV over the chunk: the token after each position is the chunk's next input token, and
+after the chunk's last one the target's own greedy pick (the sampled token is not in the graph). That pick, and the
+chunk boundary of a long prompt, give the draft a slightly different state there, never a different output."""
+
+import torch
+from torch import nn
+
+from sglang_neuron.layers import ColumnParallelLinear
+from sglang_neuron.models.transformer.config import DTYPE
+from sglang_neuron.models.transformer.model import DecoderLayer, RMSNorm
+from sglang_neuron.parallel import groups
+from sglang_neuron.utils.weight_loader import SafetensorsWeightLoader, set_weight_loader
+
+
+def enabled() -> bool:
+    """Whether the launch serves NEURON_MTP (the decode verifies and drafts with this layer)."""
+    import os
+
+    from sglang.srt.runtime_context import get_server_args
+
+    from sglang_neuron.speculative.neuron_mtp import is_neuron_mtp
+
+    # TODO(mtp bring-up): HY3_MTP_TEST loads the layer and runs its prefill KV pass without the speculative worker
+    return os.environ.get("HY3_MTP_TEST") == "1" or is_neuron_mtp(getattr(get_server_args(), "speculative_algorithm",
+                                                                             None))
+
+
+class HyV3Mtp(nn.Module):
+    def __init__(self, config, layer: DecoderLayer):
+        super().__init__()
+        hidden = config.hidden_size
+        self.layer_idx = config.num_hidden_layers
+        self.enorm = RMSNorm(hidden, config.rms_norm_eps)
+        self.hnorm = RMSNorm(hidden, config.rms_norm_eps)
+        self.final_layernorm = RMSNorm(hidden, config.rms_norm_eps)
+        group = groups.get_neuron_attn_tp_group()
+        self.eh_proj = ColumnParallelLinear(2 * hidden, hidden, dtype=DTYPE, gather_output=True,
+                                            tp_group=group.device_group)
+        rows = self.eh_proj.out_features_per_rank
+        set_weight_loader(self.eh_proj.weight,
+                          SafetensorsWeightLoader(transform=lambda slices, rank: slices[0][rank * rows:(rank + 1) * rows]))
+        self.layer = layer
+
+    @property
+    def attn(self):
+        return self.layer.self_attn
+
+    def weight_mappings(self, layer_mappings: dict) -> dict:
+        """This layer's checkpoint keys; ``layer_mappings`` the decoder layer's, as the target's layer mappings give them
+        under ``mtp.layer``."""
+        src = f"model.layers.{self.layer_idx}"
+        return {"mtp.enorm.weight": f"{src}.enorm.weight", "mtp.hnorm.weight": f"{src}.hnorm.weight",
+                "mtp.final_layernorm.weight": f"{src}.final_layernorm.weight",
+                "mtp.eh_proj.weight": f"{src}.eh_proj.weight", **layer_mappings}
+
+    def project(self, embeds: torch.Tensor, target: torch.Tensor, positions: torch.Tensor) -> torch.Tensor:
+        """The decoder layer's input from the next tokens' embeddings and the target's normed states, [T, H]."""
+        embeds = embeds * (positions != 0).unsqueeze(-1).to(embeds.dtype)
+        return self.eh_proj(torch.cat([self.enorm(embeds), self.hnorm(target.to(embeds.dtype))], dim=-1))
+
+    def prefill(self, graph, hidden: torch.Tensor, input_ids: torch.Tensor, positions: torch.Tensor, logits,
+                attn_metadata: dict, cos, sin, rank) -> None:
+        """Write this layer's KV over a prefill chunk: ``hidden`` [T, H] the target's last layer output, ``logits`` the
+        target's at the sampling positions (its greedy pick follows the chunk's last token)."""
+        # the layer reads the target's tables and slots (the runtime builds metadata for the target's layers)
+        md = attn_metadata[graph.layers[0].self_attn.name]
+        pick = graph.greedy_token(logits).reshape(1).to(input_ids.dtype)
+        next_ids = torch.cat([input_ids[1:], pick])
+        x = self.project(graph.embed_tokens(next_ids, scatter_tokens=False, rank=rank), graph.norm(hidden), positions)
+        self.layer(x, lambda h: self.attn.prefill(h, cos, sin, md))

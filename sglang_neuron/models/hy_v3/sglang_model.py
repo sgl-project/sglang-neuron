@@ -4,8 +4,9 @@ Hy3's MoE (moe.py) in every layer after the first ``first_k_dense_replace`` dens
 
 Hy3's attention is the dense transformer's: GQA with a per-head RMSNorm of Q and K before a plain RoPE. With more
 attention-TP ranks than its 8 KV heads each KV head is replicated (models/transformer/weights.kv_rank). Every FP8
-linear weight is dequantized to bf16 as it loads (fp8.py); the graphs compute in bf16. The checkpoint's MTP layer
-(``num_nextn_predict_layers``) is not loaded."""
+linear weight is dequantized to bf16 as it loads (fp8.py); the graphs compute in bf16. Under
+``--speculative-algorithm NEURON_MTP`` the checkpoint's MTP layer (``num_nextn_predict_layers``) is loaded too (mtp.py)
+and the KV pool holds its layer after the target's."""
 
 import os
 from dataclasses import dataclass
@@ -14,7 +15,7 @@ import torch
 from torch import nn
 
 from sglang_neuron.models.host import ModelHost
-from sglang_neuron.models.hy_v3 import sparse
+from sglang_neuron.models.hy_v3 import mtp, sparse
 from sglang_neuron.models.hy_v3.attention import DcpDecodeInputs, Fp8Attention, dcp_group
 from sglang_neuron.models.hy_v3.fp8 import dequantizing, with_scales
 from sglang_neuron.models.hy_v3.kv_scales import load_kv_scales
@@ -23,6 +24,7 @@ from sglang_neuron.models.hy_v3.mlp import ShardedMLP
 from sglang_neuron.models.hy_v3.moe import HyV3MoE
 from sglang_neuron.models.qwen3_moe.sglang_model import Qwen3MoeGraph
 from sglang_neuron.models.transformer.config import TransformerConfig, check_bf16_launch, rope_theta_of
+from sglang_neuron.models.transformer.model import DecoderLayer
 from sglang_neuron.utils.weight_loader import get_weight_loader, set_weight_loader
 
 NAME = "Hy3"
@@ -119,9 +121,18 @@ class HyV3Graph(Qwen3MoeGraph):
         if self.fp8_kv:
             for i, layer in enumerate(self.layers):
                 layer.self_attn = Fp8Attention(config, i)
+        self.mtp = None
+        if mtp.enabled():
+            n = config.num_hidden_layers
+            layer = DecoderLayer(config, n, self.build_mlp(config, n))
+            if self.fp8_kv:
+                layer.self_attn = Fp8Attention(config, n)
+                # the draft attends densely (mtp.py)
+                layer.self_attn.sparse = None
+            self.mtp = mtp.HyV3Mtp(config, layer)
         if fp8:
             # the MoE blocks wrap their own loaders
-            for layer in self.layers:
+            for layer in self.decoder_layers():
                 params = [layer.self_attn.qkv_weight, layer.self_attn.o_weight]
                 if getattr(layer.self_attn, "sparse", None) is not None:
                     params.append(layer.self_attn.sparse.wq)
@@ -129,6 +140,20 @@ class HyV3Graph(Qwen3MoeGraph):
                     params += [layer.mlp.gate_up_weight, layer.mlp.down_weight]
                 for p in params:
                     set_weight_loader(p, dequantizing(get_weight_loader(p)))
+
+    def decoder_layers(self) -> list:
+        """The target's decoder layers, then the MTP layer's under NEURON_MTP."""
+        return [*self.layers, *([self.mtp.layer] if self.mtp is not None else [])]
+
+    def greedy_token(self, logits: torch.Tensor) -> torch.Tensor:
+        """The greedy token of each row of the LM head's ``logits`` (its vocabulary shard on the device sampler)."""
+        from sglang_neuron import sampling
+
+        if self.lm_head.gather_output:
+            return torch.argmax(logits, dim=-1).to(torch.int32)
+        group = self.lm_head_tp_group
+        return sampling.greedy_sharded_logits(logits, group, group.rank_in_group_tensor, self.config.vocab_size,
+                                              top_logprobs=0)["token_ids"]
 
     def build_mlp(self, config: TransformerConfig, layer_idx: int) -> nn.Module:
         if layer_idx < self.moe.first_k_dense_replace:
@@ -151,13 +176,32 @@ class HyV3Graph(Qwen3MoeGraph):
                 for name in ("qkv_weight", "o_weight"):
                     key = f"layers.{i}.self_attn.{name}"
                     mappings[key] = with_scales(mappings[key])
+        if self.mtp is not None:
+            mappings.update(self.mtp.weight_mappings(self._mtp_layer_mappings()))
         return mappings
+
+    def _mtp_layer_mappings(self) -> dict:
+        """The MTP decoder layer's checkpoint keys, as a target layer's (TransformerForCausalLM.hf_weight_mappings)."""
+        src, dst = f"model.layers.{self.mtp.layer_idx}", "mtp.layer"
+        attn = f"{src}.self_attn"
+        scaled = with_scales if self.fp8 else list
+        return {
+            f"{dst}.self_attn.qkv_weight": scaled([f"{attn}.{n}_proj.weight" for n in "qkv"]),
+            f"{dst}.self_attn.o_weight": scaled([f"{attn}.o_proj.weight"]),
+            f"{dst}.self_attn.q_norm.weight": f"{attn}.q_norm.weight",
+            f"{dst}.self_attn.k_norm.weight": f"{attn}.k_norm.weight",
+            f"{dst}.input_layernorm.weight": f"{src}.input_layernorm.weight",
+            f"{dst}.post_attention_layernorm.weight": f"{src}.post_attention_layernorm.weight",
+            **self.mtp.layer.mlp.weight_mappings(src, f"{dst}.mlp"),
+        }
 
     @torch.no_grad()
     def forward(self, input_ids, positions, attn_metadata, sampling_positions, rank):
         """The dense core's forward; a DCP decode (an FP8 cache under --dcp-size) builds the group's decode mask once
         for every layer (attention.DcpDecodeInputs)."""
         attn = self.layers[0].self_attn
+        if self.mtp is not None and self.phase == "prefill":
+            return self._prefill_with_mtp(input_ids, positions, attn_metadata, sampling_positions, rank)
         if self.phase != "decode" or getattr(attn, "dcp_size", 1) == 1:
             if getattr(attn, "sparse", None) is not None:
                 # the sparse summaries of a prefill chunk need the request's length so far
@@ -181,8 +225,32 @@ class HyV3Graph(Qwen3MoeGraph):
         hidden = self.norm(hidden.index_select(0, sampling_positions))
         return self.lm_head(hidden)
 
+    def _prefill_with_mtp(self, input_ids, positions, attn_metadata, sampling_positions, rank):
+        """The target's prefill (TransformerForCausalLM.forward), then the MTP layer's KV over the chunk."""
+        if getattr(self.layers[0].self_attn, "sparse", None) is not None:
+            end = (positions.max() + 1).reshape(1)
+            attn_metadata = {k: dict(v, positions_end=end) for k, v in attn_metadata.items()}
+        hidden = self.embed_tokens(input_ids, scatter_tokens=False, rank=rank)
+        cos, sin = self.rotary_emb(positions)
+        for layer in self.layers:
+            md = attn_metadata[layer.self_attn.name]
+            hidden = layer(hidden, lambda x, a=layer.self_attn, md=md: a.prefill(x, cos, sin, md))
+        logits = self.lm_head(self.norm(hidden.index_select(0, sampling_positions)))
+        self.mtp.prefill(self, hidden, input_ids, positions, logits, attn_metadata, cos, sin, rank)
+        return logits
+
+    def get_kv_spec(self):
+        spec = super().get_kv_spec()
+        if self.mtp is not None:
+            from sglang_neuron.mem_cache.kv_cache import KVSpec, LayerSpec
+
+            spec = KVSpec(layers=[*spec.layers, LayerSpec(name=self.mtp.attn.name)])
+        return spec
+
     def bind_kv_cache(self, kv_caches: dict) -> None:
         super().bind_kv_cache(kv_caches)
+        if self.mtp is not None:
+            self.mtp.attn.k_cache, self.mtp.attn.v_cache = kv_caches[self.mtp.attn.name]
         for layer in self.layers:
             if getattr(layer.self_attn, "sparse", None) is not None:
                 layer.self_attn.sparse.bind(layer.self_attn.name, layer.self_attn.k_cache)
@@ -190,7 +258,8 @@ class HyV3Graph(Qwen3MoeGraph):
     def load_weights(self, checkpoint_path: str, device: torch.device) -> None:
         super().load_weights(checkpoint_path, device)
         if self.fp8_kv:
-            for layer, (k, v) in zip(self.layers, load_kv_scales(checkpoint_path, len(self.layers))):
+            layers = self.decoder_layers()
+            for layer, (k, v) in zip(layers, load_kv_scales(checkpoint_path, len(layers))):
                 layer.self_attn.set_kv_scales(k, v)
 
     def mlp_weight_mappings(self, src: str, dst: str) -> dict:
@@ -205,6 +274,12 @@ class HyV3Graph(Qwen3MoeGraph):
 class HYV3ForCausalLM(ModelHost):
     name = NAME
     decode_context_ladder = True
+
+    def _set_stage(self, config) -> None:
+        super()._set_stage(config)
+        if mtp.enabled():
+            # the KV pool's layer after the target's is the MTP layer's (SGLang sizes the pool from end_layer)
+            self.end_layer += 1
 
     @property
     def runtime_class(self):
