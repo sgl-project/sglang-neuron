@@ -82,3 +82,13 @@ class HyV3Mtp(nn.Module):
         next_ids = torch.cat([input_ids[1:], pick])
         x = self.project(graph.embed_tokens(next_ids, scatter_tokens=False, rank=rank), graph.norm(hidden), positions)
         self.layer(x, lambda h: self.attn.prefill(h, cos, sin, md))
+
+    def decode(self, graph, next_ids: torch.Tensor, prev: torch.Tensor, positions: torch.Tensor, inputs, cos, sin,
+               rank) -> torch.Tensor:
+        """One decode pass of this layer over ``positions`` [N] (a step's span, or one recurrent draft a row): the next
+        tokens ``next_ids`` [N] with ``prev`` [N, H] the target's normed states (or the previous pass's output), into
+        its KV under the target's DCP ``inputs``; returns its final-normed states [N, H]."""
+        x = self.project(graph.embed_tokens(next_ids.to(torch.int32), scatter_tokens=False, rank=rank), prev,
+                         positions)
+        x = self.layer(x, lambda h: self.attn.decode(h, cos, sin, inputs))
+        return self.final_layernorm(x)

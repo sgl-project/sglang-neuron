@@ -282,16 +282,50 @@ class HyV3Graph(Qwen3MoeGraph):
         cos, sin = self.rotary_emb(positions)
         for layer in self.layers:
             hidden = layer(hidden, lambda x, a=layer.self_attn: a.decode(x, cos, sin, inputs))
-        sampled = self.greedy_token(self.lm_head(self.norm(hidden))).reshape(width, spec).to(torch.int64)
+        normed = self.norm(hidden)
+        sampled = self.greedy_token(self.lm_head(normed)).reshape(width, spec).to(torch.int64)
         out, kept = mtp_step.accept(span["tokens"], sampled, span)
         bonus = sampled.gather(1, kept.reshape(-1, 1))
-        # TODO(mtp): the MTP layer's drafts (mtp.py); none yet
-        drafts = torch.zeros(width, mtp_step.NUM_STEPS, dtype=torch.int64, device=bonus.device)
+        drafts = self._mtp_drafts(span, share, sampled, normed, kept, table, page, mask, inputs, cos, sin, rank)
         self.mtp_carry.index_copy_(0, slots, torch.cat([bonus, drafts], dim=1).to(torch.int32))
         self.mtp_len.index_copy_(0, slots, (span["base"] + kept + 1).to(torch.int32))
         if self.mtp_width > width:
             out = torch.cat([out, torch.full((self.mtp_width - width, spec), -1, dtype=out.dtype, device=out.device)])
         return {"token_ids": out.to(torch.int32)}
+
+    def _mtp_drafts(self, span, share, sampled, normed, kept, table, page, mask, inputs, cos, sin, rank):
+        """[W, NUM_STEPS] the MTP layer's drafts after each row's kept run (mtp.py): its pass over the span (the token
+        after each position is the target's sample there) writes its KV and gives the first draft at the row's last
+        kept position; each further draft is a one-token pass at the next position, from the previous draft and the
+        previous pass's state."""
+        from sglang_neuron.models.hy_v3 import mtp_step
+        from sglang_neuron.ops.attention.attention_decode_mask import gen_attention_decode_mask
+
+        width, spec = sampled.shape
+        attn = self.layers[0].self_attn
+        state = self.mtp.decode(self, sampled.reshape(-1), normed, span["positions"].reshape(-1), inputs, cos, sin,
+                                rank).view(width, spec, -1)
+        prev = state.gather(1, kept.reshape(width, 1, 1).expand(width, 1, state.shape[-1])).reshape(width, -1)
+        draft = self.greedy_token(self.lm_head(prev)).to(torch.int64)
+        drafts = [draft]
+        live = span["live"].reshape(width, 1)
+        for i in range(1, mtp_step.NUM_STEPS):
+            q = span["base"] + kept + i
+            one = mtp_step.dcp_span(q.reshape(width, 1), live, q, table, attn.dcp_size,
+                                    attn.dcp_group.rank_in_group_tensor, page)
+            step_mask = gen_attention_decode_mask(one["local_prior"].reshape(1, width).to(torch.float32), bs=width,
+                                                  q_head=attn.num_heads * attn.dcp_size, s_active=1,
+                                                  s_prior=table.shape[1] * page, block_len=page,
+                                                  active_gate=one["owner"])
+            step_inputs = DcpDecodeInputs(table=table, update_idx=one["update_idx"].to(torch.uint32), mask=step_mask,
+                                          owner=one["owner"], local_prior=one["local_prior"],
+                                          positions=q.reshape(width, 1), n_keep=table.shape[1], span=1,
+                                          local_pos=one["local_pos"])
+            q_cos, q_sin = self.rotary_emb(q)
+            prev = self.mtp.decode(self, draft, prev, q, step_inputs, q_cos, q_sin, rank)
+            draft = self.greedy_token(self.lm_head(prev)).to(torch.int64)
+            drafts.append(draft)
+        return torch.stack(drafts, dim=1)
 
     def get_kv_spec(self):
         spec = super().get_kv_spec()

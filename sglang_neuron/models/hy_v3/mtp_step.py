@@ -15,7 +15,7 @@ its first token (gen_attention_decode_mask's per-token gate). Every token of a r
 sample at the position before it; the row keeps the drafts up to the first mismatch and the target's next token after
 them, so the output is the target's own sample run.
 
-TODO(mtp): the MTP layer drafts (mtp.py); until then every draft is 0 and a step keeps one token a row."""
+The MTP layer then drafts the next ``NUM_STEPS`` tokens after each row's kept run (HyV3Graph._mtp_drafts)."""
 
 from __future__ import annotations
 
