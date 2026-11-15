@@ -92,6 +92,9 @@ class HyV3Runtime(NeuronModelRuntime):
         row_slots, ctrl = (t[:width] if t.shape[0] >= width else torch.cat(
             [t, torch.zeros((width - t.shape[0], *t.shape[1:]), dtype=t.dtype) + (
                 self.mtp_num_slots if t.dim() == 1 else 0)]) for t in host)
-        dev = neuron_device()
-        out["mtp_row_slots"], out["mtp_ctrl"] = row_slots.to(dev), ctrl.to(dev)
+        from sglang_neuron.backend.device_io import upload_many
+
+        # on the side stream (device_io.upload_many): a plain copy would queue behind the step still running, and hold
+        # the host until it ends
+        out["mtp_row_slots"], out["mtp_ctrl"] = upload_many([row_slots, ctrl], neuron_device())
         return out
