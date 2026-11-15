@@ -146,9 +146,14 @@ def placeholder_draft_input():
 
 
 def validate_request(obj, preferred, server_args) -> None:
-    """Refuse a sampled request unless the decode samples on the device (``SGLANG_NEURON_SAMPLER=topk_topp``)."""
+    """Refuse a sampled request unless the decode samples on the device (``SGLANG_NEURON_SAMPLER=topk_topp``), and
+    any logprob request: the decode commits its accepted tokens on the device, and no logprobs leave it."""
     if not is_neuron_mtp(getattr(server_args, "speculative_algorithm", None)):
         return
+    returns = getattr(obj, "return_logprob", False)
+    if any(returns) if isinstance(returns, (list, tuple)) else bool(returns):
+        raise ValueError(f"--speculative-algorithm {ALGORITHM} returns no logprobs (return_logprob): send the "
+                         "request without them, or serve it from a decode without MTP")
     from sglang_neuron import sampling
 
     if sampling.sampler_mode() != "topk_topp" and not sampling.request_is_greedy(obj, preferred):

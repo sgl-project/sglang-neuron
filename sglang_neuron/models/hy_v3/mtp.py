@@ -28,15 +28,11 @@ from sglang_neuron.utils.weight_loader import SafetensorsWeightLoader, set_weigh
 
 def enabled() -> bool:
     """Whether the launch serves NEURON_MTP (the decode verifies and drafts with this layer)."""
-    import os
-
     from sglang.srt.runtime_context import get_server_args
 
     from sglang_neuron.speculative.neuron_mtp import is_neuron_mtp
 
-    # TODO(mtp bring-up): HY3_MTP_TEST loads the layer and runs its prefill KV pass without the speculative worker
-    return os.environ.get("HY3_MTP_TEST") == "1" or is_neuron_mtp(getattr(get_server_args(), "speculative_algorithm",
-                                                                             None))
+    return is_neuron_mtp(getattr(get_server_args(), "speculative_algorithm", None))
 
 
 class HyV3Mtp(nn.Module):
