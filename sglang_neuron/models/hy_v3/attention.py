@@ -29,6 +29,7 @@ from dataclasses import dataclass
 import nki
 import nki.collectives as ncc
 import torch
+from torch import nn
 from nkilib.core.attention.attention_kv_parallel_segmented_cte import attention_kv_parallel_segmented_cte
 from nkilib.core.qkv.qkv_cte import qkv_cte
 from nkilib.core.utils.common_types import NormType, QKNormConfig, QuantizationType
@@ -63,17 +64,20 @@ def _qkv_fp8(hidden, weights, cos, sin, q_norm, k_norm, norm_eps, d_head, num_q_
 
 @nki.jit
 def _decode_fp8(X, W_qkv, q_norm, k_norm, norm_eps, cos, sin, active_blocks_table, K_cache, V_cache, attention_mask,
-                kv_cache_update_idx, pos_ids, max_context_len, softmax_scale, W_out, k_scale, v_scale):
+                kv_cache_update_idx, pos_ids, max_context_len, softmax_scale, W_out, k_scale, v_scale, qkv_w_scale=None,
+                qkv_in_scale=None, o_w_scale=None, o_in_scale=None):
+    qkv_quant = QuantizationType.NONE if qkv_w_scale is None else QuantizationType.STATIC
+    out_quant = QuantizationType.NONE if o_w_scale is None else QuantizationType.STATIC
     return attention_block_tkg(
         X=X, X_hidden_dim_actual=None, rmsnorm_X_enabled=False, rmsnorm_X_eps=None, rmsnorm_X_gamma=None,
-        W_qkv=W_qkv, bias_qkv=None, quantization_type_qkv=QuantizationType.NONE, weight_dequant_scale_qkv=None,
-        input_dequant_scale_qkv=None, rmsnorm_QK_pre_rope_enabled=True, rmsnorm_QK_pre_rope_eps=norm_eps,
+        W_qkv=W_qkv, bias_qkv=None, quantization_type_qkv=qkv_quant, weight_dequant_scale_qkv=qkv_w_scale,
+        input_dequant_scale_qkv=qkv_in_scale, rmsnorm_QK_pre_rope_enabled=True, rmsnorm_QK_pre_rope_eps=norm_eps,
         rmsnorm_QK_pre_rope_W_Q=q_norm, rmsnorm_QK_pre_rope_W_K=k_norm, cos=cos, sin=sin, rope_contiguous_layout=True,
         rmsnorm_QK_post_rope_enabled=False, rmsnorm_QK_post_rope_eps=0.0, rmsnorm_QK_post_rope_W_Q=None,
         rmsnorm_QK_post_rope_W_K=None, K_cache_transposed=False, active_blocks_table=active_blocks_table,
         K_cache=K_cache, V_cache=V_cache, attention_mask=attention_mask, sink=None, update_cache=True,
         kv_cache_update_idx=kv_cache_update_idx, W_out=W_out, bias_out=None,
-        quantization_type_out=QuantizationType.NONE, weight_dequant_scale_out=None, input_dequant_scale_out=None,
+        quantization_type_out=out_quant, weight_dequant_scale_out=o_w_scale, input_dequant_scale_out=o_in_scale,
         transposed_out=False, out_in_sb=False, softmax_scale=softmax_scale, pos_ids=pos_ids,
         max_context_len=max_context_len, fp8_packed=True, k_scale=k_scale, v_scale=v_scale,
     )
@@ -81,20 +85,23 @@ def _decode_fp8(X, W_qkv, q_norm, k_norm, norm_eps, cos, sin, active_blocks_tabl
 
 @nki.jit
 def _decode_fp8_dcp(X, W_qkv, q_norm, k_norm, norm_eps, cos, sin, active_blocks_table, K_cache, V_cache, attention_mask,
-                    kv_cache_update_idx, softmax_scale, W_out, k_scale, v_scale, dcp_size, dcp_mesh, dcp_mode):
+                    kv_cache_update_idx, softmax_scale, W_out, k_scale, v_scale, dcp_size, dcp_mesh, dcp_mode,
+                    qkv_w_scale=None, qkv_in_scale=None, o_w_scale=None, o_in_scale=None):
+    qkv_quant = QuantizationType.NONE if qkv_w_scale is None else QuantizationType.STATIC
+    out_quant = QuantizationType.NONE if o_w_scale is None else QuantizationType.STATIC
     cells = []
     for cell in dcp_mesh:  # NKI's tracer takes no list comprehension
         cells.append(list(cell))
     return attention_block_tkg(
         X=X, X_hidden_dim_actual=None, rmsnorm_X_enabled=False, rmsnorm_X_eps=None, rmsnorm_X_gamma=None,
-        W_qkv=W_qkv, bias_qkv=None, quantization_type_qkv=QuantizationType.NONE, weight_dequant_scale_qkv=None,
-        input_dequant_scale_qkv=None, rmsnorm_QK_pre_rope_enabled=True, rmsnorm_QK_pre_rope_eps=norm_eps,
+        W_qkv=W_qkv, bias_qkv=None, quantization_type_qkv=qkv_quant, weight_dequant_scale_qkv=qkv_w_scale,
+        input_dequant_scale_qkv=qkv_in_scale, rmsnorm_QK_pre_rope_enabled=True, rmsnorm_QK_pre_rope_eps=norm_eps,
         rmsnorm_QK_pre_rope_W_Q=q_norm, rmsnorm_QK_pre_rope_W_K=k_norm, cos=cos, sin=sin, rope_contiguous_layout=True,
         rmsnorm_QK_post_rope_enabled=False, rmsnorm_QK_post_rope_eps=0.0, rmsnorm_QK_post_rope_W_Q=None,
         rmsnorm_QK_post_rope_W_K=None, K_cache_transposed=False, active_blocks_table=active_blocks_table,
         K_cache=K_cache, V_cache=V_cache, attention_mask=attention_mask, sink=None, update_cache=True,
         kv_cache_update_idx=kv_cache_update_idx, W_out=W_out, bias_out=None,
-        quantization_type_out=QuantizationType.NONE, weight_dequant_scale_out=None, input_dequant_scale_out=None,
+        quantization_type_out=out_quant, weight_dequant_scale_out=o_w_scale, input_dequant_scale_out=o_in_scale,
         transposed_out=False, out_in_sb=False, softmax_scale=softmax_scale, fp8_packed=True, k_scale=k_scale,
         v_scale=v_scale, CP=dcp_size, CP_replica_group=ncc.ReplicaGroup(cells), CP_collective_mode=dcp_mode,
     )
@@ -145,6 +152,21 @@ def dcp_group():
     return group if group is not None and group.world_size > 1 else None
 
 
+# SGLANG_NEURON_HY3_ATTN_FP8=1 keeps the attention projections FP8 (W8A8 decode). Off by default: at TP 64 a rank's
+# projections are small (a [4096, 384] QKV), and the decode kernel's static FP8 path measured slower than bf16 on the
+# full model (TPOT +16% at c=1, +4% at c=8 and 16, before the V-scale fold; the fold recovered about a third of it).
+ATTN_FP8_ENV = "SGLANG_NEURON_HY3_ATTN_FP8"
+
+
+def fp8_projections() -> bool:
+    import os
+
+    value = os.environ.get(ATTN_FP8_ENV, "0")
+    if value not in ("0", "1"):
+        raise ValueError(f"{ATTN_FP8_ENV}={value!r}: set 1 (FP8 projections, W8A8 decode) or 0 (bf16)")
+    return value == "1"
+
+
 class Fp8Attention(Attention):
     """The dense transformer's attention over the FP8 pool; ``set_kv_scales`` gives it its layer's scales."""
 
@@ -165,8 +187,77 @@ class Fp8Attention(Attention):
             set_weight_loader(self.sparse.wq, SafetensorsWeightLoader(
                 transform=lambda slices, rank: slices[0][rank * rows:(rank + 1) * rows].t()))
 
+    fp8_weights = False
+
+    def make_fp8_weights(self) -> None:
+        """Keep the checkpoint's FP8 Q/K/V and output projections (halved, scales doubled, as experts_fp8.py): the decode
+        kernel runs them with static FP8 activations (W8A8); the prefill dequantizes them in its graph. Their scales:
+        ``qkv_w_scale`` [P_MAX, 3] (Q, K, V), ``qkv_in_scale``, ``o_w_scale``, ``o_in_scale`` [P_MAX, 1]."""
+        from sglang_neuron.models.hy_v3.experts_fp8 import FP8, _halved
+        from sglang_neuron.utils.weight_loader import get_weight_loader
+
+        qkv_loader, o_loader = get_weight_loader(self.qkv_weight), get_weight_loader(self.o_weight)
+        self.qkv_weight = nn.Parameter(torch.empty(self.qkv_weight.shape, dtype=FP8), requires_grad=False)
+        self.o_weight = nn.Parameter(torch.empty(self.o_weight.shape, dtype=FP8), requires_grad=False)
+        set_weight_loader(self.qkv_weight, _halved(qkv_loader))
+        set_weight_loader(self.o_weight, _halved(o_loader))
+
+        def scales(cols: int, reduce=None):
+            def transform(slices, rank):
+                values = torch.stack([s[...].float().reshape(()) for s in slices])
+                if reduce is not None:
+                    values = values.max().reshape(1)
+                return (values * 2).reshape(1, cols).expand(P_MAX, cols).contiguous()
+            return SafetensorsWeightLoader(transform=transform)
+
+        for name, cols, reduce in (("qkv_w_scale", 3, None), ("qkv_in_scale", 1, "max"), ("o_w_scale", 1, None),
+                                   ("o_in_scale", 1, None)):
+            param = nn.Parameter(torch.empty(P_MAX, cols, dtype=torch.float32), requires_grad=False)
+            set_weight_loader(param, scales(cols, reduce))
+            setattr(self, name, param)
+        self.fp8_weights = True
+
+    def fp8_weight_mappings(self, src: str, dst: str) -> dict:
+        attn = f"{src}.self_attn"
+        return {
+            f"{dst}.self_attn.qkv_weight": [f"{attn}.{n}_proj.weight" for n in "qkv"],
+            f"{dst}.self_attn.qkv_w_scale": [f"{attn}.{n}_proj.weight_scale" for n in "qkv"],
+            f"{dst}.self_attn.qkv_in_scale": [f"{attn}.{n}_proj.input_scale" for n in "qkv"],
+            f"{dst}.self_attn.o_weight": [f"{attn}.o_proj.weight"],
+            f"{dst}.self_attn.o_w_scale": [f"{attn}.o_proj.weight_scale"],
+            f"{dst}.self_attn.o_in_scale": [f"{attn}.o_proj.input_scale"],
+        }
+
+    def _prefill_weights(self) -> tuple:
+        """(qkv, o) bf16 projection weights of a prefill: the FP8 ones dequantized in the graph."""
+        if not self.fp8_weights:
+            return self.qkv_weight, self.o_weight
+        q, kv = self.num_heads * self.head_dim, self.num_kv_heads * self.head_dim
+        s = self.qkv_w_scale[0]
+        cols = torch.cat([s[0:1].expand(q), s[1:2].expand(kv), s[2:3].expand(kv)])
+        qkv = (self.qkv_weight.to(torch.float32) * cols).to(torch.bfloat16)
+        # the prefill's attention output is dequantized (by its kernel, or after it), so o_w_scale's folded V scale
+        # (set_kv_scales) comes out again
+        o = (self.o_weight.to(torch.float32) * (self.o_w_scale[0, 0] / self.v_scale_float)).to(torch.bfloat16)
+        return qkv, o
+
+    def _decode_weights(self) -> dict:
+        """The decode kernel's projection arguments; the kernel reads V undequantized, so the output projection takes
+        the V scale (in its bf16 weight, or folded into its FP8 scales by set_kv_scales)."""
+        if not self.fp8_weights:
+            return {"W_qkv": self.qkv_weight, "W_out": self.o_weight * self.v_scale_float}
+        return {"W_qkv": self.qkv_weight, "W_out": self.o_weight, "qkv_w_scale": self.qkv_w_scale,
+                "qkv_in_scale": self.qkv_in_scale, "o_w_scale": self.o_w_scale, "o_in_scale": self.o_in_scale}
+
     def set_kv_scales(self, k_scale: float, v_scale: float) -> None:
         self.k_scale_float, self.v_scale_float = float(k_scale), float(v_scale)
+        if self.fp8_weights:
+            # The decode kernel reads V undequantized, so its attention output is the true one over the V scale: the
+            # output projection's weight scale takes it, and its input scale is divided by it so that the FP8 input
+            # keeps the calibrated range. Folded once, on the loaded weights (host.share_weights hands the other
+            # phase's graph these tensors); the prefill divides it out of its weight scale (_prefill_weights).
+            for param, factor in ((self.o_w_scale, self.v_scale_float), (self.o_in_scale, 1.0 / self.v_scale_float)):
+                param.data = (param.data.cpu() * factor).to(param.device)
 
     def _scale_tensor(self, value: float, rows: int, device) -> torch.Tensor:
         return torch.full((rows, 1), value, dtype=torch.float32, device=device)
@@ -177,8 +268,10 @@ class Fp8Attention(Attention):
         tokens = x.shape[0]
         slots = md["slot_mapping"]
         slots = torch.where((slots < 0) | (slots >= pages * page), torch.zeros_like(slots), slots)
+        qkv_weight, o_weight = self._prefill_weights()
+        md = dict(md, _o_weight=o_weight)
         q, k_cache, v_cache = wrap_nki(_qkv_fp8)[get_logical_nc_config()](
-            x.unsqueeze(0), weights=self.qkv_weight,
+            x.unsqueeze(0), weights=qkv_weight,
             cos=torch.cat([cos, cos], dim=-1).unsqueeze(0), sin=torch.cat([sin, sin], dim=-1).unsqueeze(0),
             q_norm=self.q_norm.weight.unsqueeze(0), k_norm=self.k_norm.weight.unsqueeze(0), norm_eps=self.norm_eps,
             d_head=self.head_dim, num_q_heads=self.num_heads, num_kv_heads=self.num_kv_heads,
@@ -198,7 +291,7 @@ class Fp8Attention(Attention):
             kv_segment_size=md["kv_segment_size"], scale=self.scaling * self.k_scale_float, sliding_window=None,
             sink=None,
         )
-        out = (out * self.v_scale_float).transpose(0, 1).reshape(tokens, -1) @ self.o_weight
+        out = (out * self.v_scale_float).transpose(0, 1).reshape(tokens, -1) @ md["_o_weight"]
         return neuron_collectives.all_reduce(self.attn_tp_group, out)
 
     def _mesh(self) -> tuple:
@@ -222,7 +315,7 @@ class Fp8Attention(Attention):
             scale=self.scaling, block_size=page, seg_size=min(tokens, size * page), dcp_size=size,
             dcp_mesh=self._mesh(),
         )
-        out = out.transpose(0, 1).reshape(tokens, -1) @ self.o_weight
+        out = out.transpose(0, 1).reshape(tokens, -1) @ md["_o_weight"]
         return neuron_collectives.all_reduce(self.attn_tp_group, out)
 
     def _refresh_prefill(self, k_cache, table, cached, md, page, tokens):
@@ -264,16 +357,17 @@ class Fp8Attention(Attention):
         rows, span = inputs.table.shape[0], inputs.span
         mask = qk_swap_layout(mask, d_head=self.head_dim, fp8_kv=True, fp8_packed=True)
         out, k_written, _ = wrap_nki(_decode_fp8_dcp)[get_logical_nc_config()](
-            x.view(rows, span, -1), W_qkv=self.qkv_weight, q_norm=self.q_norm.weight.unsqueeze(0),
+            x.view(rows, span, -1), q_norm=self.q_norm.weight.unsqueeze(0),
             k_norm=self.k_norm.weight.unsqueeze(0), norm_eps=self.norm_eps,
             cos=cos.view(rows, span, -1).permute(2, 0, 1).contiguous(),
             sin=sin.view(rows, span, -1).permute(2, 0, 1).contiguous(),
             active_blocks_table=table, K_cache=self.k_cache, V_cache=self.v_cache,
             attention_mask=mask, kv_cache_update_idx=inputs.update_idx,
-            softmax_scale=self.scaling * self.k_scale_float, W_out=self.o_weight * self.v_scale_float,
+            softmax_scale=self.scaling * self.k_scale_float,
             k_scale=self._scale_tensor(1.0 / self.k_scale_float, 1, x.device).reshape(1, 1),
             v_scale=self._scale_tensor(1.0 / self.v_scale_float, 1, x.device).reshape(1, 1),
             dcp_size=self.dcp_size, dcp_mesh=self._mesh(), dcp_mode=dcp_collective_mode(self.dcp_size),
+            **self._decode_weights(),
         )
         if self.sparse is not None:
             # the page each token landed in, on its owner (the full table's local page); a span's tokens fold in
@@ -293,7 +387,7 @@ class Fp8Attention(Attention):
         if isinstance(inputs, DcpDecodeInputs):
             return self._decode_dcp(x, cos, sin, inputs)
         out, _, _ = wrap_nki(_decode_fp8)[get_logical_nc_config()](
-            x.unsqueeze(1), W_qkv=self.qkv_weight, q_norm=self.q_norm.weight.unsqueeze(0),
+            x.unsqueeze(1), q_norm=self.q_norm.weight.unsqueeze(0),
             k_norm=self.k_norm.weight.unsqueeze(0), norm_eps=self.norm_eps,
             cos=cos.t().unsqueeze(-1).contiguous(), sin=sin.t().unsqueeze(-1).contiguous(),
             active_blocks_table=inputs.table, K_cache=self.k_cache, V_cache=self.v_cache,
@@ -302,8 +396,8 @@ class Fp8Attention(Attention):
             # the decode kernel quantizes by multiplying: the inverted scales; dequantization folds into the softmax
             # scale (K) and the output projection (V)
             softmax_scale=self.scaling * self.k_scale_float,
-            W_out=self.o_weight * self.v_scale_float,
             k_scale=self._scale_tensor(1.0 / self.k_scale_float, 1, x.device).reshape(1, 1),
             v_scale=self._scale_tensor(1.0 / self.v_scale_float, 1, x.device).reshape(1, 1),
+            **self._decode_weights(),
         )
         return neuron_collectives.all_reduce(self.attn_tp_group, out)

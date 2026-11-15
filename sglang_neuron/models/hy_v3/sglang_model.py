@@ -16,7 +16,7 @@ from torch import nn
 
 from sglang_neuron.models.host import ModelHost
 from sglang_neuron.models.hy_v3 import mtp, sparse
-from sglang_neuron.models.hy_v3.attention import DcpDecodeInputs, Fp8Attention, dcp_group
+from sglang_neuron.models.hy_v3.attention import DcpDecodeInputs, Fp8Attention, dcp_group, fp8_projections
 from sglang_neuron.models.hy_v3.fp8 import dequantizing, with_scales
 from sglang_neuron.models.hy_v3.kv_scales import load_kv_scales
 from sglang_neuron.models.hy_v3.launch import FP8_CAST
@@ -145,10 +145,15 @@ class HyV3Graph(Qwen3MoeGraph):
                 self.mtp_width = self.mtp_slots
                 self.register_buffer("mtp_carry", torch.zeros(self.mtp_slots + 1, mtp_step.SPEC, dtype=torch.int32))
                 self.register_buffer("mtp_len", torch.zeros(self.mtp_slots + 1, dtype=torch.int32))
+        # the FP8 checkpoint's attention projections stay FP8 over an FP8 KV cache (Fp8Attention.make_fp8_weights)
+        self.fp8_attn = fp8 and self.fp8_kv and fp8_projections()
+        if self.fp8_attn:
+            for layer in self.decoder_layers():
+                layer.self_attn.make_fp8_weights()
         if fp8:
             # the MoE blocks wrap their own loaders
             for layer in self.decoder_layers():
-                params = [layer.self_attn.qkv_weight, layer.self_attn.o_weight]
+                params = [] if self.fp8_attn else [layer.self_attn.qkv_weight, layer.self_attn.o_weight]
                 if getattr(layer.self_attn, "sparse", None) is not None:
                     params.append(layer.self_attn.sparse.wq)
                 if isinstance(layer.mlp, ShardedMLP):
@@ -196,7 +201,10 @@ class HyV3Graph(Qwen3MoeGraph):
                 q = [f"{attn}.q_proj.weight"]
                 mappings[f"layers.{i}.self_attn.sparse.wq"] = with_scales(q) if self.fp8 else q
                 mappings[f"layers.{i}.self_attn.sparse.q_norm"] = f"{attn}.q_norm.weight"
-        if self.fp8:
+        if self.fp8_attn:
+            for i, layer in enumerate(self.layers):
+                mappings.update(layer.self_attn.fp8_weight_mappings(f"model.layers.{i}", f"layers.{i}"))
+        elif self.fp8:
             for i in range(len(self.layers)):
                 for name in ("qkv_weight", "o_weight"):
                     key = f"layers.{i}.self_attn.{name}"
@@ -210,9 +218,12 @@ class HyV3Graph(Qwen3MoeGraph):
         src, dst = f"model.layers.{self.mtp.layer_idx}", "mtp.layer"
         attn = f"{src}.self_attn"
         scaled = with_scales if self.fp8 else list
-        return {
+        projections = (self.mtp.layer.self_attn.fp8_weight_mappings(src, dst) if self.fp8_attn else {
             f"{dst}.self_attn.qkv_weight": scaled([f"{attn}.{n}_proj.weight" for n in "qkv"]),
             f"{dst}.self_attn.o_weight": scaled([f"{attn}.o_proj.weight"]),
+        })
+        return {
+            **projections,
             f"{dst}.self_attn.q_norm.weight": f"{attn}.q_norm.weight",
             f"{dst}.self_attn.k_norm.weight": f"{attn}.k_norm.weight",
             f"{dst}.input_layernorm.weight": f"{src}.input_layernorm.weight",
