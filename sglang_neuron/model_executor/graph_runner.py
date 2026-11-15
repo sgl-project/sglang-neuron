@@ -1735,7 +1735,10 @@ class NeuronGraphRunner(BaseRunner):
             self._md, self._plan, self._step = step.metadata, step.plan, step
             self.raw_bs, self.raw_num_token, self.bs = step.metadata.batch_size, step.metadata.num_tokens, step.rows
             return self
-        self._md = self.attn_backend.build_metadata(forward_batch)
+        # a hybrid linear-attention model's backend is SGLang's wrapper over the platform's (full_attn_backend), which
+        # builds the step metadata, as NeuronModel.forward reads it (models/base.py)
+        backend = getattr(self.attn_backend, "full_attn_backend", self.attn_backend)
+        self._md = backend.build_metadata(forward_batch)
         self.raw_bs = self._md.batch_size
         self.raw_num_token = self._md.num_tokens
         self._plan = self.runtime.plan_step(forward_batch, self._md)
