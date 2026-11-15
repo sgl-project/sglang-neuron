@@ -66,6 +66,19 @@ def resize_block_len(block_len: int, bs: int, q_head: int, s_active: int, s_prio
     return math.gcd(block_len, bucket_len // partitions)
 
 
+def qk_swap_layout(mask: Tensor, *, d_head: int, fp8_kv: bool, fp8_packed: bool, kv_heads: int = 1) -> Tensor:
+    """``mask`` [s_prior, bs, q_head, s_active] (gen_attention_decode_mask) in the layout attention_block_tkg takes
+    for it: as it is, or [bs, q_head, s_active, s_prior] where the kernel takes its transposed-score (QK-swap) path for
+    the shape, which nkilib's is_qk_swapped decides (a span of tokens a row, as a speculative verify, can take it)."""
+    from nkilib.core.attention.attention_tkg_utils import is_qk_swapped
+
+    s_prior, bs, q_head, s_active = (int(d) for d in mask.shape)
+    swapped = is_qk_swapped(bs=bs, q_head=q_head, d_head=d_head, s_active=s_active, curr_sprior=s_prior,
+                            lnc=get_logical_nc_config(), p_max=P_MAX, is_block_kv=True, is_2byte_kv=not fp8_kv,
+                            fp8_packed=fp8_packed, fuse_rope=False, kv_heads=kv_heads)
+    return mask.permute(1, 2, 3, 0).contiguous() if swapped else mask
+
+
 def _torch_gen_attention_decode_mask(pos_ids, bs, q_head, s_active, s_prior, start_pos, block_len, active_mask):
     """The kernel's mask: the prior part is the same for every token of a row (it ends at the row's first token, since
     the cache holds no later one) and the active part is ``active_mask``, placed at the slots of the last ``s_active``

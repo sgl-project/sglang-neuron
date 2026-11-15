@@ -219,6 +219,10 @@ class NeuronMHATokenToKVPoolKind(NeuronMHATokenToKVPool, MHATokenToKVPool):
     this pool doesn't implement are refused."""
 
     def __init__(self, *args, **kwargs):
+        if kwargs.get("enable_kv_cache_copy") and _neuron_mtp():
+            # SGLang asks for KV copies under any speculative algorithm, for the verify of a draft tree; a NEURON_MTP
+            # step writes each token's KV at its final slot and copies none (speculative/neuron_mtp.py)
+            kwargs = dict(kwargs, enable_kv_cache_copy=False)
         _refuse_unsupported_pool_options(kwargs)
         NeuronMHATokenToKVPool.__init__(self, *args, **kwargs)
 
@@ -269,6 +273,14 @@ def _refuse_other_head_dims(head_dim: int, kwargs: dict) -> None:
     if other:
         raise ValueError(f"the Neuron KV pool holds K and V of one head dim ({head_dim}) on every layer, not "
                          f"{', '.join(f'{k}={v}' for k, v in other.items())}")
+
+
+def _neuron_mtp() -> bool:
+    from sglang.srt.runtime_context import get_server_args
+
+    from sglang_neuron.speculative.neuron_mtp import is_neuron_mtp
+
+    return is_neuron_mtp(getattr(get_server_args(), "speculative_algorithm", None))
 
 
 def _refuse_unsupported_pool_options(kwargs: dict, options_off=None) -> None:

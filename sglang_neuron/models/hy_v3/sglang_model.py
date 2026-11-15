@@ -130,6 +130,18 @@ class HyV3Graph(Qwen3MoeGraph):
                 # the draft attends densely (mtp.py)
                 layer.self_attn.sparse = None
             self.mtp = mtp.HyV3Mtp(config, layer)
+            if phase == "decode":
+                from sglang.srt.runtime_context import get_server_args
+
+                from sglang_neuron.models.hy_v3 import mtp_step
+
+                # the decode samples in its own forward: every step is the MTP step (mtp_step.py), whose carry is
+                # each request slot's next tokens and committed length, one more row for the padding rows
+                self.samples_in_forward = True
+                self.mtp_slots = int(get_server_args().max_running_requests)
+                self.mtp_width = self.mtp_slots
+                self.register_buffer("mtp_carry", torch.zeros(self.mtp_slots + 1, mtp_step.SPEC, dtype=torch.int32))
+                self.register_buffer("mtp_len", torch.zeros(self.mtp_slots + 1, dtype=torch.int32))
         if fp8:
             # the MoE blocks wrap their own loaders
             for layer in self.decoder_layers():
@@ -196,12 +208,15 @@ class HyV3Graph(Qwen3MoeGraph):
         }
 
     @torch.no_grad()
-    def forward(self, input_ids, positions, attn_metadata, sampling_positions, rank):
+    def forward(self, input_ids, positions, attn_metadata, sampling_positions, rank, mtp_row_slots=None,
+                mtp_ctrl=None):
         """The dense core's forward; a DCP decode (an FP8 cache under --dcp-size) builds the group's decode mask once
-        for every layer (attention.DcpDecodeInputs)."""
+        for every layer (attention.DcpDecodeInputs). Under NEURON_MTP the decode is the MTP step (mtp_step.py)."""
         attn = self.layers[0].self_attn
         if self.mtp is not None and self.phase == "prefill":
             return self._prefill_with_mtp(input_ids, positions, attn_metadata, sampling_positions, rank)
+        if self.mtp is not None:
+            return self._mtp_decode(attn_metadata, rank, mtp_row_slots, mtp_ctrl)
         if self.phase != "decode" or getattr(attn, "dcp_size", 1) == 1:
             if getattr(attn, "sparse", None) is not None:
                 # the sparse summaries of a prefill chunk need the request's length so far
@@ -238,6 +253,45 @@ class HyV3Graph(Qwen3MoeGraph):
         logits = self.lm_head(self.norm(hidden.index_select(0, sampling_positions)))
         self.mtp.prefill(self, hidden, input_ids, positions, logits, attn_metadata, cos, sin, rank)
         return logits
+
+    def _mtp_decode(self, attn_metadata, rank, row_slots, ctrl):
+        """One MTP step (mtp_step.py): ``{"token_ids": [width, SPEC]}`` int32, each row's kept run, -1 after it, at the
+        decode width."""
+        from sglang_neuron.models.hy_v3 import mtp_step
+        from sglang_neuron.ops.attention.attention_decode_mask import gen_attention_decode_mask
+
+        attn = self.layers[0].self_attn
+        if attn.dcp_size == 1:
+            raise NotImplementedError("Hy3's MTP step runs under DCP (--dcp-size) with the FP8 KV cache")
+        md = attn_metadata[attn.name]
+        table = md["block_table_tensor"].to(torch.int32)
+        width, spec, page = table.shape[0], mtp_step.SPEC, md["block_size"]
+        slots = row_slots.to(torch.int64)
+        span = mtp_step.span_inputs(self.mtp_carry.index_select(0, slots), self.mtp_len.index_select(0, slots), ctrl)
+        share = mtp_step.dcp_span(span["positions"], span["valid"], span["base"], table, attn.dcp_size,
+                                  attn.dcp_group.rank_in_group_tensor, page)
+        prior = share["local_prior"].reshape(width, 1).expand(width, spec).reshape(1, width * spec)
+        mask = gen_attention_decode_mask(prior.to(torch.float32), bs=width, q_head=attn.num_heads * attn.dcp_size,
+                                         s_active=spec, s_prior=table.shape[1] * page, block_len=page,
+                                         active_gate=share["owner"])
+        inputs = DcpDecodeInputs(table=table, update_idx=share["update_idx"].to(torch.uint32), mask=mask,
+                                 owner=share["owner"], local_prior=share["local_prior"], positions=span["positions"],
+                                 n_keep=sparse.kept_pages(table.shape[1]), span=spec, local_pos=share["local_pos"])
+        positions = span["positions"].reshape(-1)
+        hidden = self.embed_tokens(span["tokens"].reshape(-1).to(torch.int32), scatter_tokens=False, rank=rank)
+        cos, sin = self.rotary_emb(positions)
+        for layer in self.layers:
+            hidden = layer(hidden, lambda x, a=layer.self_attn: a.decode(x, cos, sin, inputs))
+        sampled = self.greedy_token(self.lm_head(self.norm(hidden))).reshape(width, spec).to(torch.int64)
+        out, kept = mtp_step.accept(span["tokens"], sampled, span)
+        bonus = sampled.gather(1, kept.reshape(-1, 1))
+        # TODO(mtp): the MTP layer's drafts (mtp.py); none yet
+        drafts = torch.zeros(width, mtp_step.NUM_STEPS, dtype=torch.int64, device=bonus.device)
+        self.mtp_carry.index_copy_(0, slots, torch.cat([bonus, drafts], dim=1).to(torch.int32))
+        self.mtp_len.index_copy_(0, slots, (span["base"] + kept + 1).to(torch.int32))
+        if self.mtp_width > width:
+            out = torch.cat([out, torch.full((self.mtp_width - width, spec), -1, dtype=out.dtype, device=out.device)])
+        return {"token_ids": out.to(torch.int32)}
 
     def get_kv_spec(self):
         spec = super().get_kv_spec()

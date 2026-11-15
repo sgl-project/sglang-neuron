@@ -212,7 +212,9 @@ MODELS = {
                                  kv_cache_dtypes=("auto", "bf16", "bfloat16", "fp8_e4m3"),
                                  quantizations=("fp8",), launch_hooks="sglang_neuron.models.hy_v3.launch",
                                  # its FP8 attention runs over DCP shards in decode and prefill (models/hy_v3/attention.py)
-                                 decode_context_parallel=True, prefill_context_parallel=True),
+                                 decode_context_parallel=True, prefill_context_parallel=True,
+                                 # NEURON_MTP: the checkpoint's MTP layer verifies and drafts in the decode step
+                                 mtp_host="sglang_neuron.models.hy_v3.mtp_step"),
     # the paged giga prefill writes each forward's final GDN state into SGLang's tracking slot, so the chunk-keyed tree
     # keeps an exact checkpoint at every chunk boundary (models/qwen35/prefix.py)
     "Qwen3_5MoeForCausalLM": ModelSpec(package="sglang_neuron.models.qwen35",

@@ -631,6 +631,18 @@ class TokenRelay:
 _RELAY = None
 
 
+def relay_prefill_token(slot: int, generation: int):
+    """A NEURON_MTP aggregated server's prefill token of request slot ``slot`` (its generation ``generation``), read on
+    the host from the prefill's readback (waiting for it if no one read it yet), consumed once; None if none."""
+    if _RELAY is None:
+        return None
+    entry = _RELAY.rows.get(slot)
+    if entry is None or entry[0] != generation:
+        return None
+    del _RELAY.rows[slot]
+    return int(entry[1].cpu()[entry[2]])
+
+
 def reset_token_relay() -> None:
     """Forget this process's relay rows (after a successful flush_cache)."""
     if _RELAY is not None:
@@ -649,7 +661,14 @@ def _stash(original_fn, self, indices, payload, *args, **kwargs):
 
     if is_neuron_mtp(self.spec_algo):
         # a decode kernel's own MTP step carries every next input token on the device: no token of a step is relayed,
-        # and a fresh request's first token reaches the device in the step's host inputs (speculative/neuron_mtp.py)
+        # and a fresh request's first token reaches the device in the step's host inputs (speculative/neuron_mtp.py).
+        # An aggregated server's prefill tokens (one a row) are relayed, for its requests' first steps to read on the
+        # host (relay_prefill_token).
+        tokens = payload.bonus_tokens
+        if tokens is not None and tokens.dim() == 1 and tokens.device.type == "neuron":
+            slots = tuple(indices.tolist())
+            self.neuron_token_relay.stash(slots, tuple(self.neuron_req_pool.req_generation[list(slots)].tolist()),
+                                          tokens)
         return None
     if _token_io["pp"] is not None:
         # PP: the first stage's relay rows come from the seam (stash_seam_tokens), and a processed step's host stash
