@@ -600,14 +600,16 @@ class NeuronPagedHostPool(HostKVCache):
     holds ``page_size // unit`` device pages of every region, and a transfer moves each whole, aligned device page of
     its indices on its own (a chunk's KV pages need not be consecutive on the device)."""
 
-    # whether the remote DRAM tier (mem_cache/remote_dram, allocator "dynamic") may sit below this host pool
+    # whether the plugin's storage tiers (allocator "dynamic": mem_cache/remote_dram, mem_cache/mooncake_store) may
+    # sit below this host pool
     remote_dram_tier = False
 
     @classmethod
     def check_allocator(cls, allocator_type, pool_label) -> None:
-        """SGLang's get_allocator_type() names the storage backend: "dynamic" is the remote DRAM tier (the platform
-        refuses every other backend), which reads and writes these host pages itself (batch_*_v1); validated on the
-        MHA pool only (``remote_dram_tier``), so the other layouts' host pools stay L2 only."""
+        """SGLang's get_allocator_type() names the storage backend: "dynamic" is one of the plugin's storage tiers, the
+        remote DRAM tier or Mooncake Store (the platform refuses every other backend), which read and write these host
+        pages themselves (batch_*_v1); validated on the MHA pool only (``remote_dram_tier``), so the other layouts'
+        host pools stay L2 only."""
         allowed = (None, "default", "dynamic") if cls.remote_dram_tier else (None, "default")
         if allocator_type not in allowed:
             raise ValueError(f"Neuron HiCache allocates its own host memory, not a {allocator_type} allocator"
