@@ -26,13 +26,29 @@ from sglang_neuron.parallel import groups
 from sglang_neuron.utils.weight_loader import SafetensorsWeightLoader, set_weight_loader
 
 
+# SGLANG_NEURON_HY3_PD_MTP_KV=1 on a --disaggregation-mode prefill: build the MTP layer and write its KV over each chunk,
+# for a NEURON_MTP decode (whose pool holds the layer; the prefill itself runs no speculative step)
+PD_MTP_KV_ENV = "SGLANG_NEURON_HY3_PD_MTP_KV"
+
+
 def enabled() -> bool:
-    """Whether the launch serves NEURON_MTP (the decode verifies and drafts with this layer)."""
+    """Whether the launch holds the MTP layer: it serves NEURON_MTP (the decode verifies and drafts with the layer), or
+    it is the PD prefill of such a decode (``SGLANG_NEURON_HY3_PD_MTP_KV``)."""
+    import os
+
     from sglang.srt.runtime_context import get_server_args
 
     from sglang_neuron.speculative.neuron_mtp import is_neuron_mtp
 
-    return is_neuron_mtp(getattr(get_server_args(), "speculative_algorithm", None))
+    args = get_server_args()
+    if is_neuron_mtp(getattr(args, "speculative_algorithm", None)):
+        return True
+    if os.environ.get(PD_MTP_KV_ENV, "0") == "1":
+        if str(getattr(args, "disaggregation_mode", "null")) != "prefill":
+            raise ValueError(f"{PD_MTP_KV_ENV}=1 is for a --disaggregation-mode prefill; a decode serves the layer with "
+                             "--speculative-algorithm NEURON_MTP")
+        return True
+    return False
 
 
 class HyV3Mtp(nn.Module):

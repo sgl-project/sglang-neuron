@@ -181,7 +181,7 @@ class Fp8Attention(Attention):
             raise ValueError(f"Hy3's DCP attention runs one KV head per rank, not {self.num_kv_heads}")
         self.sparse = (sparse.SparseState(config.hidden_size, self.num_heads, self.head_dim, config.rms_norm_eps,
                                           config.rope_theta)
-                       if sparse.enabled() and self.dcp_size > 1 else None)
+                       if sparse.enabled() and (self.dcp_size > 1 or sparse.pd_prefill()) else None)
         if self.sparse is not None:
             rows = self.num_heads * self.head_dim
             set_weight_loader(self.sparse.wq, SafetensorsWeightLoader(
@@ -285,6 +285,13 @@ class Fp8Attention(Attention):
         q = q.view(tokens, self.num_heads, self.head_dim).transpose(0, 1)
         if self.dcp_size > 1:
             return self._prefill_dcp(q, k_cache, v_cache, md, page, tokens)
+        if self.sparse is not None:
+            # a PD prefill without DCP: the summaries of the chunk's whole pages, which go to the DCP decode with them
+            # (sparse.transfer_summaries)
+            table = md["block_table_tensor"].to(torch.int32)
+            table = torch.where(table < 0, torch.zeros_like(table), table)
+            self._refresh_prefill(k_cache, table[0], md["cached_seq_len"].to(torch.int32).reshape(1, 1), md, page,
+                                  tokens)
         out = NF.segmented_attention(
             q, k_cache=k_cache, v_cache=v_cache,
             block_tables=md["block_table_tensor"], prior_tokens=md["cached_seq_len"], block_size=page,
@@ -322,7 +329,8 @@ class Fp8Attention(Attention):
         """The summaries of this rank's pages the chunk wrote: local pages from cached / D on, filled up to this rank's
         share of the request's length so far (the chunk's last real position + 1)."""
         size = self.dcp_size
-        rank = self.dcp_group.rank_in_group_tensor
+        rank = (self.dcp_group.rank_in_group_tensor if size > 1
+                else torch.zeros(1, dtype=torch.int64, device=table.device))
         first = torch.div(cached.reshape(-1)[0].to(torch.int64), size * page, rounding_mode="floor")
         end = sparse.local_count(md["positions_end"], size, rank, page)
         idx = first + torch.arange(tokens // (size * page) + 1, device=table.device, dtype=torch.int64)
@@ -369,9 +377,12 @@ class Fp8Attention(Attention):
             dcp_size=self.dcp_size, dcp_mesh=self._mesh(), dcp_mode=dcp_collective_mode(self.dcp_size),
             **self._decode_weights(),
         )
-        if self.sparse is not None:
-            # the page each token landed in, on its owner (the full table's local page); a span's tokens fold in
-            # order, since two of them can land in one page
+        if self.sparse is not None and inputs.local_pos is not None and span > 1:
+            # a span's tokens fold in one pass (SparseState.add_span)
+            self.sparse.add_span(k_written, inputs.table, inputs.local_pos.view(rows, span),
+                                 inputs.owner.reshape(rows, span), self.k_cache.shape[2] * 2)
+        elif self.sparse is not None:
+            # the page each token landed in, on its owner (the full table's local page)
             page = self.k_cache.shape[2] * 2
             n = (inputs.local_prior.to(torch.int64).view(rows, 1) if inputs.local_pos is None
                  else inputs.local_pos.to(torch.int64).view(rows, span))

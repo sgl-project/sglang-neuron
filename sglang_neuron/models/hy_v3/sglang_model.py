@@ -141,7 +141,7 @@ class HyV3Graph(Qwen3MoeGraph):
 
                 self.samples_in_forward = True
                 self.sampler_modes = neuron_sampling.SAMPLER_MODES
-                self.mtp_slots = int(get_server_args().max_running_requests)
+                self.mtp_slots = mtp_step.request_rows(get_server_args())
                 self.mtp_width = self.mtp_slots
                 self.register_buffer("mtp_carry", torch.zeros(self.mtp_slots + 1, mtp_step.SPEC, dtype=torch.int32))
                 self.register_buffer("mtp_len", torch.zeros(self.mtp_slots + 1, dtype=torch.int32))

@@ -42,6 +42,16 @@ from sglang.srt.mem_cache.memory_pool import GB, KVCache, MHATokenToKVPool, MLAT
 logger = logging.getLogger(__name__)
 
 
+# callables (pool) -> list of (pool layer index, tensor [num_blocks, ...]) a model keeps next to an MHA pool, indexed
+# by its pages (Hy3's sparse page summaries, models/hy_v3/sparse.transfer_summaries); the same list on the PD prefill
+# and decode, which pair each entry by its layer (get_kv_layer_ids)
+PAGE_SIDE_BUFFERS: list = []
+
+
+def page_side_buffers(pool) -> list:
+    return [entry for provider in PAGE_SIDE_BUFFERS for entry in provider(pool)]
+
+
 class NeuronMHATokenToKVPool(KVCache):
     # Each page stores its heads contiguously ([blocks, kv_heads, block, head_dim]; packed fp8 K
     # [blocks, kv_heads, block // 2, head_dim, 2]), so a KV transfer between different attention-TP
@@ -173,7 +183,8 @@ class NeuronMHATokenToKVPool(KVCache):
         """The global layer of every entry ``get_contiguous_buf_infos`` registers, K entries then V. A pipelined stage
         holds only its own layers, and SGLang's PD transfer pairs entries by layer (sglang_patches.pd_kv_layer_ids)."""
         layers = list(range(self.start_layer, self.start_layer + self.layer_num))
-        return layers + layers
+        # then the page side buffers' layers, a third entry of each layer that has one (get_contiguous_buf_infos)
+        return layers + layers + [self.start_layer + i for i, _ in page_side_buffers(self)]
 
     def set_kv_buffer(self, *args, **kwargs):
         raise RuntimeError("the K/V pages are written by the compiled graphs, not by the pool")
@@ -191,7 +202,8 @@ class NeuronMHATokenToKVPool(KVCache):
         return torch.Size(k_shape), torch.Size(shape)
 
     def get_contiguous_buf_infos(self):
-        """(ptrs, lens, item_lens): item_len = bytes per page; page p at ptr + p*item_len."""
+        """(ptrs, lens, item_lens): item_len = bytes per page; page p at ptr + p*item_len. After K and V, the page-indexed
+        side buffers a model keeps next to the pool (``PAGE_SIDE_BUFFERS``), which a PD transfer moves with each page."""
         item_len = self.head_num * self.block_size * self.head_dim * self.store_dtype.itemsize
         from sglang_neuron.backend.device_io import device_address
 
@@ -199,7 +211,14 @@ class NeuronMHATokenToKVPool(KVCache):
         lens = [t.numel() * t.element_size() for t in self.k_buffer] + [
             t.numel() * t.element_size() for t in self.v_buffer
         ]
-        return ptrs, lens, [item_len] * (2 * self.layer_num)
+        item_lens = [item_len] * (2 * self.layer_num)
+        for _, side in page_side_buffers(self):
+            if side.shape[0] != self.num_blocks:
+                raise RuntimeError(f"a page side buffer of {side.shape[0]} pages next to a pool of {self.num_blocks}")
+            ptrs.append(device_address(side))
+            lens.append(side.numel() * side.element_size())
+            item_lens.append(side[0].numel() * side.element_size())
+        return ptrs, lens, item_lens
 
     # SGLang's KVCache signatures, for its allocators' host copies (Req.offload_kv_cache); a PD decode keeps no
     # retraction backup ("none", disaggregation.apply_launch_settings), so serving reaches neither

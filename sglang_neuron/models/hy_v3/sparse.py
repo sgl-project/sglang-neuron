@@ -28,7 +28,11 @@ from sglang_neuron.ops.attention.attention_decode import unswizzle_packed_k
 from sglang_neuron.parallel import collectives as neuron_collectives
 
 FRACTION = float(os.environ.get("SGLANG_NEURON_HY3_SPARSE_DECODE", "0") or 0)
-SELECT_EVERY = 4
+# SGLANG_NEURON_HY3_SPARSE_SELECT_EVERY: layers 0, R, 2R, ... select, the rest reuse the selection (8, as the vllm-neuron
+# Hy3 reference configuration's HY3_SPARSE_SELECT_EVERY)
+SELECT_EVERY = int(os.environ.get("SGLANG_NEURON_HY3_SPARSE_SELECT_EVERY", "8") or 8)
+if SELECT_EVERY < 1:
+    raise ValueError(f"SGLANG_NEURON_HY3_SPARSE_SELECT_EVERY={SELECT_EVERY}: set a layer count of at least 1")
 SINK_PAGES = 1
 RECENT_PAGES = 2
 # the kept pages are whole quanta of 32 pages (4096 tokens): the kernel reads the packed FP8 K cache in tiles of
@@ -38,10 +42,42 @@ PAGE_QUANTUM = 32
 _EMPTY = 3.0e38
 # (layer name, its K cache's address) -> the layer's summaries, shared by the prefill and decode graphs
 _SUMMARIES: dict = {}
+# (K cache, its summaries) in bind order, for the PD transfer's side buffers (transfer_summaries)
+_BOUND: list = []
 
 
 def enabled() -> bool:
     return FRACTION > 0
+
+
+def pd_prefill() -> bool:
+    """Whether this launch is a PD prefill: without DCP it keeps the summaries only to send them to its DCP decode."""
+    from sglang.srt.runtime_context import get_server_args
+
+    return str(getattr(get_server_args(), "disaggregation_mode", "null")) == "prefill"
+
+
+def transfer_summaries(k_buffers) -> list:
+    """(pool layer index, summaries) of the layers whose K cache is one of the pool's ``k_buffers``, in order: a PD
+    transfer registers them next to K and V (memory_pool.page_side_buffers), page ``p`` at ``p * 2 * d`` elements, so a
+    DCP decode receives each page's summary with its page."""
+    out = []
+    for i, k in enumerate(k_buffers):
+        # data_ptr() is a placeholder on torch-neuronx, but each allocation's own: the cache tensor itself first
+        hit = [summary for cache, summary in _BOUND if cache is k] or [
+            summary for cache, summary in _BOUND if cache.data_ptr() == k.data_ptr()]
+        if hit:
+            out.append((i, hit[0]))
+    return out
+
+
+def _register_side_buffers() -> None:
+    from sglang_neuron.mem_cache import memory_pool
+
+    provider = lambda pool: transfer_summaries(pool.k_buffer)  # noqa: E731
+    provider.__name__ = "hy3_sparse_summaries"
+    if not any(getattr(p, "__name__", "") == provider.__name__ for p in memory_pool.PAGE_SIDE_BUFFERS):
+        memory_pool.PAGE_SIDE_BUFFERS.append(provider)
 
 
 def kept_pages(table_pages: int) -> int:
@@ -91,6 +127,8 @@ class SparseState(nn.Module):
         if key not in _SUMMARIES:
             empty = torch.tensor([_EMPTY, -_EMPTY], dtype=torch.bfloat16).view(1, 2, 1)
             _SUMMARIES[key] = empty.expand(k_cache.shape[0], 2, self.head_dim).contiguous().to(k_cache.device)
+            _BOUND.append((k_cache, _SUMMARIES[key]))
+            _register_side_buffers()
         self.summary = _SUMMARIES[key]
 
     def query(self, x: torch.Tensor, positions: torch.Tensor) -> torch.Tensor:
@@ -124,6 +162,48 @@ class SparseState(nn.Module):
         kmin = torch.where(first, k, torch.minimum(old[:, 0], k))
         kmax = torch.where(first, k, torch.maximum(old[:, 1], k))
         self.summary.index_copy_(0, blocks, torch.stack([kmin, kmax], dim=1).to(torch.bfloat16))
+
+
+    def add_span(self, k_cache: torch.Tensor, table: torch.Tensor, local_pos: torch.Tensor, owner: torch.Tensor,
+                 page: int) -> None:
+        """Fold each row's span tokens this rank keeps (``owner`` [B, S] > 0, at local positions ``local_pos`` [B, S];
+        ``table`` [B, pages] the rows' local pages) into their page's summary, in one pass. A rank keeps a run of
+        consecutive tokens of a span, inside one page (a span is shorter than a DCP block, and the next block is
+        another rank's), so each row folds the min and max of its run into one page, starting the page afresh when
+        the run begins at its first slot. A row that keeps none rewrites block 0 with itself, as add_token's -1."""
+        rows, span = local_pos.shape
+        n = local_pos.to(torch.int64)
+        own = owner.reshape(rows, span) > 0
+        idx = torch.div(n, page, rounding_mode="floor")
+        blocks = table.to(torch.int64).gather(1, torch.clamp(idx, max=table.shape[1] - 1))
+        blocks = torch.where(own, blocks, torch.full_like(blocks, -1))
+        slot = n - idx * page
+        half, d = k_cache.shape[2], k_cache.shape[3]
+        flat = k_cache.reshape(-1, d, 2)
+        # each token's K row read on its own, as add_token's (one gather of all the span's rows at once hit
+        # neuronx-cc NCC_ILLC051, a CoreBarrier mismatch between the logical core's two cores); the span folds
+        # elementwise over its columns
+        kmin = kmax = None
+        row_block = torch.full_like(blocks[:, 0], -1)
+        first = torch.zeros_like(own[:, 0])
+        for j in range(span):
+            at = torch.clamp(blocks[:, j], min=0) * half + torch.div(slot[:, j], 2, rounding_mode="floor")
+            pairs = flat.index_select(0, at)
+            kj = pairs.gather(2, (slot[:, j] % 2).view(-1, 1, 1).expand(-1, d, 1)).squeeze(2).to(torch.float32)
+            oj = own[:, j].view(-1, 1)
+            if kmin is None:
+                kmin = torch.full_like(kj, _EMPTY)
+                kmax = torch.full_like(kj, -_EMPTY)
+            kmin = torch.where(oj, torch.minimum(kmin, kj), kmin)
+            kmax = torch.where(oj, torch.maximum(kmax, kj), kmax)
+            row_block = torch.maximum(row_block, blocks[:, j])
+            first = first | (own[:, j] & slot[:, j].eq(0))
+        row_block = torch.clamp(row_block, min=0)
+        first = first.view(-1, 1)
+        old = self.summary.index_select(0, row_block).to(torch.float32)
+        kmin = torch.where(first, kmin, torch.minimum(old[:, 0], kmin))
+        kmax = torch.where(first, kmax, torch.maximum(old[:, 1], kmax))
+        self.summary.index_copy_(0, row_block, torch.stack([kmin, kmax], dim=1).to(torch.bfloat16))
 
 
 def scores(state: SparseState, x, positions, table, dcp_group) -> torch.Tensor:

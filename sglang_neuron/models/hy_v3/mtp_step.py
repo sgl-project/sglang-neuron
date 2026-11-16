@@ -38,6 +38,24 @@ def launch_warnings(server_args) -> list:
     return []
 
 
+def request_rows(server_args) -> int:
+    """The request table's rows: the running set, and on a PD decode the rows it hands to transfers still landing
+    (``--disaggregation-decode-extra-slots``, SGLang's pre-allocation), any of which a request can hold when it starts."""
+    rows = int(server_args.max_running_requests)
+    if str(getattr(server_args, "disaggregation_mode", "null")) != "decode":
+        return rows
+    from sglang.srt.runtime_context import get_disagg
+
+    # the resolved count lives in the runtime's disagg config (the server args may still hold None); unresolved, it is
+    # SGLang's default (handle_pd_disaggregation): twice a batch of at most 32
+    extra = getattr(get_disagg(), "disaggregation_decode_extra_slots", None)
+    if extra is None:
+        extra = getattr(server_args, "disaggregation_decode_extra_slots", None)
+    if extra is None:
+        extra = 2 * rows if rows <= 32 else 0
+    return rows + int(extra)
+
+
 def slot_of(req_pool_idx: int, slots: int) -> int:
     """The carry slot of SGLang request row ``req_pool_idx`` (row 0 is SGLang's padding row)."""
     slot = int(req_pool_idx) - 1
