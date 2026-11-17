@@ -146,8 +146,9 @@ def placeholder_draft_input():
 
 
 def validate_request(obj, preferred, server_args) -> None:
-    """Refuse a sampled request unless the decode samples on the device (``SGLANG_NEURON_SAMPLER=topk_topp``), and
-    any logprob request: the decode commits its accepted tokens on the device, and no logprobs leave it."""
+    """Refuse a sampled request unless the decode samples on the device (``SGLANG_NEURON_SAMPLER=topk_topp``, or
+    ``temperature``, whose own admission refuses the top-k / top-p / min-p filters it does not apply), and any logprob
+    request: the decode commits its accepted tokens on the device, and no logprobs leave it."""
     if not is_neuron_mtp(getattr(server_args, "speculative_algorithm", None)):
         return
     returns = getattr(obj, "return_logprob", False)
@@ -156,7 +157,8 @@ def validate_request(obj, preferred, server_args) -> None:
                          "request without them, or serve it from a decode without MTP")
     from sglang_neuron import sampling
 
-    if sampling.sampler_mode() != "topk_topp" and not sampling.request_is_greedy(obj, preferred):
+    sampled = sampling.sampler_mode() in ("topk_topp", "temperature")
+    if not sampled and not sampling.request_is_greedy(obj, preferred):
         raise ValueError(f"--speculative-algorithm {ALGORITHM} verifies greedy requests only (temperature 0 or "
                          "top_k 1): send the request greedy, or serve it from a decode without MTP")
 
