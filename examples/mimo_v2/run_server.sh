@@ -5,6 +5,7 @@
 #   CONTEXT=8192   bash run_server.sh    # bring-up: the smallest graphs, the quickest compile
 #   CONTEXT=262144 bash run_server.sh    # the AgentX 256K point
 #   CONTEXT=1048576 bash run_server.sh   # the AgentX 1M point (see the recipe's capacity table first)
+#   MTP=1 bash run_server.sh              # NEURON_MTP: the checkpoint's MTP layers draft 3 tokens a decode step
 #
 # The radix cache keeps each session's prefix across turns; SGLANG_NEURON_HYBRID_SWA_RADIX=1 keeps the 39 sliding
 # layers' KV in SGLang's window pool under it, so only the 9 full-attention layers hold the whole context (without it
@@ -41,9 +42,16 @@ if [ "$CONTEXT" -gt 262144 ]; then
     export NEURON_RT_IO_RING_CACHE_SIZE=${NEURON_RT_IO_RING_CACHE_SIZE:-4}
 fi
 
+# NEURON_MTP (models/mimo_v2/mtp.py): one decode step verifies the previous step's 3 drafts and drafts 3 more with the
+# MTP layers (SGLANG_NEURON_MIMO_MTP_LAYERS: 3, the checkpoint's, or 1, the first one chained)
+SPEC_ARGS=()
+if [ "${MTP:-0}" = 1 ]; then
+    SPEC_ARGS=(--speculative-algorithm NEURON_MTP)
+fi
+
 exec python3 -m sglang.launch_server --model-path "$MODEL_PATH" --served-model-name "$SERVED_NAME" \
     --trust-remote-code --tp-size 64 --ep-size 64 \
     --context-length "$CONTEXT" --chunked-prefill-size "$CHUNK" --max-running-requests "$MAX_RUNNING" \
     --mem-fraction-static "$MEM_FRACTION" --swa-full-tokens-ratio "$SWA_RATIO" \
     --reasoning-parser mimo --tool-call-parser mimo \
-    --host "$HOST" --port "$PORT" "$@"
+    --host "$HOST" --port "$PORT" "${SPEC_ARGS[@]}" "$@"

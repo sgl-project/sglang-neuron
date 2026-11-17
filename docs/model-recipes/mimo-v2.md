@@ -7,8 +7,9 @@ the target is InferenceX AgentX at 256K and 1M contexts. The checkpoint conversi
 that port's eager fp32 attention gathers the whole context every step and cannot serve 256K.
 
 **Status:** served on a trn2.48xlarge at 8K, 256K and 1M contexts with FP8 experts (the measurements below; Neuron SDK
-2.33.0, the release image `pytorch-inference-sglang-neuron:v0.1.0` with this tree on `PYTHONPATH`). Not yet: MTP, an FP8
-KV cache, DP attention / DCP, an AgentX run.
+2.33.0, the release image `pytorch-inference-sglang-neuron:v0.1.0` with this tree on `PYTHONPATH`), and with
+`--speculative-algorithm NEURON_MTP` (the checkpoint's 3 MTP layers, [below](#mtp-neuron_mtp)). Not yet: an FP8 KV cache,
+DP attention / DCP, PD.
 
 ## The model
 
@@ -22,7 +23,7 @@ KV cache, DP attention / DCP, an AgentX run.
 | V | times `attention_value_scale` (0.707) before it is cached |
 | MLP | layer 0 dense (intermediate 16384); layers 1-47 MoE: 256 experts, top 8, intermediate 2048, no shared expert |
 | router | sigmoid; noaux_tc with one group: top 8 of score + `e_score_correction_bias`, weights from the scores, renormalized |
-| MTP | 3 layers (`model.mtp.layers.*`), not loaded yet |
+| MTP | 3 layers (`model.mtp.layers.*`): sliding attention (the sliding kind's heads and RoPE, window 128, sinks) and a dense MLP (16384) each |
 | context | `max_position_embeddings` 1048576 |
 
 ## The checkpoint and the weights
@@ -142,6 +143,50 @@ mimo` with the radix cache and:
 - **`SGLANG_NEURON_SAMPLER=topk_topp`**: a request that names no sampling takes the checkpoint's `generation_config`
   (temperature 1.0, top-p 0.95), as AgentX's do; the plugin's default greedy sampler answers those with a 400.
 
+### MTP (`NEURON_MTP`)
+
+`MTP=1 bash examples/mimo_v2/run_server.sh` adds `--speculative-algorithm NEURON_MTP` (`speculative/neuron_mtp.py`):
+one decode step verifies the previous step's 3 drafts and drafts 3 more on the device, with Hy3's step
+(`models/hy_v3/mtp_step.py`, `runtime.py`: a device carry of each request slot's next tokens and length, the host's
+per-row control) and MiMo's graphs (`models/mimo_v2/mtp.py`, `mtp_step.py`, `model.MiMoV2Graph._mtp_decode`):
+
+- **Verify**: every target layer runs each row's 4 tokens at once, nkilib's `attention_block_tkg` at `S_tkg = 4` over a
+  span mask (`attention.span_mask`: the prior ends at the row's committed length, the sliding layers' window starts at
+  each token's own position) and the 4 tokens' K/V written after it (`attention.span_slots`). The target's sample at
+  each token checks the next; the row keeps the drafts up to the first mismatch and the target's token after them, so
+  the output is the target's own sample run (greedy, or `topk_topp` keyed by position).
+- **Draft**: MTP layer k reads the target's state before its final norm and the token k + 1 ahead
+  (`eh_proj(cat(enorm(embed), hnorm(h)))`, as SGLang's multi-layer EAGLE runs MiMo's MTP: not chain-style, every layer
+  reads the target's state); its draft is its greedy pick at the row's last kept position, and its tokens past that
+  position are the drafts before it. `SGLANG_NEURON_MIMO_MTP_LAYERS=1` runs layer 0 alone, chained (EAGLE).
+- **KV**: the MTP layers' KV are the pool's layers 48-50, in the window pool (`sglang_patches/mimo_v2_launch`: an
+  AROUND hook on `ModelConfig._derive_hybrid_model` lists them among the sliding layers; the host sizes the pool 3
+  layers deeper). The prefill writes them over each chunk, the target's greedy pick and the layers' drafts after its
+  last token. The decode's sliding tables are one page wider (a step reaches 2 x 4 positions past the host's length).
+
+Two traps a step must avoid, both of which collapse every later answer to one repeated token at concurrency above 1
+and never show at concurrency 1 (`HyV3Runtime._allocated_table`, `mtp_step.span_inputs`, fixed for Hy3 too):
+
+- the step's block table reaches past a request's allocation, where its request-table row still holds an earlier
+  request's slots (now another request's or the radix tree's pages): those columns are -1;
+- a padding row reads the padding slot's carry, whose length its own steps advance by one each step: its masks then
+  opened the whole table and the K/V it wrote to the reserved slot carried what it read there, which every later
+  attention over that page (a masked window page maps to it) took in. A padding row now decodes token 0 at position 0.
+
+Measured at 8K (`CONTEXT=8192 MAX_RUNNING=16 MTP=1`), against the same server without MTP:
+
+| | no MTP | NEURON_MTP, 3 layers |
+| --- | --- | --- |
+| GSM8K (5-shot, 1319, parallel 8) | 0.895 / 619 s | **0.895 / 287 s** (accepted length 3.39) |
+| GSM8K, layer 0 chained (`SGLANG_NEURON_MIMO_MTP_LAYERS=1`, 400, parallel 1) | | 0.892 (accepted length about 2.6) |
+| decode TPOT, c=1 (GSM8K prompts, 256 tokens) | 19.45 ms | **6.67 ms** (accepted 3.41) |
+| decode TPOT, c=8 | 21.32 ms | **9.18 ms** (accepted 3.24), 743 tok/s |
+| decode TPOT, c=16 | | **11.53 ms** (accepted 3.33), 1075 tok/s |
+
+A step (4 tokens a row through the target, 3 MTP layer passes) costs 22.7 ms at c=1 and 29.7 ms at c=8, against the
+one-token step's 19.45 and 21.32: the verify runs nkilib's attention and the MoE half kernel, not the attention half
+kernel (`kernels/attn_half.py` takes one token a row).
+
 ### Pools, measured (`--mem-fraction-static 0.85`, bf16 KV, a rank)
 
 | Experts | full-attention pool | window pool |
@@ -177,7 +222,7 @@ start with another `CACHE_DIR`.
 | `--mm-enable-dp-encoder` | refused | the text decoder only; `--enable-multimodal` is refused, and a launch without it is served text-only |
 | `--mem-fraction-static 0.65` | 0.85 | a NeuronCore's HBM, with the graphs' scratchpad outside the fraction |
 | `--chunked-prefill-size 16384` | 8192 | the segmented prefill's KV segment tiles go up to 8192 |
-| `--speculative-algorithm EAGLE` (multi-layer, 3 steps) | not yet | the plugin serves only `NEURON_MTP`, a model's own in-graph MTP step; MiMo's 3 MTP layers are a next step |
+| `--speculative-algorithm EAGLE --speculative-num-steps 3 --speculative-eagle-topk 1 --speculative-num-draft-tokens 4 --enable-multi-layer-eagle` | `--speculative-algorithm NEURON_MTP` (`MTP=1`) | the same chain (3 top-1 drafts, one per MTP layer, each layer reading the target's state before its norm), verified and drafted inside the decode graph; the chain-shape flags are filled in |
 | `--reasoning-parser mimo --tool-call-parser mimo` | kept | SGLang's host-side parsers, which AgentX's tool calls need |
 | `--trust-remote-code` | kept | |
 
@@ -188,12 +233,15 @@ start with another `CACHE_DIR`.
 - Any `--kv-cache-dtype` but bf16 (for now), a dtype other than bfloat16.
 - The split q/k/v projection layout (MiMo-V2-Flash), a scaled RoPE, grouped routing, shared experts, attention biases.
 - `--enable-multimodal`, `--mm-enable-dp-encoder`.
+- `NEURON_MTP` on a PD role (the MTP step is served on an aggregated server), with other chain-shape flags than 3 / 1 / 4,
+  or with logprobs.
 
 ## Next
 
 - **The decode megakernel** ([design](../design/mimo-v2-decode-megakernel.md)): cheaper in-kernel collectives, then
   every layer in one call, then an attention at Q/K 192 and V 128 (no padding: 1.6x fewer KV bytes and reads).
-- **NEURON_MTP** with the 3 MTP layers (`mtp_host`, as Hy3's `models/hy_v3/mtp_step.py`).
+- **NEURON_MTP**: the verify's attention in the attention half kernel (`S > 1`), the MTP layers' passes in one kernel,
+  and SGLang's draft extend (rewriting the MTP layers' KV at the positions whose tokens were drafts).
 - **FP8 KV cache**: heads of 256 need the unpacked FP8 layout (nkilib packs FP8 K only up to 128 channels) and KV scales
   from a calibration, as Hy3's (vllm-project/vllm-neuron#73).
 - **PD with DP attention / DCP**: at TP64 a full layer's KV head is replicated on 16 ranks, which DP attention (attention

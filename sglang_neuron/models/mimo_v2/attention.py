@@ -68,9 +68,10 @@ class DecodeInputs:
 
 
 class MiMoAttention(nn.Module):
-    def __init__(self, config: MiMoV2Config, layer_idx: int):
+    def __init__(self, config: MiMoV2Config, layer_idx: int, kind: Optional[AttentionKind] = None):
+        """``kind`` overrides the layer's own (the MTP layer, past the target's layers, is a sliding one)."""
         super().__init__()
-        kind: AttentionKind = config.kind(layer_idx)
+        kind = kind or config.kind(layer_idx)
         self.kind = kind
         self.layer_idx = layer_idx
         self.name = config.layer_name(layer_idx)
@@ -162,6 +163,36 @@ class MiMoAttention(nn.Module):
         kv_write.write_kv(self.k_cache, self.v_cache, k_new.reshape(1, rows, KV_HEAD_DIM),
                           v_new.reshape(1, rows, KV_HEAD_DIM), md["slot_mapping"])
         return self._project_out(heads)
+
+    def span_decode(self, x, norm, cos, sin, md: dict, mask, slots, span: int, caches=None) -> tuple:
+        """The attention output [B x span, H] of ``span`` tokens a row (a NEURON_MTP step's verify, or a draft pass):
+        ``x`` [B x span, H] the residual stream, row-major, cos / sin [B x span, KV_HEAD_DIM / 2], ``mask`` the
+        layer kind's span mask (``span_mask``), ``slots`` [B x span] each token's pool slot (0 for a token the step
+        drops). The tokens attend the prior the mask opens and each other causally; their K/V are written after the
+        attention. ``caches`` (K, V) are the caches to read, if a pass of this step wrote them; returns
+        (output, K cache, V cache) as written."""
+        from sglang_neuron.backend.stack import wrap_nki
+        from sglang_neuron.models.mimo_v2.kernels import attention_block
+        from sglang_neuron.utils.hardware_config import get_logical_nc_config
+
+        if self.num_kv_heads != 1:
+            raise ValueError(f"the MiMo-V2 decode attends one KV head per rank, not {self.num_kv_heads}")
+        k_cache, v_cache = caches or (self.k_cache, self.v_cache)
+        tokens = x.shape[0]
+        rows = tokens // span
+        # [B x S, d / 2] -> the kernel's [d / 2, B, S]
+        layout = lambda t: t.reshape(rows, span, -1).permute(2, 0, 1).contiguous()  # noqa: E731
+        out, k_new, v_new = wrap_nki(attention_block.decode_masked)[get_logical_nc_config()](
+            X=x.view(rows, span, -1), rmsnorm_X_gamma=norm.weight.unsqueeze(0).to(torch.float32),
+            rmsnorm_X_eps=norm.eps, X_hidden_dim_actual=self.hidden_size, W_qkv=self.qkv_weight, cos=layout(cos),
+            sin=layout(sin), K_cache=k_cache, V_cache=v_cache, sink=self._sink_column(), softmax_scale=self.scaling,
+            active_blocks_table=md["block_table_tensor"], attention_mask=mask)
+        # out [B, heads, d, S]; K [d, B, S] and V [B, 1, S, d] for one KV head (nkilib attention_block_tkg)
+        heads = out.reshape(rows, self.num_heads, KV_HEAD_DIM, span).permute(0, 3, 1, 2).reshape(
+            tokens, self.num_heads, KV_HEAD_DIM)
+        k_cache, v_cache = kv_write.write_kv(k_cache, v_cache, k_new.reshape(KV_HEAD_DIM, tokens).t().reshape(
+            1, tokens, KV_HEAD_DIM), v_new.reshape(1, tokens, KV_HEAD_DIM), slots)
+        return self._project_out(heads), k_cache, v_cache
 
     def _fused_decode(self, x, norm, cos, sin, md, inputs: DecodeInputs) -> torch.Tensor:
         """The attention half in one kernel (kernels/attn_half.py), its partial all-reduced."""
@@ -271,3 +302,37 @@ def decode_masks(attn_metadata: dict, positions: torch.Tensor, config: MiMoV2Con
     elif full_mask is not None:
         out["full"] = DecodeInputs(positions=positions, mask=kernel_layout(full_mask))
     return out
+
+
+def span_mask(md: dict, prior_end: torch.Tensor, positions: torch.Tensor, *, window: Optional[int], num_heads: int):
+    """A layer kind's decode mask in the kernel's layout for ``positions`` [B, S] (S tokens a row, which see each
+    other causally), whose prior ends (exclusive) at ``prior_end`` [B, S]: the full layers' over the row's whole
+    table, the sliding layers' over the trimmed one (``swa_kv_pos_offset``), from each token's own window start."""
+    from sglang_neuron.ops.attention.attention_decode_mask import gen_attention_decode_mask, qk_swap_layout
+
+    rows, span = positions.shape
+    page = md["block_size"]
+    end, start = prior_end.to(torch.int64), None
+    if window:
+        offset = md["swa_kv_pos_offset"].to(torch.int64).reshape(rows, 1)
+        end = (end - offset).clamp(min=0)
+        start = (positions.to(torch.int64) - offset - window + 1).clamp(min=0)
+        start = torch.minimum(start, end).reshape(1, rows * span).to(torch.float32)
+    mask = gen_attention_decode_mask(end.reshape(1, rows * span).to(torch.float32), bs=rows, q_head=num_heads,
+                                     s_active=span, s_prior=md["max_blocks_per_seq"] * page, block_len=page,
+                                     start_pos=start)
+    return qk_swap_layout(mask, d_head=KV_HEAD_DIM, fp8_kv=False, fp8_packed=False)
+
+
+def span_slots(md: dict, positions: torch.Tensor, valid: torch.Tensor, *, window: Optional[int]) -> torch.Tensor:
+    """[B x S] the pool slot of each token at ``positions`` [B, S] from its row's table (the sliding layers' trimmed
+    one, in the window pool), 0 (SGLang's reserved slot) where ``valid`` is False or the page is unallocated."""
+    table = md["block_table_tensor"].to(torch.int64)
+    page = md["block_size"]
+    pos = positions.to(torch.int64)
+    frame = pos - md["swa_kv_pos_offset"].to(torch.int64).reshape(-1, 1) if window else pos
+    raw = frame.div(page, rounding_mode="floor")
+    block = table.gather(1, raw.clamp(min=0, max=table.shape[1] - 1))
+    slot = block * page + pos % page
+    keep = valid & (block >= 0) & (raw >= 0) & (raw < table.shape[1])
+    return torch.where(keep, slot, torch.zeros_like(slot)).reshape(-1)

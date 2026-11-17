@@ -15,7 +15,13 @@
    the derivation all four read KV_HEAD_DIM, and the pool, its sizing and the host pools agree with the graphs. The
    graphs read their own dims from the checkpoint's config, which is left as it is.
 
-Both targets are md5-pinned against upstream SGLang 43881a7."""
+3. **The MTP layers' KV.** Under ``--speculative-algorithm NEURON_MTP`` the graphs hold the checkpoint's MTP
+   layers, sliding-window layers whose KV is the pool's layers after the target's (models/mimo_v2/mtp.py; the host
+   sizes the pool deeper). ``ModelConfig._derive_hybrid_model`` splits the target's layers between the
+   window and full pools from ``hybrid_layer_pattern``, which has no entry for them, so after the derivation the MTP
+   layers the draft runs (from ``num_hidden_layers`` on) are listed among the sliding ones.
+
+The targets are md5-pinned against upstream SGLang 43881a7."""
 
 from __future__ import annotations
 
@@ -24,6 +30,8 @@ _EXPECTED_TP_MD5 = "ffe9726373f082e7a56f83be9f21b518"
 SHAPES = "sglang.srt.configs.model_config.ModelConfig._derive_model_shapes"
 _SHAPES_MD5 = "64913dc453d37806c81fb665fccd9802"
 _HEAD_DIMS = ("head_dim", "v_head_dim", "swa_head_dim", "swa_v_head_dim")
+HYBRID = "sglang.srt.configs.model_config.ModelConfig._derive_hybrid_model"
+_HYBRID_MD5 = "4fc5ddc6ee6b948a2bffc07ede1501dc"
 
 
 def _is_mimo_v2(architectures) -> bool:
@@ -48,12 +56,27 @@ def derive_model_shapes(original_fn, self, *args, **kwargs):
     return result
 
 
+def derive_hybrid_model(original_fn, self, *args, **kwargs):
+    result = original_fn(self, *args, **kwargs)
+    from sglang_neuron.speculative.neuron_mtp import is_neuron_mtp
+
+    ids = getattr(self, "swa_attention_layer_ids", None)
+    if (_is_mimo_v2(getattr(self.hf_config, "architectures", None)) and ids is not None
+            and is_neuron_mtp(getattr(self, "speculative_algorithm", None)) and not self.is_draft_model):
+        from sglang_neuron.models.mimo_v2.mtp import num_layers
+
+        first = int(self.hf_text_config.num_hidden_layers)
+        self.swa_attention_layer_ids = [*ids, *(i for i in range(first, first + num_layers()) if i not in ids)]
+    return result
+
+
 def register(registry, around, replace) -> None:
     from sglang_neuron.sglang_patches import source_guard
 
-    for target, md5 in ((EXPECTED_TP, _EXPECTED_TP_MD5), (SHAPES, _SHAPES_MD5)):
+    for target, md5 in ((EXPECTED_TP, _EXPECTED_TP_MD5), (SHAPES, _SHAPES_MD5), (HYBRID, _HYBRID_MD5)):
         module_name = "sglang.srt.configs.model_config"
         source_guard.check(source_guard.resolve(module_name, target.removeprefix(module_name + ".")), md5, target,
                            __name__)
     registry.register(EXPECTED_TP, no_expected_tp_size, replace)
     registry.register(SHAPES, derive_model_shapes, around)
+    registry.register(HYBRID, derive_hybrid_model, around)

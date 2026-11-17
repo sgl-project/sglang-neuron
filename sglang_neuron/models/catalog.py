@@ -231,7 +231,9 @@ MODELS = {
     "MiMoV2ForCausalLM": ModelSpec(package="sglang_neuron.models.mimo_v2",
                                    kv_cache_dtypes=("auto", "bf16", "bfloat16"),
                                    quantizations=("fp8",), launch_hooks="sglang_neuron.models.mimo_v2.launch",
-                                   hybrid_swa_memory=True),
+                                   hybrid_swa_memory=True,
+                                   # NEURON_MTP: the checkpoint's first MTP layer drafts in the decode step
+                                   mtp_host="sglang_neuron.models.mimo_v2.mtp_step"),
     "DeepseekV2ForCausalLM": ModelSpec(package="sglang_neuron.models.deepseek_v2",
                                        kv_cache_dtypes=("auto", "bf16", "bfloat16"), prefill_holds_prior=True),
     # GLM-5.2 (models/glm52), one host whose PD role picks its giga kernel (sglang_model.py) and one set of

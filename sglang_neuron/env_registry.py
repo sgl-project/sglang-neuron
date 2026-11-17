@@ -40,6 +40,7 @@ KNOBS: dict = {
     "SGLANG_NEURON_MIMO_DECODE_MOE_FUSED": CONFIG,
     "SGLANG_NEURON_MIMO_DECODE_ATTN_FUSED": CONFIG,
     "SGLANG_NEURON_MIMO_DECODE_LAYER_KERNEL": CONFIG,
+    "SGLANG_NEURON_MIMO_MTP_LAYERS": CONFIG,
     # the Kimi-K3 prompt cache on the PD prefill (--radix-cache-backend kimi-prompt, mem_cache/kimi_prompt_backend):
     # its host tier, keep_previous, the chunk ends and the read-back of each page copy of a hit
     "SGLANG_NEURON_KIMI_PROMPT_HOST_SLOTS": CONFIG,

@@ -174,14 +174,21 @@ class BucketConfig:
         whose prefill takes the chunk alone (``prefill_ladder`` false) runs the chunk's graph only. A decode runs one
         graph per batch size SGLang resolved (--cuda-graph-bs-decode, else the platform's default) up to the per-DP
         batch, and one of the per-DP batch itself, each over the whole context (--context-length), and with
-        ``decode_context_ladder`` also over its quarter and its half. A disaggregated decode (``prefill`` false) has no
+        ``decode_context_ladder`` also over its quarter and its half, or over the contexts a callable of the context
+        gives (a model's own rungs, ModelHost.decode_context_ladder). A disaggregated decode (``prefill`` false) has no
         prefill bucket. Under DCP (``kv_shards`` above 1) each context becomes its DCP decode context, by the decode
         kernel's rule (``dcp_context_rule``, default decode_context_parallel.decode_context)."""
         from sglang_neuron.utils.bucket_utils import SUPPORTED_KV_SEGMENT_SIZES
 
         tile = _lnc_degree() * P_MAX
         max_model_len = _round_up(max_model_len, tile)
-        contexts = sorted({_round_up(max_model_len // q, tile) for q in ((4, 2, 1) if decode_context_ladder else (1,))})
+        # True: the quarter and the half too; a model may give its own rungs as the contexts themselves (a callable of
+        # the context, ModelHost.decode_context_ladder)
+        if callable(decode_context_ladder):
+            rungs = [int(c) for c in decode_context_ladder(max_model_len) if 0 < int(c) <= max_model_len]
+        else:
+            rungs = [max_model_len // q for q in ((4, 2, 1) if decode_context_ladder else (1,))]
+        contexts = sorted({_round_up(c, tile) for c in rungs + [max_model_len]})
         if kv_shards > 1:
             from sglang_neuron.distributed.decode_context_parallel import decode_context
 
@@ -410,7 +417,7 @@ class NeuronModelRuntime:
             prefill_token_counts=resolution_result(sa, "cuda_graph_bs_prefill", None),
             prefill_ladder=sgl_model.prefill_ladder,
             # the DP ranks of a lockstep decode share no row lengths, so they could not agree on a context rung
-            decode_context_ladder=sgl_model.decode_context_ladder and not self.dp_lockstep,
+            decode_context_ladder=False if self.dp_lockstep else sgl_model.decode_context_ladder,
             kv_shards=1 if self.dcp is None else self.dcp.size,
             dcp_context_rule=None if self.dcp is None else self.dcp_decode_context,
         )

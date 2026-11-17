@@ -43,8 +43,28 @@ def check_layout(config: MiMoV2Config, tp: int, ep: int, attn_dp: int) -> None:
 
 class MiMoV2ForCausalLM(ModelHost):
     name = NAME
-    # the decode attention reads only its graph's table (the trimmed window on the sliding layers)
-    decode_context_ladder = True
+
+    def _set_stage(self, config) -> None:
+        super()._set_stage(config)
+        from sglang_neuron.models.mimo_v2 import mtp
+
+        if mtp.enabled():
+            # the KV pool's layers after the target's are the MTP layers' (SGLang sizes the pool from end_layer)
+            self.end_layer += mtp.num_layers()
+
+    @property
+    def runtime_class(self):
+        from sglang_neuron.models.mimo_v2.runtime import MiMoV2Runtime
+
+        return MiMoV2Runtime
+
+    @staticmethod
+    def decode_context_ladder(context: int) -> list:
+        """The decode's contexts (graph_runner.BucketConfig): the decode attention reads its graph's whole table, so a
+        row's step costs its graph's context, not its own. Rungs at 1/2, 1/4, 1/16 and 1/64 of the context, none
+        below 8K: an AgentX step of rows of 10K-200K at a 1M server runs a 16K-256K graph instead of a 256K one."""
+        rungs = {context // q for q in (1, 2, 4, 16, 64)}
+        return sorted(r for r in rungs if r >= min(8192, context))
 
     def check_launch(self, config) -> None:
         from sglang_neuron import sglang_tree
