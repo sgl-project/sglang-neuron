@@ -250,6 +250,22 @@ def greedy_sharded_logits(logits, group, rank, vocabulary_size, top_logprobs=MAX
     return result
 
 
+def greedy_draft_tokens(logits, group, rank, vocabulary_size):
+    """[R] int32: each row's greedy token over vocabulary shards, ties to the smallest id, as greedy_sharded_logits's
+    ``token_ids``, without its logprobs: a speculative draft needs only the token. Its float32 columns and ids stay
+    exact below 2**24; the all-gather carries two values a row."""
+    if vocabulary_size >= 2**24:
+        raise ValueError("Packed float32 token IDs require a vocabulary smaller than 2**24")
+    width = logits.shape[-1]
+    columns = torch.arange(width, dtype=torch.float32, device=logits.device)
+    offset = rank.to(torch.float32).reshape(1, 1) * width
+    logits = logits.float().masked_fill((columns.unsqueeze(0) + offset) >= vocabulary_size, float("-inf"))
+    value, first = _max_smallest_id(logits, columns, width - 1)
+    gathered = neuron_collectives.all_gather(group, torch.cat([value, first + offset], dim=-1), dim=-1)
+    _, token, _ = _shard_winner(gathered.reshape(logits.shape[0], group.world_size, 2), vocabulary_size)
+    return token.squeeze(1).to(torch.int32)
+
+
 def sampled_positions(positions: torch.Tensor, sampling_positions: torch.Tensor) -> torch.Tensor:
     """Position of each sampled row's input token (the key of its draw)."""
     return torch.index_select(positions.reshape(-1), 0, sampling_positions.reshape(-1).to(torch.int64))

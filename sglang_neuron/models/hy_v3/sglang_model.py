@@ -185,6 +185,15 @@ class HyV3Graph(Qwen3MoeGraph):
         return sampling.greedy_sharded_logits(logits, group, group.rank_in_group_tensor, self.config.vocab_size,
                                               top_logprobs=0)["token_ids"]
 
+    def draft_token(self, logits: torch.Tensor) -> torch.Tensor:
+        """greedy_token for an MTP draft: the same token, without the logprobs a draft never returns."""
+        from sglang_neuron import sampling
+
+        if self.lm_head.gather_output:
+            return torch.argmax(logits, dim=-1).to(torch.int32)
+        group = self.lm_head_tp_group
+        return sampling.greedy_draft_tokens(logits, group, group.rank_in_group_tensor, self.config.vocab_size)
+
     def build_mlp(self, config: TransformerConfig, layer_idx: int) -> nn.Module:
         if layer_idx < self.moe.first_k_dense_replace:
             return ShardedMLP(config.hidden_size, config.intermediate_size)
@@ -355,7 +364,7 @@ class HyV3Graph(Qwen3MoeGraph):
         state = self.mtp.decode(self, sampled.reshape(-1), normed, span["positions"].reshape(-1), inputs, cos, sin,
                                 rank).view(width, spec, -1)
         prev = state.gather(1, kept.reshape(width, 1, 1).expand(width, 1, state.shape[-1])).reshape(width, -1)
-        draft = self.greedy_token(self.lm_head(prev)).to(torch.int64)
+        draft = self.draft_token(self.lm_head(prev)).to(torch.int64)
         drafts = [draft]
         live = span["live"].reshape(width, 1)
         for i in range(1, mtp_step.NUM_STEPS):
@@ -372,7 +381,7 @@ class HyV3Graph(Qwen3MoeGraph):
                                           local_pos=one["local_pos"])
             q_cos, q_sin = self.rotary_emb(q)
             prev = self.mtp.decode(self, draft, prev, q, step_inputs, q_cos, q_sin, rank)
-            draft = self.greedy_token(self.lm_head(prev)).to(torch.int64)
+            draft = self.draft_token(self.lm_head(prev)).to(torch.int64)
             drafts.append(draft)
         return torch.stack(drafts, dim=1)
 
