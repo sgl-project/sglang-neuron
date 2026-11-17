@@ -232,7 +232,8 @@ one KV pool (`--disable-hybrid-swa-memory`). `models/mimo_v2/attention.py`:
 Measured at 8K (bf16 cache, no MTP): GSM8K 0.901 (1319, parallel 8); decode TPOT 33.87 / 46.48 / 53.94 ms at
 c = 1 / 8 / 16 (19.45 / 21.32 ms without DCP: the DCP step runs nkilib's attention kernel with its collectives on all 48
 layers, not the fused attention half). The pool holds 2620 pages of 128 tokens a rank for every layer, 2.68M tokens of
-context over the group: DCP is the capacity point (1M contexts, more of them), not the latency one. Not yet with
+context over the group: DCP is the capacity point (1M contexts, more of them), not the latency one. With the FP8 cache
+(`--kv-cache-dtype fp8_e4m3`): GSM8K 0.910, TPOT 34.96 / 46.88 ms at c = 1 / 8, 5240 pages a rank (5.37M tokens). Not yet with
 NEURON_MTP or the hybrid window pool.
 
 ### Pools, measured (`--mem-fraction-static 0.85`, bf16 KV, a rank)
