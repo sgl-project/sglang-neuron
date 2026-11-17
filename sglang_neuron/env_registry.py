@@ -32,6 +32,14 @@ KNOBS: dict = {
     "SGLANG_NEURON_GLM52_POINT": CONFIG,
     "SGLANG_NEURON_GLM52_MTP_SYNTHETIC_AL": BENCHMARK,
     "SGLANG_NEURON_GLM52_ATTN_W8": CONFIG,
+    # MiMo-V2 (models/mimo_v2): the routed experts' format (fp8, converted without loss, or bf16), the full layers'
+    # decode attention (mask or posid) and the K/V write's torch path (kv_write.py)
+    "SGLANG_NEURON_MIMO_EXPERTS": CONFIG,
+    "SGLANG_NEURON_MIMO_FULL_DECODE": CONFIG,
+    "SGLANG_NEURON_MIMO_KV_WRITE_TORCH": CONFIG,
+    "SGLANG_NEURON_MIMO_DECODE_MOE_FUSED": CONFIG,
+    "SGLANG_NEURON_MIMO_DECODE_ATTN_FUSED": CONFIG,
+    "SGLANG_NEURON_MIMO_DECODE_LAYER_KERNEL": CONFIG,
     # the Kimi-K3 prompt cache on the PD prefill (--radix-cache-backend kimi-prompt, mem_cache/kimi_prompt_backend):
     # its host tier, keep_previous, the chunk ends and the read-back of each page copy of a hit
     "SGLANG_NEURON_KIMI_PROMPT_HOST_SLOTS": CONFIG,
