@@ -36,6 +36,7 @@ KNOBS: dict = {
     "SGLANG_NEURON_HY3_ATTN_FP8": CONFIG,
     "SGLANG_NEURON_HY3_SPARSE_SELECT_EVERY": CONFIG,
     "SGLANG_NEURON_HY3_PREFILL_SEG": CONFIG,
+    "SGLANG_NEURON_HY3_SPARSE_PREFILL_KEEP": CONFIG,
     "SGLANG_NEURON_HY3_PD_MTP_KV": CONFIG,
     # GLM-5.2 (models/glm52): the decode's weight store, the prefill's MTP rows for a drafting decode, the decode
     # point, the benchmark's pinned MTP acceptance and the decode's FP8 attention weights

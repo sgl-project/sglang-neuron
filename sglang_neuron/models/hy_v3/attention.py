@@ -325,16 +325,22 @@ class Fp8Attention(Attention):
         cached = md["cached_seq_len"].to(torch.int32).reshape(1, 1)
         table = md["block_table_tensor"].to(torch.int32)
         table = torch.where(table < 0, torch.zeros_like(table), table)
+        seg = min(tokens, prefill_seg(size * page))
+        offset, prior, kv_table = cached, torch.div(cached, size, rounding_mode="floor"), table[:1]
         if self.sparse is not None:
             self._refresh_prefill(k_cache, table[0], cached, md, page, tokens)
+            keep = sparse.prefill_keep_pages(size, page)
+            # the kernel loads seg / page local pages for the chunk itself after the prior
+            if keep and keep + seg // page < table.shape[1]:
+                kv_table, offset, prior = sparse.prefill_select(self.sparse, q, table[0], cached, size, page, keep,
+                                                                seg // page, self.dcp_group)
         out = wrap_nki(_prefill_kv_parallel)[get_logical_nc_config()](
-            q, k_cache=k_cache, v_cache=v_cache, block_tables=table[:1], kvp_q_offset=cached,
+            q, k_cache=k_cache, v_cache=v_cache, block_tables=kv_table, kvp_q_offset=offset,
             kvp_rank_id=self.dcp_group.rank_in_group_tensor.to(torch.int32).reshape(1, 1),
-            valid_num_prior_tokens=torch.div(cached, size, rounding_mode="floor"),
+            valid_num_prior_tokens=prior,
             k_scale=self._scale_tensor(self.k_scale_float, P_MAX, q.device),
             v_scale=self._scale_tensor(self.v_scale_float, P_MAX, q.device),
-            scale=self.scaling, block_size=page, seg_size=min(tokens, prefill_seg(size * page)), dcp_size=size,
-            prior_seg_size=size * page,
+            scale=self.scaling, block_size=page, seg_size=seg, dcp_size=size, prior_seg_size=size * page,
             dcp_mesh=self._mesh(),
         )
         out = out.transpose(0, 1).reshape(tokens, -1) @ md["_o_weight"]

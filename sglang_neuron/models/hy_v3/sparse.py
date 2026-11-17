@@ -35,6 +35,10 @@ if SELECT_EVERY < 1:
     raise ValueError(f"SGLANG_NEURON_HY3_SPARSE_SELECT_EVERY={SELECT_EVERY}: set a layer count of at least 1")
 SINK_PAGES = 1
 RECENT_PAGES = 2
+# SGLANG_NEURON_HY3_SPARSE_PREFILL_KEEP=<tokens>: a DCP prefill chunk over a longer prior attends to that many of its
+# prior tokens (whole virtual pages, a multiple of 8 local pages: the prefill kernel's prior segment), picked by the same
+# bound with the chunk's queries; 0 (default) attends to the whole prior
+PREFILL_KEEP = int(os.environ.get("SGLANG_NEURON_HY3_SPARSE_PREFILL_KEEP", "0") or 0)
 # the kept pages are whole quanta of 32 pages (4096 tokens): the kernel reads the packed FP8 K cache in tiles of
 # 2 x LNC x P_MAX tokens (4 pages), and a row of s_prior tokens in blocks of gcd(page, s_prior / 256), 16 at 4096
 # (runtime.LOCAL_ALIGN)
@@ -234,3 +238,50 @@ def compact(bound, table, local_prior, page: int, n_keep: int):
     kept = table.gather(1, pick)
     prior = torch.where(dense, n, (n_keep - 2) * page + (n - full * page)).view(rows)
     return kept.to(torch.int32), prior
+
+
+def prefill_keep_pages(size: int, page: int) -> int:
+    """Local pages a sparse DCP prefill chunk keeps of its prior (0: dense)."""
+    if PREFILL_KEEP <= 0:
+        return 0
+    vpage, quantum = size * page, 8
+    keep = PREFILL_KEEP // vpage
+    if PREFILL_KEEP % vpage or keep % quantum or keep <= SINK_PAGES + RECENT_PAGES:
+        raise ValueError(f"SGLANG_NEURON_HY3_SPARSE_PREFILL_KEEP={PREFILL_KEEP}: give a multiple of {vpage * quantum} "
+                         f"tokens ({quantum} virtual pages of {vpage})")
+    return keep
+
+
+def prefill_select(state: SparseState, q, table_row, cached, size: int, page: int, keep: int, active: int, dcp_group):
+    """The table, query offset and prior length of a DCP prefill chunk that attends to ``keep`` of its local prior
+    pages. ``q`` [h, T, d] the chunk's queries on this rank (after the QK-norm and RoPE), ``table_row`` [pages] the
+    request's local pages, ``cached`` [1, 1] the chunk's first position (whole virtual pages), ``active`` the pages the
+    kernel loads for the chunk itself (its query segment / page).
+
+    The kernel treats the prior as fully visible and masks only the chunk's own pages by position, so the kept pages
+    are packed first and the chunk's pages follow, with the chunk's position moved to ``keep`` virtual pages: RoPE is
+    already in Q and K, and the mask inside the chunk depends only on positions relative to it. A prior of at most
+    ``keep`` pages keeps the request's own table, position and prior (dense)."""
+    pages = table_row.shape[0]
+    full = torch.div(cached.reshape(1).to(torch.int64), size * page, rounding_mode="floor")  # local prior pages
+    qa = neuron_collectives.all_gather(dcp_group, q.contiguous(), dim=0).float()  # the group's heads [H, T, d]
+    qa = qa.reshape(-1, qa.shape[-1])
+    blocks = table_row.to(torch.int64)
+    summ = state.summary.index_select(0, blocks).float()  # [pages, 2, d]
+    bound = (F.relu(qa) @ summ[:, 1].t() + torch.clamp(qa, max=0) @ summ[:, 0].t()).amax(dim=0)  # [pages]
+    idx = torch.arange(pages, device=table_row.device)
+    big = torch.finfo(torch.float32).max
+    forced = (idx < SINK_PAGES) | (idx >= full - RECENT_PAGES)
+    score = torch.where(idx < full, torch.where(forced, big, bound), -big)
+    top = torch.topk(score, keep).indices  # the kept prior pages (any order: the prior is fully visible)
+    width = keep + active
+    lane = torch.arange(width, device=table_row.device)
+    top = torch.cat([top, torch.zeros(active, dtype=top.dtype, device=top.device)])  # lanes past keep: the chunk
+    sparse_pick = torch.where(lane < keep, top, full + (lane - keep))
+    sparse = full > keep
+    pick = torch.clamp(torch.where(sparse, sparse_pick, lane), max=pages - 1)
+    table = table_row.gather(0, pick).view(1, width).to(torch.int32)
+    vpages = torch.where(sparse, torch.full_like(full, keep), full)
+    offset = (vpages * size * page).to(torch.int32).view(1, 1)
+    prior = (vpages * page).to(torch.int32).view(1, 1)
+    return table, offset, prior
