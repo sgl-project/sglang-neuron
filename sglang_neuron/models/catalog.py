@@ -229,7 +229,8 @@ MODELS = {
                                        megakernel=MegakernelServing(dp_steps_from_exchange=True, async_steps=True)),
     # MiMo-V2's text decoder (MiMo-V2.6-Flash-RL, MiMo-V2.5): the sliding layers' KV in SGLang's window pool
     "MiMoV2ForCausalLM": ModelSpec(package="sglang_neuron.models.mimo_v2",
-                                   kv_cache_dtypes=("auto", "bf16", "bfloat16"),
+                                   # FP8: token-major K and V in Trn2's e4m3 (models/mimo_v2/attention.py)
+                                   kv_cache_dtypes=("auto", "bf16", "bfloat16", "fp8_e4m3"),
                                    quantizations=("fp8",), launch_hooks="sglang_neuron.models.mimo_v2.launch",
                                    hybrid_swa_memory=True,
                                    # NEURON_MTP: the checkpoint's first MTP layer drafts in the decode step

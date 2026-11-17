@@ -353,6 +353,8 @@ class MiMoV2Graph(nn.Module):
     def _layer_kernel_serves(layer) -> bool:
         """Whether ``layer``'s decode runs as one kernel: a dense layer, or an MoE layer whose experts the MoE half
         kernel takes (moe.MiMoV2MoE.fused)."""
+        if layer.self_attn.fp8_kv:
+            return False  # its attention half takes the bf16 cache only
         return isinstance(layer.mlp, DenseMLP) or getattr(layer.mlp, "fused", False)
 
     def _step_inputs(self, tables, attn_metadata, layer) -> dict:

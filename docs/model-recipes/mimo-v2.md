@@ -8,8 +8,8 @@ that port's eager fp32 attention gathers the whole context every step and cannot
 
 **Status:** served on a trn2.48xlarge at 8K, 256K and 1M contexts with FP8 experts (the measurements below; Neuron SDK
 2.33.0, the release image `pytorch-inference-sglang-neuron:v0.1.0` with this tree on `PYTHONPATH`), and with
-`--speculative-algorithm NEURON_MTP` (the checkpoint's 3 MTP layers, [below](#mtp-neuron_mtp)). Not yet: an FP8 KV cache,
-DP attention / DCP, PD.
+`--speculative-algorithm NEURON_MTP` (the checkpoint's 3 MTP layers, [below](#mtp-neuron_mtp)) and the FP8 KV cache
+(`--kv-cache-dtype fp8_e4m3`, [below](#fp8-kv-cache)). Not yet: DP attention / DCP, PD.
 
 ## The model
 
@@ -187,6 +187,25 @@ A step (4 tokens a row through the target, 3 MTP layer passes) costs 22.7 ms at 
 one-token step's 19.45 and 21.32: the verify runs nkilib's attention and the MoE half kernel, not the attention half
 kernel (`kernels/attn_half.py` takes one token a row).
 
+### FP8 KV cache
+
+`--kv-cache-dtype fp8_e4m3` (`models/mimo_v2/attention.py`): K and V pages in Trn2's e4m3 (at most 240), each value
+times `SGLANG_NEURON_MIMO_KV_SCALE` (1.0 by default; the checkpoint has no KV scales), both token-major `[page, 256]`.
+The platform pool packs FP8 K (two tokens a bf16-sized slot) for kernels that read it so up to 128 channels; MiMo
+declares `KVLayout(fp8_k_packed=False)` because nkilib's decode attention reads FP8 heads of 256 only token-major.
+
+- **Decode**: `attention_block_tkg` with `k_scale` / `v_scale` quantizes the new token's K/V itself (clip(x * scale)),
+  the fused attention half kernel writes them as they come, 1 / k_scale goes into the softmax scale and 1 / v_scale
+  into the output projection (`tools/mimo_v2/check_attn_half.py --fp8`).
+- **Prefill**: nkilib's segmented attention reads FP8 K only packed, so the prefill packs the pages it reads
+  (`attention.pack_prior`: a sliding layer its window's few pages, a full layer its table), by an FP8 gather and
+  transpose (a uint8 view of the cache fails the compiler's type check: `Type mismatch uint8 vs float8_e4m3`)
+  (`tools/mimo_v2/check_prefill_fp8.py`: equal to the bf16 kernel over the dequantized cache).
+- The one-kernel layer (`SGLANG_NEURON_MIMO_DECODE_LAYER_KERNEL=1`) keeps the bf16 cache.
+
+Measured at 8K with `MTP=1` (the same server as the MTP table, bf16 cache in brackets): GSM8K 0.914 (0.895), decode TPOT
+6.54 / 8.84 / 11.48 ms at c = 1 / 8 / 16 (6.67 / 9.18 / 11.53); the pool holds 2.79M full-layer tokens a rank (1.53M).
+
 ### Pools, measured (`--mem-fraction-static 0.85`, bf16 KV, a rank)
 
 | Experts | full-attention pool | window pool |
@@ -230,7 +249,8 @@ start with another `CACHE_DIR`.
 
 - DP attention, `--dcp-size`, `--pp-size`; a layout whose heads, KV heads, experts or intermediate sizes do not shard
   (every rank holds exactly one KV head: `--tp-size` a multiple of 8).
-- Any `--kv-cache-dtype` but bf16 (for now), a dtype other than bfloat16.
+- A `--kv-cache-dtype` other than bf16 or `fp8_e4m3`, a dtype other than bfloat16;
+  `SGLANG_NEURON_MIMO_FULL_DECODE=posid` with the FP8 cache.
 - The split q/k/v projection layout (MiMo-V2-Flash), a scaled RoPE, grouped routing, shared experts, attention biases.
 - `--enable-multimodal`, `--mm-enable-dp-encoder`.
 - `NEURON_MTP` on a PD role (the MTP step is served on an aggregated server), with other chain-shape flags than 3 / 1 / 4,
@@ -242,7 +262,7 @@ start with another `CACHE_DIR`.
   every layer in one call, then an attention at Q/K 192 and V 128 (no padding: 1.6x fewer KV bytes and reads).
 - **NEURON_MTP**: the verify's attention in the attention half kernel (`S > 1`), the MTP layers' passes in one kernel,
   and SGLang's draft extend (rewriting the MTP layers' KV at the positions whose tokens were drafts).
-- **FP8 KV cache**: heads of 256 need the unpacked FP8 layout (nkilib packs FP8 K only up to 128 channels) and KV scales
-  from a calibration, as Hy3's (vllm-project/vllm-neuron#73).
+- **FP8 KV cache**: per-layer KV scales from a calibration (as Hy3's profile), and the prefill's full-layer packing
+  limited to the prior's pages.
 - **PD with DP attention / DCP**: at TP64 a full layer's KV head is replicated on 16 ranks, which DP attention (attention
   TP 8: 2 ranks a head) or DCP removes; both run on a PD pair only, where the window pool is not served yet.

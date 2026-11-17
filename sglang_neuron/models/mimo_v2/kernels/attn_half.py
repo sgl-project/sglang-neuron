@@ -29,7 +29,7 @@ COLS = 512
 
 
 def _attention(X, X_hidden_dim_actual, rmsnorm_X_eps, rmsnorm_X_gamma, W_qkv, cos, sin, active_blocks_table, K_cache,
-               V_cache, attention_mask, sink, softmax_scale):
+               V_cache, attention_mask, sink, softmax_scale, k_scale=None, v_scale=None):
     return attention_block_tkg(
         X=X, X_hidden_dim_actual=X_hidden_dim_actual, rmsnorm_X_enabled=True, rmsnorm_X_eps=rmsnorm_X_eps,
         rmsnorm_X_gamma=rmsnorm_X_gamma, W_qkv=W_qkv, bias_qkv=None, quantization_type_qkv=QuantizationType.NONE,
@@ -40,15 +40,17 @@ def _attention(X, X_hidden_dim_actual, rmsnorm_X_eps, rmsnorm_X_gamma, W_qkv, co
         active_blocks_table=active_blocks_table, K_cache=K_cache, V_cache=V_cache, attention_mask=attention_mask,
         sink=sink, update_cache=False, kv_cache_update_idx=None, W_out=None, bias_out=None,
         quantization_type_out=QuantizationType.NONE, weight_dequant_scale_out=None, input_dequant_scale_out=None,
-        transposed_out=False, out_in_sb=False, softmax_scale=softmax_scale,
+        transposed_out=False, out_in_sb=False, softmax_scale=softmax_scale, k_scale=k_scale, v_scale=v_scale,
     )
 
 
 @nki.jit
 def attn_half(X, rmsnorm_X_gamma, W_qkv, cos, sin, active_blocks_table, K_cache, V_cache, attention_mask, sink,
-              slots, W_o, rmsnorm_X_eps=1e-6, softmax_scale=1.0, v_head_dim=128):
+              slots, W_o, k_scale=None, v_scale=None, rmsnorm_X_eps=1e-6, softmax_scale=1.0, v_head_dim=128):
     """X [B, 1, H] bf16; W_qkv [H, (heads + 2) x d]; cos / sin [d / 2, B, 1]; the caches [pages, 1, page, d]; the mask
     in the kernel's layout; sink [heads, 1] fp32 or None; slots [B, 1] int32; W_o [heads x v_head_dim, H] bf16.
+    Over an FP8 cache (``k_scale`` / ``v_scale`` [1, 1] fp32) the attention quantizes the new token's K/V, which are
+    written as they come; the caller folds 1 / k_scale into ``softmax_scale`` and 1 / v_scale into ``W_o``.
     Returns (partial [B, H] bf16, K_cache, V_cache)."""
     B, _, H = X.shape
     pages, _, page, d = K_cache.shape
@@ -59,7 +61,7 @@ def attn_half(X, rmsnorm_X_gamma, W_qkv, cos, sin, active_blocks_table, K_cache,
     h0 = pid * HH
 
     heads_out, k_new, v_new = _attention(X, H, rmsnorm_X_eps, rmsnorm_X_gamma, W_qkv, cos, sin, active_blocks_table,
-                                         K_cache, V_cache, attention_mask, sink, softmax_scale)
+                                         K_cache, V_cache, attention_mask, sink, softmax_scale, k_scale, v_scale)
     # the two programs each wrote a share of the rows, and each reads them all below (nkilib's transformer_tkg fences
     # its attention output the same way)
     if n_prg > 1:

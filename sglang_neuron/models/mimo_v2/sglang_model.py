@@ -80,6 +80,13 @@ class MiMoV2ForCausalLM(ModelHost):
             raise ValueError(f"{NAME}: --pp-size is not served; the graphs build every layer")
 
     def build_graph(self, phase: str, config) -> nn.Module:
+        from sglang_neuron.models.mimo_v2.attention import fp8_kv_cache
+
+        if fp8_kv_cache():
+            # token-major FP8 K pages, the layout nkilib's decode attention reads heads of 256 in (attention.py)
+            from sglang_neuron.model_executor import kv_layout
+
+            kv_layout.declare(kv_layout.KVLayout(fp8_k_packed=False))
         mimo = mimo_v2_config(config)
         suffix = expert_scale_suffix(config)
         return MiMoV2Graph(mimo, phase, quantized=bool(mimo.quant_method), expert_suffix=suffix)

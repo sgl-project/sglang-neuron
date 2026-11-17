@@ -62,9 +62,14 @@ def launch_settings(server_args) -> tuple:
     from sglang_neuron.backend.stack import get_platform_target, normalize_target_family
     from sglang_neuron.models import catalog
 
-    if fp8_experts(server_args) and normalize_target_family(get_platform_target()) == "trn2":
+    if normalize_target_family(get_platform_target()) != "trn2":
+        return ()
+    if fp8_experts(server_args):
         return (catalog.LaunchSetting(FP8_CAST, "1", "the FP8 expert kernels compile float8_e4m3fn as Trn2's e4m3 "
                                       "(the converted experts are at most 240)"),)
+    if str(getattr(server_args, "kv_cache_dtype", "auto") or "auto").startswith("fp8"):
+        return (catalog.LaunchSetting(FP8_CAST, "1", "the FP8 KV cache compiles float8_e4m3fn as Trn2's e4m3 (the "
+                                      "graphs clip its values to 240)"),)
     return ()
 
 

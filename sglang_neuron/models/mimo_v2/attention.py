@@ -15,7 +15,15 @@ the ranks, and with more ranks than KV heads each rank holds one KV head, replic
 ``SGLANG_NEURON_MIMO_FULL_DECODE=posid`` runs the full-attention layers' decode in the kernel's position mode instead
 of over a pre-built mask (no mask of the graph's context to build each step); ``mask`` (the default) is the path the
 sliding layers take and the one the layer kernels serve. Neither ends its loop early: nkilib's early exit
-(``max_context_len``) is wrong past an 8K prior (sgl-project/sglang-neuron#4)."""
+(``max_context_len``) is wrong past an 8K prior (sgl-project/sglang-neuron#4).
+
+**FP8 KV cache** (``--kv-cache-dtype fp8_e4m3``): K and V pages in Trn2's e4m3 (at most 240), each value times the
+layer's scale (``KV_SCALE_ENV``, 1.0 by default: the checkpoint carries no KV scales), both token-major
+([page, 256]; the host declares ``KVLayout(fp8_k_packed=False)``), which is the layout nkilib's decode attention reads
+FP8 heads of 256 in. The decode kernels quantize the new token's K/V themselves (``k_scale`` / ``v_scale``) and take
+1 / k_scale in the softmax scale and 1 / v_scale in the output projection. nkilib's segmented prefill reads FP8 K only
+packed (two tokens a bf16-sized slot), so the prefill packs the pages it reads (``pack_prior``): a sliding layer its
+window's few pages, a full layer its whole table."""
 
 from __future__ import annotations
 
@@ -37,6 +45,9 @@ from sglang_neuron.utils.neuron_utils import can_run_kernel
 from sglang_neuron.utils.weight_loader import set_weight_loader
 
 FULL_DECODE_ENV = "SGLANG_NEURON_MIMO_FULL_DECODE"
+# the FP8 KV cache's scale: the cache holds clip(x * scale) in e4m3 (module docstring)
+KV_SCALE_ENV = "SGLANG_NEURON_MIMO_KV_SCALE"
+FP8_KV_MAX = 240.0
 # the decode attention half in one kernel (kernels/attn_half.py: attention, K/V write, output projection): 1 (the
 # default) or 0 for nkilib's attention kernel with the write and the projection in the graph
 FUSED_ENV = "SGLANG_NEURON_MIMO_DECODE_ATTN_FUSED"
@@ -55,6 +66,57 @@ def full_decode_mode() -> str:
         raise ValueError(f"{FULL_DECODE_ENV}={value!r}: set mask (a pre-built mask, the default) or posid (the "
                          "kernel's position mode)")
     return value
+
+
+def fp8_kv_cache() -> bool:
+    """Whether the launch's KV cache is FP8 (--kv-cache-dtype fp8_e4m3)."""
+    from sglang.srt.runtime_context import get_server_args
+
+    return str(getattr(get_server_args(), "kv_cache_dtype", "auto") or "auto").startswith("fp8")
+
+
+def kv_scale(environ=os.environ) -> float:
+    value = environ.get(KV_SCALE_ENV, "1.0").strip()
+    try:
+        scale = float(value)
+    except ValueError:
+        scale = -1.0
+    if not scale > 0:
+        raise ValueError(f"{KV_SCALE_ENV}={value!r}: set a positive scale (the FP8 cache holds K and V times it)")
+    return scale
+
+
+def _fp8_rows_t(k_new: torch.Tensor, d: int, tokens: int) -> torch.Tensor:
+    """A kernel's new K [d, tokens] as [tokens, d] rows (FP8 over an FP8 cache, transposed as it is)."""
+    return k_new.reshape(d, tokens).t().contiguous()
+
+
+def pack_prior(k_cache: torch.Tensor, v_cache: torch.Tensor, table: torch.Tensor, first_col=None, n_cols=None):
+    """The pages a prefill reads from token-major FP8 caches as nkilib's segmented attention takes FP8 K: (K packed
+    [n, kv_heads, page // 2, d, 2], V [n, kv_heads, page, d], the table [R, columns] int32 over them). Every column of
+    ``table`` [R, columns], or for a sliding window each row's ``n_cols`` columns from ``first_col`` [R] (the pages its
+    window reaches; the other columns name the row's first gathered page, which the window never reads). The gather and
+    the transpose run on the FP8 tensors themselves (a uint8 view of them fails the compiler's type check)."""
+    t = table.to(torch.int64)
+    rows, width = t.shape
+    blocks, heads, page, d = k_cache.shape
+    j = torch.arange(width, device=t.device).reshape(1, width)
+    if n_cols is None:
+        n_cols, first = width, torch.zeros((rows, 1), dtype=torch.int64, device=t.device)
+    else:
+        n_cols = min(int(n_cols), width)
+        first = first_col.to(torch.int64).reshape(rows, 1)
+    cols = (first + torch.arange(n_cols, device=t.device).reshape(1, n_cols)).clamp(max=width - 1)
+    src = t.gather(1, cols).clamp(min=0).reshape(-1)
+    k_pages = k_cache.index_select(0, src)
+    v_pages = v_cache.index_select(0, src)
+    n = src.shape[0]
+    k_packed = k_pages.reshape(n, heads, page // 2, 2, d).transpose(-1, -2).contiguous()
+    rel = j - first
+    inside = (rel >= 0) & (rel < n_cols)
+    base = torch.arange(rows, device=t.device).reshape(rows, 1) * n_cols
+    new = torch.where(inside, base + rel, base)
+    return k_packed, v_pages, torch.where(t >= 0, new, torch.full_like(new, -1)).to(torch.int32)
 
 
 @dataclass
@@ -98,6 +160,8 @@ class MiMoAttention(nn.Module):
         self.k_cache = None
         self.v_cache = None
         self._config = config
+        self.fp8_kv = fp8_kv_cache()
+        self.kv_scale = kv_scale() if self.fp8_kv else 1.0
         self.set_qkv_disk_tp(1)
         set_weight_loader(self.o_weight, weights.o_proj_loader(self.num_heads, self.v_head_dim))
         if self.sink is not None:
@@ -124,6 +188,17 @@ class MiMoAttention(nn.Module):
         out = heads[..., :self.v_head_dim].reshape(tokens, self.num_heads * self.v_head_dim) @ self.o_weight
         return neuron_collectives.all_reduce(self.attn_tp_group, out)
 
+    def _scale_tensors(self, device) -> tuple:
+        """The decode kernels' (k_scale, v_scale) [1, 1] fp32, (None, None) over a bf16 cache."""
+        if not self.fp8_kv:
+            return None, None
+        scale = torch.full((1, 1), self.kv_scale, dtype=torch.float32, device=device)
+        return scale, scale
+
+    def _kernel_o_weight(self) -> torch.Tensor:
+        """The output projection a decode kernel takes: over an FP8 cache its heads come out times the V scale."""
+        return self.o_weight if self.kv_scale == 1.0 else self.o_weight / self.kv_scale
+
     def _sink_column(self) -> Optional[torch.Tensor]:
         return None if self.sink is None else self.sink.reshape(self.num_heads, 1)
 
@@ -135,14 +210,28 @@ class MiMoAttention(nn.Module):
 
         q, k, v = self._split(x @ self.qkv_weight)
         q, k = rotate(q, cos, sin), rotate(k, cos, sin)
+        if self.fp8_kv:
+            k, v = ((t * self.kv_scale).clamp(-FP8_KV_MAX, FP8_KV_MAX) for t in (k, v))
         k_cache, v_cache = kv_write.write_kv(self.k_cache, self.v_cache, k.transpose(0, 1), v.transpose(0, 1),
                                              md["slot_mapping"])
+        table, scale = md["block_table_tensor"], self.scaling
+        if self.fp8_kv:
+            page, tokens = md["block_size"], x.shape[0]
+            window = {}
+            if self.sliding_window:
+                cached = md["cached_seq_len"].to(torch.int64).reshape(-1)
+                window = dict(first_col=torch.clamp(cached - self.sliding_window + 1, min=0) // page,
+                              n_cols=(tokens + self.sliding_window - 1) // page + 2)
+            k_cache, v_cache, table = pack_prior(k_cache, v_cache, table, **window)
+            scale = scale / self.kv_scale
         out = NF.segmented_attention(
             q.transpose(0, 1).contiguous(), k_cache=k_cache, v_cache=v_cache,
-            block_tables=md["block_table_tensor"], prior_tokens=md["cached_seq_len"], block_size=md["block_size"],
-            kv_segment_size=md["kv_segment_size"], scale=self.scaling, sliding_window=self.sliding_window,
+            block_tables=table, prior_tokens=md["cached_seq_len"], block_size=md["block_size"],
+            kv_segment_size=md["kv_segment_size"], scale=scale, sliding_window=self.sliding_window,
             sink=self._sink_column(),
         )
+        if self.kv_scale != 1.0:
+            out = out / self.kv_scale
         return self._project_out(out.transpose(0, 1))
 
     # -- decode -------------------------------------------------------------------------------------------------------
@@ -182,15 +271,24 @@ class MiMoAttention(nn.Module):
         rows = tokens // span
         # [B x S, d / 2] -> the kernel's [d / 2, B, S]
         layout = lambda t: t.reshape(rows, span, -1).permute(2, 0, 1).contiguous()  # noqa: E731
-        out, k_new, v_new = wrap_nki(attention_block.decode_masked)[get_logical_nc_config()](
+        args = dict(
             X=x.view(rows, span, -1), rmsnorm_X_gamma=norm.weight.unsqueeze(0).to(torch.float32),
             rmsnorm_X_eps=norm.eps, X_hidden_dim_actual=self.hidden_size, W_qkv=self.qkv_weight, cos=layout(cos),
-            sin=layout(sin), K_cache=k_cache, V_cache=v_cache, sink=self._sink_column(), softmax_scale=self.scaling,
-            active_blocks_table=md["block_table_tensor"], attention_mask=mask)
+            sin=layout(sin), K_cache=k_cache, V_cache=v_cache, sink=self._sink_column(),
+            softmax_scale=self.scaling / self.kv_scale, active_blocks_table=md["block_table_tensor"],
+            attention_mask=mask)
+        if self.fp8_kv:
+            k_scale, v_scale = self._scale_tensors(x.device)
+            out, k_new, v_new = wrap_nki(attention_block.decode_masked_fp8)[get_logical_nc_config()](
+                k_scale=k_scale, v_scale=v_scale, **args)
+        else:
+            out, k_new, v_new = wrap_nki(attention_block.decode_masked)[get_logical_nc_config()](**args)
         # out [B, heads, d, S]; K [d, B, S] and V [B, 1, S, d] for one KV head (nkilib attention_block_tkg)
         heads = out.reshape(rows, self.num_heads, KV_HEAD_DIM, span).permute(0, 3, 1, 2).reshape(
             tokens, self.num_heads, KV_HEAD_DIM)
-        k_cache, v_cache = kv_write.write_kv(k_cache, v_cache, k_new.reshape(KV_HEAD_DIM, tokens).t().reshape(
+        if self.kv_scale != 1.0:
+            heads = heads / self.kv_scale
+        k_cache, v_cache = kv_write.write_kv(k_cache, v_cache, _fp8_rows_t(k_new, KV_HEAD_DIM, tokens).reshape(
             1, tokens, KV_HEAD_DIM), v_new.reshape(1, tokens, KV_HEAD_DIM), slots)
         return self._project_out(heads), k_cache, v_cache
 
@@ -201,12 +299,13 @@ class MiMoAttention(nn.Module):
         from sglang_neuron.utils.hardware_config import get_logical_nc_config
 
         rows = x.shape[0]
+        k_scale, v_scale = self._scale_tensors(x.device)
         out, _, _ = wrap_nki(attn_half)[get_logical_nc_config()](
             x.view(rows, 1, -1), norm.weight.unsqueeze(0).to(torch.float32), self.qkv_weight,
             cos.t().unsqueeze(-1).contiguous(), sin.t().unsqueeze(-1).contiguous(), md["block_table_tensor"],
             self.k_cache, self.v_cache, inputs.mask, self._sink_column(),
-            md["slot_mapping"].view(rows, 1).to(torch.int32), self.o_weight,
-            rmsnorm_X_eps=norm.eps, softmax_scale=self.scaling, v_head_dim=self.v_head_dim)
+            md["slot_mapping"].view(rows, 1).to(torch.int32), self._kernel_o_weight(), k_scale, v_scale,
+            rmsnorm_X_eps=norm.eps, softmax_scale=self.scaling / self.kv_scale, v_head_dim=self.v_head_dim)
         return neuron_collectives.all_reduce(self.attn_tp_group, out)
 
     def _kernel_decode(self, x, norm, cos, sin, md, inputs: DecodeInputs) -> tuple:
@@ -219,11 +318,19 @@ class MiMoAttention(nn.Module):
             X_hidden_dim_actual=self.hidden_size, W_qkv=self.qkv_weight,
             # [B, d / 2] -> the kernel's [d / 2, B, 1]
             cos=cos.t().unsqueeze(-1).contiguous(), sin=sin.t().unsqueeze(-1).contiguous(),
-            K_cache=self.k_cache, V_cache=self.v_cache, sink=self._sink_column(), softmax_scale=self.scaling,
+            K_cache=self.k_cache, V_cache=self.v_cache, sink=self._sink_column(),
+            softmax_scale=self.scaling / self.kv_scale,
         )
         from sglang_neuron.utils.hardware_config import get_logical_nc_config
 
-        if inputs.paged is not None:
+        if self.fp8_kv:
+            if inputs.paged is not None:
+                raise ValueError(f"{FULL_DECODE_ENV}=posid is not served with the FP8 KV cache")
+            k_scale, v_scale = self._scale_tensors(x.device)
+            out, k_new, v_new = wrap_nki(attention_block.decode_masked_fp8)[get_logical_nc_config()](
+                active_blocks_table=md["block_table_tensor"], attention_mask=inputs.mask, k_scale=k_scale,
+                v_scale=v_scale, **args)
+        elif inputs.paged is not None:
             p = inputs.paged
             out, k_new, v_new = wrap_nki(attention_block.decode_posid)[get_logical_nc_config()](
                 active_blocks_table=p.table, attention_mask=p.active_mask, pos_ids=p.pos_ids, **args)
@@ -232,7 +339,9 @@ class MiMoAttention(nn.Module):
                 active_blocks_table=md["block_table_tensor"], attention_mask=inputs.mask, **args)
         # out [B, heads, d, 1]; K [d, B, 1] and V [B, 1, 1, d] for one KV head (nkilib attention_block_tkg)
         heads = out.reshape(rows, self.num_heads, KV_HEAD_DIM, 1)[..., 0]
-        return heads, k_new.reshape(KV_HEAD_DIM, rows).t(), v_new.reshape(rows, KV_HEAD_DIM)
+        if self.kv_scale != 1.0:
+            heads = heads / self.kv_scale
+        return heads, _fp8_rows_t(k_new, KV_HEAD_DIM, rows), v_new.reshape(rows, KV_HEAD_DIM)
 
     def _torch_decode(self, x, norm, cos, sin, md, positions) -> tuple:
         """The kernel's decode by plain attention over each row's pages (the CPU reference): the prior is the row's
@@ -287,7 +396,7 @@ def decode_masks(attn_metadata: dict, positions: torch.Tensor, config: MiMoV2Con
             swa_layer=swa_layer, full_layer=masked_full)
 
     def kernel_layout(mask):
-        return qk_swap_layout(mask, d_head=KV_HEAD_DIM, fp8_kv=False, fp8_packed=False)
+        return qk_swap_layout(mask, d_head=KV_HEAD_DIM, fp8_kv=fp8_kv_cache(), fp8_packed=False)
 
     out = {}
     if swa_mask is not None:
@@ -321,7 +430,7 @@ def span_mask(md: dict, prior_end: torch.Tensor, positions: torch.Tensor, *, win
     mask = gen_attention_decode_mask(end.reshape(1, rows * span).to(torch.float32), bs=rows, q_head=num_heads,
                                      s_active=span, s_prior=md["max_blocks_per_seq"] * page, block_len=page,
                                      start_pos=start)
-    return qk_swap_layout(mask, d_head=KV_HEAD_DIM, fp8_kv=False, fp8_packed=False)
+    return qk_swap_layout(mask, d_head=KV_HEAD_DIM, fp8_kv=fp8_kv_cache(), fp8_packed=False)
 
 
 def span_slots(md: dict, positions: torch.Tensor, valid: torch.Tensor, *, window: Optional[int]) -> torch.Tensor:

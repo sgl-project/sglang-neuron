@@ -111,6 +111,7 @@ class NeuronMHATokenToKVPool(KVCache):
         self.k_buffer: List[torch.Tensor] = []
         self.v_buffer: List[torch.Tensor] = []
         self.paired_layers = layout.paired_layers
+        self.fp8_k_layout_packed = layout.fp8_k_packed
         # the model that declares the pairing refuses an odd layer count first (GptOssModel)
         assert not (self.paired_layers and self.layer_num % 2), self.layer_num
         if self.paired_layers and self.kv_cp_size > 1:
@@ -133,8 +134,10 @@ class NeuronMHATokenToKVPool(KVCache):
     def fp8_packed_k(self) -> bool:
         """fp8 caches use the kernels' packed K layout [nb, kv_heads, block//2, d, 2] (two consecutive
         tokens per bf16-sized slot; V stays [nb, kv_heads, block, d]). The nkilib qkv / segmented /
-        decode kernels only support fp8 KV in this layout."""
-        return self.store_dtype in (torch.float8_e4m3fn, torch.float8_e5m2)
+        decode kernels only support fp8 KV in this layout up to 128 channels; a model can declare token-major
+        fp8 K (model_executor.kv_layout.KVLayout.fp8_k_packed)."""
+        return (self.store_dtype in (torch.float8_e4m3fn, torch.float8_e5m2)
+                and getattr(self, "fp8_k_layout_packed", True))
 
     def _create_buffers(self):
         k_shape, shape = self.get_kv_buffer_shape()

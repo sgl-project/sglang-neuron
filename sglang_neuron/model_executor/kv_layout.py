@@ -30,6 +30,10 @@ class KVLayout:
     # a model's own paged allocator, returned by this zero-argument callable: a NeuronPagedTokenToKVPoolAllocator
     # subclass that decides which pages a request takes (platform.get_paged_allocator_cls); None: the platform's
     paged_allocator_class: Optional[Callable[[], type]] = None
+    # an FP8 pool's K pages in the packed layout ([block // 2, head_dim, 2], two tokens a bf16-sized slot), which
+    # nkilib's qkv / segmented / decode kernels read up to 128 channels; False keeps them token-major like V, the
+    # layout nkilib's decode attention reads FP8 heads of 256 in (MiMo-V2: its prefill packs the pages it reads)
+    fp8_k_packed: bool = True
 
     def physical_block_size(self, page_size: int) -> int:
         """This rank's block of an SGLang page under token context parallelism."""
