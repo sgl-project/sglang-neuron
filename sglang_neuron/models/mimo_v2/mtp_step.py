@@ -22,6 +22,8 @@ AGGREGATED = True
 
 def launch_problems(server_args) -> list:
     problems = []
+    if int(getattr(server_args, "dcp_size", 1) or 1) > 1:
+        problems.append("--dcp-size (the step's span attention does not run over DCP shards yet)")
     if str(getattr(server_args, "disaggregation_mode", "null")) != "null":
         problems.append("a PD role (MiMo's MTP step is served on an aggregated server)")
     return problems

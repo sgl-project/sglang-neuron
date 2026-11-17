@@ -9,7 +9,8 @@ that port's eager fp32 attention gathers the whole context every step and cannot
 **Status:** served on a trn2.48xlarge at 8K, 256K and 1M contexts with FP8 experts (the measurements below; Neuron SDK
 2.33.0, the release image `pytorch-inference-sglang-neuron:v0.1.0` with this tree on `PYTHONPATH`), and with
 `--speculative-algorithm NEURON_MTP` (the checkpoint's 3 MTP layers, [below](#mtp-neuron_mtp)) and the FP8 KV cache
-(`--kv-cache-dtype fp8_e4m3`, [below](#fp8-kv-cache)). Not yet: DP attention / DCP, PD.
+(`--kv-cache-dtype fp8_e4m3`, [below](#fp8-kv-cache)) and DCP (`--dcp-size 8`, [below](#dcp---dcp-size-8)). Not yet: DP
+attention (PD decode only), PD.
 
 ## The model
 
@@ -206,6 +207,34 @@ declares `KVLayout(fp8_k_packed=False)` because nkilib's decode attention reads 
 Measured at 8K with `MTP=1` (the same server as the MTP table, bf16 cache in brackets): GSM8K 0.914 (0.895), decode TPOT
 6.54 / 8.84 / 11.48 ms at c = 1 / 8 / 16 (6.67 / 9.18 / 11.53); the pool holds 2.79M full-layer tokens a rank (1.53M).
 
+### DCP (`--dcp-size 8`)
+
+```bash
+SGLANG_NEURON_HYBRID_SWA_RADIX=0 bash examples/mimo_v2/run_server.sh --dcp-size 8 --disable-hybrid-swa-memory
+```
+
+At TP64 every KV head is replicated on 8 (sliding) or 16 (full) consecutive ranks; `--dcp-size 8` keeps each head's
+sequence in 8-way block-cyclic shards over those replicas (`distributed/decode_context_parallel.py`; at most 8: the
+sliding layers' 8 KV heads), served aggregated (`catalog`: `decode_context_parallel`, `prefill_context_parallel`), on
+one KV pool (`--disable-hybrid-swa-memory`). `models/mimo_v2/attention.py`:
+
+- **Decode**: every layer's `attention_block_tkg` with `CP = 8` over its shard (the runtime's per-row bounds, the decoded
+  token counted on its owner), the sliding layers' sinks as the group's (`group_sinks`: real on rank 0). nkilib's CP
+  path holds Q and the output as `[d_head, rows]` tiles (heads of at most 128 channels); the vendored copy in
+  `kernels/cp` gathers Q and merges the output one 128-channel d-tile at a time with nkilib's own collectives
+  (`tools/mimo_v2/check_dcp_decode.py`, 8 ranks: every rank's head equals full attention over the unsharded
+  sequence, with and without sinks).
+- **Prefill, full layers** (no sinks): nkilib's KV-parallel segmented attention over the shards (Hy3's).
+- **Prefill, sliding layers**: a chunk starts at a whole virtual page, so the keys before it its window reaches are the
+  last block of the previous virtual page, on the group's rank 7; every rank takes it (an all-gather) and attends
+  locally over it and the chunk's own K/V with the sinks (nkilib's KV-parallel kernel takes no sinks).
+
+Measured at 8K (bf16 cache, no MTP): GSM8K 0.901 (1319, parallel 8); decode TPOT 33.87 / 46.48 / 53.94 ms at
+c = 1 / 8 / 16 (19.45 / 21.32 ms without DCP: the DCP step runs nkilib's attention kernel with its collectives on all 48
+layers, not the fused attention half). The pool holds 2620 pages of 128 tokens a rank for every layer, 2.68M tokens of
+context over the group: DCP is the capacity point (1M contexts, more of them), not the latency one. Not yet with
+NEURON_MTP or the hybrid window pool.
+
 ### Pools, measured (`--mem-fraction-static 0.85`, bf16 KV, a rank)
 
 | Experts | full-attention pool | window pool |
@@ -247,7 +276,7 @@ start with another `CACHE_DIR`.
 
 ## What a launch refuses
 
-- DP attention, `--dcp-size`, `--pp-size`; a layout whose heads, KV heads, experts or intermediate sizes do not shard
+- DP attention, `--pp-size`; `--dcp-size` above 8, or with the hybrid window pool or NEURON_MTP; a layout whose heads, KV heads, experts or intermediate sizes do not shard
   (every rank holds exactly one KV head: `--tp-size` a multiple of 8).
 - A `--kv-cache-dtype` other than bf16 or `fp8_e4m3`, a dtype other than bfloat16;
   `SGLANG_NEURON_MIMO_FULL_DECODE=posid` with the FP8 cache.
@@ -264,15 +293,8 @@ start with another `CACHE_DIR`.
   and SGLang's draft extend (rewriting the MTP layers' KV at the positions whose tokens were drafts).
 - **FP8 KV cache**: per-layer KV scales from a calibration (as Hy3's profile), and the prefill's full-layer packing
   limited to the prior's pages.
-- **DCP** (`--dcp-size`, served aggregated for a model whose prefill and decode attend over the shards, as Hy3's): at TP64
-  a full layer's KV head is replicated on 16 ranks, which DCP turns into 8 context shards (8: the sliding layers' 8 KV
-  heads). The graph side is written (full layers' prefill on nkilib's KV-parallel segmented attention; the sliding
-  layers' prefill over the window's prior block from the group's last rank, attended locally with the sinks, which the
-  KV-parallel kernel does not take; the decode on `attention_block_tkg` with `CP = 8` and the group's sinks), and is
-  blocked in nkilib: the decode kernel's CP path holds Q and the attention output as `[d_head, rows]` SBUF tiles
-  (`attention_block_tkg_sharding._CP_attention_input_collectives` / `_CP_attention_output_collectives`), which takes
-  heads of at most 128 channels (`Q_tkg_sb shape mismatch: (128, 2) != (256, 1)` at 256). It needs the d-tiled layout
-  the non-CP path has, or the decode attention at Q/K 192 and V 128 below.
+- **DCP**: faster DCP steps (the fused attention half kernel over the shards, the sliding layers kept off the
+  merge where their window allows), DCP with NEURON_MTP, and DCP over the hybrid window pool.
 - **DP attention** runs on a PD decode only (the runtime refuses it aggregated), and needs MiMo's experts over the wide EP
   group with the DP groups' tokens gathered around them (models/gpt_oss/mxfp4's decode). PD itself is written for one
   node (`examples/mimo_v2/run_pd_one_node.sh`, TP32 prefill + TP32 decode) and needs EFA: without it NIXL's LIBFABRIC

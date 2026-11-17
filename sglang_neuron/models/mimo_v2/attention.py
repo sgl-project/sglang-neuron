@@ -23,7 +23,19 @@ layer's scale (``KV_SCALE_ENV``, 1.0 by default: the checkpoint carries no KV sc
 FP8 heads of 256 in. The decode kernels quantize the new token's K/V themselves (``k_scale`` / ``v_scale``) and take
 1 / k_scale in the softmax scale and 1 / v_scale in the output projection. nkilib's segmented prefill reads FP8 K only
 packed (two tokens a bf16-sized slot), so the prefill packs the pages it reads (``pack_prior``): a sliding layer its
-window's few pages, a full layer its whole table."""
+window's few pages, a full layer its whole table.
+
+**DCP** (``--dcp-size D``, on one KV pool: ``--disable-hybrid-swa-memory``): the D consecutive ranks that replicate a KV
+head keep its sequence in D-way block-cyclic shards (distributed.decode_context_parallel.DcpLayout), each rank writing
+only the tokens it owns (the backend's localized slots).
+
+- decode: ``attention_block_tkg`` with ``CP = D`` over every layer's shard (the runtime's per-row bounds and the decoded
+  token's owner), the sliding layers' sinks as the group's (``group_sinks``: counted once in the merge);
+- prefill, full layers (no sinks): nkilib's KV-parallel segmented attention over the shards (Hy3's);
+- prefill, sliding layers: a chunk starts at a whole virtual page, so the 127 keys before it a window reaches are the
+  last block of the previous virtual page, which the group's rank D - 1 keeps. Every rank takes that block from it (an
+  all-gather over the group) and attends locally over it and the chunk's own K/V, sinks included: nkilib's KV-parallel
+  kernel takes no sinks (decode_context_parallel._PREFILL_KERNEL_GAP)."""
 
 from __future__ import annotations
 
@@ -119,6 +131,16 @@ def pack_prior(k_cache: torch.Tensor, v_cache: torch.Tensor, table: torch.Tensor
     return k_packed, v_pages, torch.where(t >= 0, new, torch.full_like(new, -1)).to(torch.int32)
 
 
+def _group_sink_loader(heads_per_rank: int, size: int):
+    """``attention_sink_bias`` [heads] as attention-TP rank ``rank``'s DCP group's sinks (group_sinks: the DCP group is
+    ``size`` consecutive attention-TP ranks)."""
+    from sglang_neuron.distributed.decode_context_parallel import group_sinks
+    from sglang_neuron.utils.weight_loader import SafetensorsWeightLoader
+
+    return SafetensorsWeightLoader(transform=lambda slices, rank: group_sinks(
+        slices[0][...].to(torch.float32), heads_per_rank, rank, size, rank % size))
+
+
 @dataclass
 class DecodeInputs:
     """A decode step's inputs shared by every layer of one kind: the layer kind's mask in the kernel's layout, or in
@@ -162,10 +184,18 @@ class MiMoAttention(nn.Module):
         self._config = config
         self.fp8_kv = fp8_kv_cache()
         self.kv_scale = kv_scale() if self.fp8_kv else 1.0
+        group = groups.get_neuron_dcp_group()
+        self.dcp_group = group if group is not None and group.world_size > 1 else None
+        self.dcp_size = 1 if self.dcp_group is None else self.dcp_group.world_size
         self.set_qkv_disk_tp(1)
         set_weight_loader(self.o_weight, weights.o_proj_loader(self.num_heads, self.v_head_dim))
         if self.sink is not None:
             set_weight_loader(self.sink, weights.sink_loader(self.num_heads))
+        # the DCP decode's sinks: the group's gathered heads', real on the group's rank 0 only (group_sinks)
+        self.dcp_sink = None
+        if self.sink is not None and self.dcp_size > 1:
+            self.dcp_sink = nn.Parameter(torch.empty(self.num_heads * self.dcp_size, dtype=torch.float32))
+            set_weight_loader(self.dcp_sink, _group_sink_loader(self.num_heads, self.dcp_size))
 
     def set_qkv_disk_tp(self, disk_tp: int) -> None:
         """The fused QKV's loader for the checkpoint's shard count (weights.qkv_disk_tp), set before the load."""
@@ -214,6 +244,8 @@ class MiMoAttention(nn.Module):
             k, v = ((t * self.kv_scale).clamp(-FP8_KV_MAX, FP8_KV_MAX) for t in (k, v))
         k_cache, v_cache = kv_write.write_kv(self.k_cache, self.v_cache, k.transpose(0, 1), v.transpose(0, 1),
                                              md["slot_mapping"])
+        if self.dcp_size > 1:
+            return self._prefill_dcp(q, k, v, k_cache, v_cache, md)
         table, scale = md["block_table_tensor"], self.scaling
         if self.fp8_kv:
             page, tokens = md["block_size"], x.shape[0]
@@ -234,6 +266,93 @@ class MiMoAttention(nn.Module):
             out = out / self.kv_scale
         return self._project_out(out.transpose(0, 1))
 
+    def _mesh(self) -> tuple:
+        from sglang_neuron.backend.stack import resolve_full_mesh
+
+        return tuple(tuple(int(r) for r in cell) for cell in resolve_full_mesh(self.dcp_group))
+
+    def _prefill_dcp(self, q, k, v, k_cache, v_cache, md) -> torch.Tensor:
+        """A chunk's attention under DCP (module docstring); ``k`` / ``v`` [T, 1, d] its K/V as the cache holds them
+        (times the FP8 scale), the caches as written."""
+        import sglang_neuron.ops as NF
+        from sglang_neuron.backend.stack import wrap_nki
+        from sglang_neuron.models.mimo_v2.kernels import attention_block
+        from sglang_neuron.utils.hardware_config import get_logical_nc_config
+
+        size, page, tokens = self.dcp_size, md["block_size"], q.shape[0]
+        cached = md["cached_seq_len"].to(torch.int32).reshape(1, 1)
+        table = md["block_table_tensor"].to(torch.int32)
+        heads = q.transpose(0, 1).contiguous()
+        if self.sliding_window is None:
+            # every column of this rank's shard (FP8: packed for the kernel)
+            ks = vs = None
+            if self.fp8_kv:
+                k_cache, v_cache, table = pack_prior(k_cache, v_cache, table)
+                ks = vs = torch.full((128, 1), 1.0 / self.kv_scale, dtype=torch.float32, device=q.device)
+            table = torch.where(table < 0, torch.zeros_like(table), table)
+            out = wrap_nki(attention_block.prefill_kv_parallel)[get_logical_nc_config()](
+                heads, k_cache, v_cache, table[:1], cached, self.dcp_group.rank_in_group_tensor.to(torch.int32).reshape(
+                    1, 1), torch.div(cached, size, rounding_mode="floor"), ks, vs, scale=self.scaling,
+                block_size=page, seg_size=min(tokens, size * page), dcp_size=size, dcp_mesh=self._mesh(),
+                fp8_packed=self.fp8_kv)
+            return self._project_out(out.transpose(0, 1))
+        # a sliding layer: the window's prior block from the group's last rank, then the chunk, attended locally
+        from sglang_neuron.parallel import collectives as neuron_collectives_
+
+        col = torch.clamp(torch.div(cached.reshape(1).to(torch.int64), size * page, rounding_mode="floor") - 1, min=0)
+        block = table.to(torch.int64)[0].gather(0, col).clamp(min=0)
+
+        def prior(cache):
+            blk = cache.index_select(0, block)
+            if self.fp8_kv:
+                blk = (blk.to(torch.float32) / self.kv_scale).to(DTYPE)
+            return neuron_collectives_.all_gather(self.dcp_group, blk, dim=0)[size - 1:size]
+
+        def chunk(t):
+            if self.fp8_kv:  # the chunk as the cache holds it
+                t = (t.to(k_cache.dtype).to(torch.float32) / self.kv_scale).to(DTYPE)
+            return t.reshape(tokens // page, page, 1, KV_HEAD_DIM).transpose(1, 2)
+
+        k_local = torch.cat([prior(k_cache), chunk(k)], dim=0)
+        v_local = torch.cat([prior(v_cache), chunk(v)], dim=0)
+        n = k_local.shape[0]
+        first = (cached.reshape(1) == 0).to(torch.int32)
+        local_table = torch.clamp(torch.arange(n, dtype=torch.int32, device=q.device) + first, max=n - 1).reshape(1, n)
+        prior_tokens = torch.where(cached > 0, torch.full_like(cached, page), torch.zeros_like(cached))
+        out = NF.segmented_attention(
+            heads, k_cache=k_local, v_cache=v_local, block_tables=local_table, prior_tokens=prior_tokens,
+            block_size=page, kv_segment_size=md["kv_segment_size"], scale=self.scaling,
+            sliding_window=self.sliding_window, sink=self._sink_column())
+        return self._project_out(out.transpose(0, 1))
+
+    def _dcp_decode(self, x, norm, cos, sin, md, mask, slots, span: int = 1) -> torch.Tensor:
+        """``span`` tokens a row (one outside a NEURON_MTP step) over the DCP group's shards: ``mask`` the group's (the
+        runtime's per-row bounds), ``slots`` [B x span] this rank's slot of each token (0 where another rank keeps it);
+        the K/V written after the attention, the output all-reduced."""
+        from sglang_neuron.backend.stack import wrap_nki
+        from sglang_neuron.models.mimo_v2.kernels import attention_block
+        from sglang_neuron.ops.attention.attention_decode import dcp_collective_mode
+        from sglang_neuron.utils.hardware_config import get_logical_nc_config
+
+        tokens = x.shape[0]
+        rows = tokens // span
+        layout = lambda t: t.reshape(rows, span, -1).permute(2, 0, 1).contiguous()  # noqa: E731
+        k_scale, v_scale = self._scale_tensors(x.device)
+        sink = None if self.dcp_sink is None else self.dcp_sink.reshape(-1, 1)
+        out, k_new, v_new = wrap_nki(attention_block.decode_masked_dcp)[get_logical_nc_config()](
+            X=x.view(rows, span, -1), X_hidden_dim_actual=self.hidden_size, rmsnorm_X_eps=norm.eps,
+            rmsnorm_X_gamma=norm.weight.unsqueeze(0).to(torch.float32), W_qkv=self.qkv_weight, cos=layout(cos),
+            sin=layout(sin), active_blocks_table=md["block_table_tensor"], K_cache=self.k_cache, V_cache=self.v_cache,
+            attention_mask=mask, sink=sink, softmax_scale=self.scaling / self.kv_scale, k_scale=k_scale,
+            v_scale=v_scale, dcp_size=self.dcp_size, dcp_mesh=self._mesh(), dcp_mode=dcp_collective_mode(self.dcp_size))
+        heads = out.reshape(rows, self.num_heads, KV_HEAD_DIM, span).permute(0, 3, 1, 2).reshape(
+            tokens, self.num_heads, KV_HEAD_DIM)
+        if self.kv_scale != 1.0:
+            heads = heads / self.kv_scale
+        kv_write.write_kv(self.k_cache, self.v_cache, _fp8_rows_t(k_new, KV_HEAD_DIM, tokens).reshape(
+            1, tokens, KV_HEAD_DIM), v_new.reshape(1, tokens, KV_HEAD_DIM), slots)
+        return self._project_out(heads)
+
     # -- decode -------------------------------------------------------------------------------------------------------
 
     def decode(self, x: torch.Tensor, norm, cos: torch.Tensor, sin: torch.Tensor, md: dict,
@@ -243,6 +362,8 @@ class MiMoAttention(nn.Module):
         if self.num_kv_heads != 1:
             raise ValueError(f"the MiMo-V2 decode attends one KV head per rank, not {self.num_kv_heads}")
         rows = x.shape[0]
+        if self.dcp_size > 1:
+            return self._dcp_decode(x, norm, cos, sin, md, inputs.mask, md["slot_mapping"].reshape(-1))
         if can_run_kernel(x) and inputs.mask is not None and fused_enabled():
             return self._fused_decode(x, norm, cos, sin, md, inputs)
         if not can_run_kernel(x):

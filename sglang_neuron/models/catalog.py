@@ -233,6 +233,9 @@ MODELS = {
                                    kv_cache_dtypes=("auto", "bf16", "bfloat16", "fp8_e4m3"),
                                    quantizations=("fp8",), launch_hooks="sglang_neuron.models.mimo_v2.launch",
                                    hybrid_swa_memory=True,
+                                   # --dcp-size on an aggregated server: its decode and prefill attend over the DCP
+                                   # shards (models/mimo_v2/attention.py)
+                                   decode_context_parallel=True, prefill_context_parallel=True,
                                    # NEURON_MTP: the checkpoint's first MTP layer drafts in the decode step
                                    mtp_host="sglang_neuron.models.mimo_v2.mtp_step"),
     "DeepseekV2ForCausalLM": ModelSpec(package="sglang_neuron.models.deepseek_v2",

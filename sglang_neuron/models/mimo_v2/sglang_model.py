@@ -75,7 +75,16 @@ class MiMoV2ForCausalLM(ModelHost):
         check_layout(mimo, int(pc.tp_size), int(pc.ep_size or 1), sglang_tree.attention_dp_size(pc))
         dcp = int(getattr(pc, "attn_dcp_size", 1) or 1)
         if dcp > 1:
-            raise ValueError(f"{NAME}: --dcp-size {dcp} is not served yet; the decode attends each rank's whole prior")
+            from sglang.srt.runtime_context import get_server_args
+
+            from sglang_neuron.distributed.decode_context_parallel import validate_dcp_heads
+
+            # each DCP group's ranks share one KV head of every layer kind (8 sliding KV heads: at most 8 at TP64)
+            for kind in (mimo.full, mimo.swa):
+                validate_dcp_heads(NAME, kind.num_heads, kind.num_kv_heads, int(pc.tp_size), dcp)
+            if not getattr(get_server_args(), "disable_hybrid_swa_memory", False):
+                raise ValueError(f"{NAME}: --dcp-size {dcp} is served on one KV pool; launch with "
+                                 "--disable-hybrid-swa-memory (and SGLANG_NEURON_HYBRID_SWA_RADIX=0)")
         if int(getattr(pc, "pp_size", 1) or 1) > 1:
             raise ValueError(f"{NAME}: --pp-size is not served; the graphs build every layer")
 

@@ -198,8 +198,9 @@ class MiMoV2Graph(nn.Module):
                 hidden = hidden + attn.prefill(layer.input_layernorm(hidden), cos, sin, attn_metadata[attn.name])
                 hidden = hidden + layer.mlp(layer.post_attention_layernorm(hidden), real=real)
         else:
-            heads = self.layers[0].self_attn.num_heads
-            inputs = decode_masks(attn_metadata, positions, self.config, heads)
+            attn0 = self.layers[0].self_attn
+            # under DCP the decode attends the group's gathered query heads
+            inputs = decode_masks(attn_metadata, positions, self.config, attn0.num_heads * attn0.dcp_size)
             step = None
             for layer in self.layers:
                 cos, sin = tables[layer.is_swa]
@@ -353,8 +354,8 @@ class MiMoV2Graph(nn.Module):
     def _layer_kernel_serves(layer) -> bool:
         """Whether ``layer``'s decode runs as one kernel: a dense layer, or an MoE layer whose experts the MoE half
         kernel takes (moe.MiMoV2MoE.fused)."""
-        if layer.self_attn.fp8_kv:
-            return False  # its attention half takes the bf16 cache only
+        if layer.self_attn.fp8_kv or layer.self_attn.dcp_size > 1:
+            return False  # its attention half takes the bf16 cache, without DCP
         return isinstance(layer.mlp, DenseMLP) or getattr(layer.mlp, "fused", False)
 
     def _step_inputs(self, tables, attn_metadata, layer) -> dict:
@@ -426,6 +427,8 @@ class MiMoV2Graph(nn.Module):
             })
             if layer.self_attn.sink is not None:
                 mappings[f"{dst}.self_attn.sink"] = f"{attn}.attention_sink_bias"
+            if layer.self_attn.dcp_sink is not None:
+                mappings[f"{dst}.self_attn.dcp_sink"] = f"{attn}.attention_sink_bias"
             mappings[f"{dst}.input_norm_f32"] = f"{src}.input_layernorm.weight"
             if isinstance(layer.mlp, MiMoV2MoE):
                 mappings.update(layer.mlp.weight_mappings(src, f"{dst}.mlp"))
