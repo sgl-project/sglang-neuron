@@ -1294,7 +1294,9 @@ class NeuronModelRuntime:
         """The serving device-profile window (SGLANG_NEURON_PROFILE_SERVE_*) a decode dispatch counts against, or None.
         Every decode dispatch counts, an idle DP rank's dummy and a non-last PP stage's too: the window's entry and exit
         are barriers every rank of the (stage's) TP group must reach on the same step."""
-        if phase != "decode" or not self._profile_serve:
+        # SGLANG_NEURON_PROFILE_SERVE_PHASE=prefill counts the prefill dispatches instead (an aggregated server's
+        # chunks, which every rank of the TP group runs)
+        if not self._profile_serve or phase != os.environ.get("SGLANG_NEURON_PROFILE_SERVE_PHASE", "decode"):
             return None
         if not hasattr(self, "_serving_capture"):
             from sglang_neuron.model_executor.profiling import ServingCapture, serve_label

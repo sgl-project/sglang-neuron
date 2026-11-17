@@ -30,7 +30,7 @@ import nki
 import nki.collectives as ncc
 import torch
 from torch import nn
-from nkilib.core.attention.attention_kv_parallel_segmented_cte import attention_kv_parallel_segmented_cte
+from sglang_neuron.models.hy_v3.kernels.attention_kv_parallel_fp8 import attention_kv_parallel_segmented_cte
 from nkilib.core.qkv.qkv_cte import qkv_cte
 from nkilib.core.utils.common_types import NormType, QKNormConfig, QuantizationType
 from nkilib.experimental.transformer.attention_block_tkg import attention_block_tkg
@@ -109,7 +109,7 @@ def _decode_fp8_dcp(X, W_qkv, q_norm, k_norm, norm_eps, cos, sin, active_blocks_
 
 @nki.jit
 def _prefill_kv_parallel(q, k_cache, v_cache, block_tables, kvp_q_offset, kvp_rank_id, valid_num_prior_tokens, k_scale,
-                         v_scale, scale, block_size, seg_size, dcp_size, dcp_mesh):
+                         v_scale, scale, block_size, seg_size, dcp_size, dcp_mesh, prior_seg_size=0):
     cells = []
     for cell in dcp_mesh:
         cells.append(list(cell))
@@ -118,6 +118,7 @@ def _prefill_kv_parallel(q, k_cache, v_cache, block_tables, kvp_q_offset, kvp_ra
         replica_groups=ncc.ReplicaGroup(cells), group_size=dcp_size, block_size=block_size, seg_size=seg_size,
         scale=scale, global_q_offset=0, kvp_rank_id=kvp_rank_id, kvp_group_size=dcp_size, apc_mode=True,
         valid_num_prior_tokens=valid_num_prior_tokens, fp8_packed=True, k_scale=k_scale, v_scale=v_scale,
+        prior_seg_size=prior_seg_size,
     )
 
 
@@ -144,6 +145,19 @@ class DcpDecodeInputs:
     sparse_mask: torch.Tensor = None
     span: int = 1
     local_pos: torch.Tensor = None
+
+
+def prefill_seg(virtual_page: int) -> int:
+    """The DCP prefill attention's query segment: SGLANG_NEURON_HY3_PREFILL_SEG tokens (a multiple of the virtual page),
+    else one virtual page. A longer segment reads the rank's prior KV fewer times a chunk."""
+    import os
+
+    seg = int(os.environ.get("SGLANG_NEURON_HY3_PREFILL_SEG", "0") or 0)
+    if seg <= 0:
+        return virtual_page
+    if seg % virtual_page:
+        raise ValueError(f"SGLANG_NEURON_HY3_PREFILL_SEG={seg} must be a multiple of the DCP virtual page ({virtual_page})")
+    return seg
 
 
 def dcp_group():
@@ -319,7 +333,8 @@ class Fp8Attention(Attention):
             valid_num_prior_tokens=torch.div(cached, size, rounding_mode="floor"),
             k_scale=self._scale_tensor(self.k_scale_float, P_MAX, q.device),
             v_scale=self._scale_tensor(self.v_scale_float, P_MAX, q.device),
-            scale=self.scaling, block_size=page, seg_size=min(tokens, size * page), dcp_size=size,
+            scale=self.scaling, block_size=page, seg_size=min(tokens, prefill_seg(size * page)), dcp_size=size,
+            prior_seg_size=size * page,
             dcp_mesh=self._mesh(),
         )
         out = out.transpose(0, 1).reshape(tokens, -1) @ md["_o_weight"]

@@ -35,6 +35,7 @@ KNOBS: dict = {
     "SGLANG_NEURON_HY3_DECODE_MOE_FUSED": CONFIG,
     "SGLANG_NEURON_HY3_ATTN_FP8": CONFIG,
     "SGLANG_NEURON_HY3_SPARSE_SELECT_EVERY": CONFIG,
+    "SGLANG_NEURON_HY3_PREFILL_SEG": CONFIG,
     "SGLANG_NEURON_HY3_PD_MTP_KV": CONFIG,
     # GLM-5.2 (models/glm52): the decode's weight store, the prefill's MTP rows for a drafting decode, the decode
     # point, the benchmark's pinned MTP acceptance and the decode's FP8 attention weights
@@ -116,7 +117,7 @@ KNOBS: dict = {
     "SGLANG_NEURON_PROFILE_DIR": DEBUG,
     "SGLANG_NEURON_PROFILE_RANKS": DEBUG,
     "SGLANG_NEURON_PROFILE_DEVICE_MODE": DEBUG,
-    **{f"SGLANG_NEURON_PROFILE_SERVE_{field}": DEBUG for field in ("RANKS", "START", "STEPS")},
+    **{f"SGLANG_NEURON_PROFILE_SERVE_{field}": DEBUG for field in ("RANKS", "START", "STEPS", "PHASE")},
     # the SGLang Diffusion platform (sglang_neuron/diffusion/envs.py; docs/model-recipes/flux1-dev.md)
     "SGLANG_NEURON_REQUIRE_NKI_KERNELS": DEBUG,
     "SGLANG_NEURON_DISABLE_NKI_KERNELS": DEBUG,
