@@ -264,5 +264,16 @@ start with another `CACHE_DIR`.
   and SGLang's draft extend (rewriting the MTP layers' KV at the positions whose tokens were drafts).
 - **FP8 KV cache**: per-layer KV scales from a calibration (as Hy3's profile), and the prefill's full-layer packing
   limited to the prior's pages.
-- **PD with DP attention / DCP**: at TP64 a full layer's KV head is replicated on 16 ranks, which DP attention (attention
-  TP 8: 2 ranks a head) or DCP removes; both run on a PD pair only, where the window pool is not served yet.
+- **DCP** (`--dcp-size`, served aggregated for a model whose prefill and decode attend over the shards, as Hy3's): at TP64
+  a full layer's KV head is replicated on 16 ranks, which DCP turns into 8 context shards (8: the sliding layers' 8 KV
+  heads). The graph side is written (full layers' prefill on nkilib's KV-parallel segmented attention; the sliding
+  layers' prefill over the window's prior block from the group's last rank, attended locally with the sinks, which the
+  KV-parallel kernel does not take; the decode on `attention_block_tkg` with `CP = 8` and the group's sinks), and is
+  blocked in nkilib: the decode kernel's CP path holds Q and the attention output as `[d_head, rows]` SBUF tiles
+  (`attention_block_tkg_sharding._CP_attention_input_collectives` / `_CP_attention_output_collectives`), which takes
+  heads of at most 128 channels (`Q_tkg_sb shape mismatch: (128, 2) != (256, 1)` at 256). It needs the d-tiled layout
+  the non-CP path has, or the decode attention at Q/K 192 and V 128 below.
+- **DP attention** runs on a PD decode only (the runtime refuses it aggregated), and needs MiMo's experts over the wide EP
+  group with the DP groups' tokens gathered around them (models/gpt_oss/mxfp4's decode). PD itself is written for one
+  node (`examples/mimo_v2/run_pd_one_node.sh`, TP32 prefill + TP32 decode) and needs EFA: without it NIXL's LIBFABRIC
+  backend registers no device memory (`registerMem: no available backends for mem type 'VRAM_SEG'`).
