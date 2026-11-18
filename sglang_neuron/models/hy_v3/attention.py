@@ -299,16 +299,23 @@ class Fp8Attention(Attention):
         q = q.view(tokens, self.num_heads, self.head_dim).transpose(0, 1)
         if self.dcp_size > 1:
             return self._prefill_dcp(q, k_cache, v_cache, md, page, tokens)
+        block_tables, prior_tokens = md["block_table_tensor"], md["cached_seq_len"]
         if self.sparse is not None:
             # a PD prefill without DCP: the summaries of the chunk's whole pages, which go to the DCP decode with them
             # (sparse.transfer_summaries)
             table = md["block_table_tensor"].to(torch.int32)
             table = torch.where(table < 0, torch.zeros_like(table), table)
-            self._refresh_prefill(k_cache, table[0], md["cached_seq_len"].to(torch.int32).reshape(1, 1), md, page,
-                                  tokens)
+            cached = md["cached_seq_len"].to(torch.int32).reshape(1, 1)
+            self._refresh_prefill(k_cache, table[0], cached, md, page, tokens)
+            keep = sparse.prefill_keep_pages(1, page)
+            active = -(-tokens // page)
+            # the kernel reads the chunk's own pages from prior / page on, so the kept prior pages go first
+            if keep and keep + active < table.shape[1]:
+                block_tables, _, prior_tokens = sparse.prefill_select(self.sparse, q, table[0], cached, 1, page, keep,
+                                                                      active, None)
         out = NF.segmented_attention(
             q, k_cache=k_cache, v_cache=v_cache,
-            block_tables=md["block_table_tensor"], prior_tokens=md["cached_seq_len"], block_size=page,
+            block_tables=block_tables, prior_tokens=prior_tokens, block_size=page,
             kv_segment_size=md["kv_segment_size"], scale=self.scaling * self.k_scale_float, sliding_window=None,
             sink=None,
         )
@@ -381,6 +388,21 @@ class Fp8Attention(Attention):
                 active_gate=inputs.owner)
         return inputs.sparse_table, inputs.sparse_mask
 
+    def _span_k(self, x: torch.Tensor, positions: torch.Tensor) -> torch.Tensor:
+        """[n, d] fp32: the K the decode kernel writes for tokens ``x`` [n, H] (its normed input) at ``positions`` [n],
+        as the FP8 cache stores it: this rank's K projection, the K RMSNorm, RoPE, then quantized by the K scale. A
+        bf16 projection where the kernel may run W8A8, so a value can differ from the cache's by one FP8 step, which a
+        page's min and max bound (sparse.py) tolerates."""
+        q, d = self.num_heads * self.head_dim, self.head_dim
+        w = self.qkv_weight[:, q:q + d]
+        if self.fp8_weights:
+            w = (w.to(torch.float32) * self.qkv_w_scale[0, 1]).to(torch.bfloat16)
+        k = (x.to(torch.bfloat16) @ w).float()
+        k = k * torch.rsqrt(k.pow(2).mean(-1, keepdim=True) + self.norm_eps) * self.k_norm.weight.float()
+        k = self.sparse.rotate(k.unsqueeze(1), positions).squeeze(1)
+        k = torch.clamp(k * (1.0 / self.k_scale_float), -FP8_CLAMP_MAX, FP8_CLAMP_MAX)
+        return k.to(torch.float8_e4m3fn).to(torch.float32)
+
     def _decode_dcp(self, x, cos, sin, inputs: DcpDecodeInputs):
         table, mask = self._sparse_inputs(x, inputs)
         rows, span = inputs.table.shape[0], inputs.span
@@ -398,7 +420,12 @@ class Fp8Attention(Attention):
             dcp_size=self.dcp_size, dcp_mesh=self._mesh(), dcp_mode=dcp_collective_mode(self.dcp_size),
             **self._decode_weights(),
         )
-        if self.sparse is not None and inputs.local_pos is not None and span > 1:
+        if self.sparse is not None and inputs.local_pos is not None and span > 1 and sparse.SPAN_K == "computed":
+            # a span's tokens fold in one pass from their K computed here (SparseState.fold_span)
+            k = self._span_k(x, inputs.positions.reshape(-1)).view(rows, span, -1)
+            self.sparse.fold_span(k, inputs.table, inputs.local_pos.view(rows, span),
+                                  inputs.owner.reshape(rows, span), self.k_cache.shape[2] * 2)
+        elif self.sparse is not None and inputs.local_pos is not None and span > 1:
             # a span's tokens fold in one pass (SparseState.add_span)
             self.sparse.add_span(k_written, inputs.table, inputs.local_pos.view(rows, span),
                                  inputs.owner.reshape(rows, span), self.k_cache.shape[2] * 2)

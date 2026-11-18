@@ -39,6 +39,11 @@ RECENT_PAGES = 2
 # prior tokens (whole virtual pages, a multiple of 8 local pages: the prefill kernel's prior segment), picked by the same
 # bound with the chunk's queries; 0 (default) attends to the whole prior
 PREFILL_KEEP = int(os.environ.get("SGLANG_NEURON_HY3_SPARSE_PREFILL_KEEP", "0") or 0)
+# SGLANG_NEURON_HY3_SPAN_K=cache folds a decode span into the summaries from its K rows read back from the cache
+# (add_span); the default computes the span's K beside the attention kernel (fold_span)
+SPAN_K = os.environ.get("SGLANG_NEURON_HY3_SPAN_K", "computed")
+if SPAN_K not in ("computed", "cache"):
+    raise ValueError(f"SGLANG_NEURON_HY3_SPAN_K={SPAN_K!r}: computed or cache")
 # the chunk's queries score the prior pages in groups of this many (prefill_select)
 PREFILL_QUERY_GROUP = 128
 # the kept pages are whole quanta of 32 pages (4096 tokens): the kernel reads the packed FP8 K cache in tiles of
@@ -141,10 +146,14 @@ class SparseState(nn.Module):
         """[B, q_heads, d] fp32 decode queries after the QK-norm and RoPE, from x [B, H] (the attention's input)."""
         q = (x.to(torch.bfloat16) @ self.wq).float().view(x.shape[0], self.q_heads, self.head_dim)
         q = q * torch.rsqrt(q.pow(2).mean(-1, keepdim=True) + self.eps) * self.q_norm.float()
+        return self.rotate(q, positions)
+
+    def rotate(self, x: torch.Tensor, positions: torch.Tensor) -> torch.Tensor:
+        """RoPE of x [n, heads, d] at ``positions`` [n] (the halves rotated, the decode kernel's contiguous layout)."""
         angles = positions.float().view(-1, 1) * self.inv_freq.view(1, -1)
         cos, sin = angles.cos().unsqueeze(1), angles.sin().unsqueeze(1)
         half = self.head_dim // 2
-        a, b = q[..., :half], q[..., half:]
+        a, b = x[..., :half], x[..., half:]
         return torch.cat([a * cos - b * sin, b * cos + a * sin], dim=-1)
 
     def refresh(self, k_cache: torch.Tensor, blocks: torch.Tensor, valid: torch.Tensor) -> None:
@@ -212,6 +221,29 @@ class SparseState(nn.Module):
         self.summary.index_copy_(0, row_block, torch.stack([kmin, kmax], dim=1).to(torch.bfloat16))
 
 
+    def fold_span(self, k: torch.Tensor, table: torch.Tensor, local_pos: torch.Tensor, owner: torch.Tensor,
+                  page: int) -> None:
+        """add_span from the span tokens' K values ``k`` [B, S, d] (fp32, as the cache stores them: _span_k) instead of
+        their rows read back from the cache: a read of one K row is a gather of its own, and add_span's S of them a
+        layer were about 8 ms of a 47 ms decode step (bs 8, MTP span 4, 80 layers)."""
+        rows, span = local_pos.shape
+        n = local_pos.to(torch.int64)
+        own = owner.reshape(rows, span) > 0
+        idx = torch.div(n, page, rounding_mode="floor")
+        blocks = table.to(torch.int64).gather(1, torch.clamp(idx, max=table.shape[1] - 1))
+        blocks = torch.where(own, blocks, torch.full_like(blocks, -1))
+        slot = n - idx * page
+        mine = own.unsqueeze(-1)
+        kmin = torch.where(mine, k, _EMPTY).amin(dim=1)
+        kmax = torch.where(mine, k, -_EMPTY).amax(dim=1)
+        row_block = torch.clamp(blocks.amax(dim=1), min=0)
+        first = (own & slot.eq(0)).any(dim=1).view(-1, 1)
+        old = self.summary.index_select(0, row_block).to(torch.float32)
+        kmin = torch.where(first, kmin, torch.minimum(old[:, 0], kmin))
+        kmax = torch.where(first, kmax, torch.maximum(old[:, 1], kmax))
+        self.summary.index_copy_(0, row_block, torch.stack([kmin, kmax], dim=1).to(torch.bfloat16))
+
+
 def scores(state: SparseState, x, positions, table, dcp_group) -> torch.Tensor:
     """[B, pages] each local page's bound under the DCP group's query heads; ``table`` [B, pages] holds each row's
     local pages."""
@@ -243,7 +275,7 @@ def compact(bound, table, local_prior, page: int, n_keep: int):
 
 
 def prefill_keep_pages(size: int, page: int) -> int:
-    """Local pages a sparse DCP prefill chunk keeps of its prior (0: dense)."""
+    """Local pages a sparse prefill chunk keeps of its prior (0: dense); ``size`` 1 for a prefill without DCP."""
     if PREFILL_KEEP <= 0:
         return 0
     vpage, quantum = size * page, 8
@@ -263,7 +295,8 @@ def prefill_select(state: SparseState, q, table_row, cached, size: int, page: in
     The kernel treats the prior as fully visible and masks only the chunk's own pages by position, so the kept pages
     are packed first and the chunk's pages follow, with the chunk's position moved to ``keep`` virtual pages: RoPE is
     already in Q and K, and the mask inside the chunk depends only on positions relative to it. A prior of at most
-    ``keep`` pages keeps the request's own table, position and prior (dense)."""
+    ``keep`` pages keeps the request's own table, position and prior (dense). Without DCP (``size`` 1,
+    ``dcp_group`` None) each rank scores by its own query heads."""
     pages = table_row.shape[0]
     full = torch.div(cached.reshape(1).to(torch.int64), size * page, rounding_mode="floor")  # local prior pages
     # each group of PREFILL_QUERY_GROUP queries scores by its per-dimension envelope: relu(max q) . max k +
@@ -271,7 +304,8 @@ def prefill_select(state: SparseState, q, table_row, cached, size: int, page: in
     h, t, d = q.shape
     groups = q.float().reshape(h, t // PREFILL_QUERY_GROUP, PREFILL_QUERY_GROUP, d)
     envelope = torch.cat([groups.amax(dim=2), groups.amin(dim=2)], dim=-1).reshape(-1, 2 * d)  # [h * G, 2d]
-    envelope = neuron_collectives.all_gather(dcp_group, envelope.contiguous(), dim=0)  # the group's heads
+    if dcp_group is not None:
+        envelope = neuron_collectives.all_gather(dcp_group, envelope.contiguous(), dim=0)  # the group's heads
     qmax, qmin = envelope[:, :d], envelope[:, d:]
     blocks = table_row.to(torch.int64)
     summ = state.summary.index_select(0, blocks).float()  # [pages, 2, d]
