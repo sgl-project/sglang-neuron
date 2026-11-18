@@ -14,6 +14,8 @@ graph takes its tokens from its carry, draws every span token with its row's sam
 kept run at the decode width ([width, SPEC]), so the runtime keeps the width and neither assembles ids nor pads
 tokens."""
 
+import os
+
 import torch
 
 from sglang_neuron.distributed.decode_context_parallel import decode_context
@@ -32,6 +34,10 @@ def aligned_context(context: int, size: int, block: int, tile: int) -> int:
 
 class HyV3Runtime(NeuronModelRuntime):
     _mtp_host = None
+    # the decode graphs' steps go straight to their bound executors (backend.direct_submit): a step's host time in the
+    # layers above the executor was ~10 ms of a ~50 ms MTP step at TP64. The bind and shadow proofs refuse it where a
+    # step's inputs are not the bound ones; SGLANG_NEURON_HY3_DIRECT_SUBMIT=0 keeps the full path.
+    megakernel_direct_submit = os.environ.get("SGLANG_NEURON_HY3_DIRECT_SUBMIT", "1") != "0"
 
     def dcp_decode_context(self, context: int, size: int, block: int, tile: int) -> int:
         return aligned_context(context, size, block, tile)
