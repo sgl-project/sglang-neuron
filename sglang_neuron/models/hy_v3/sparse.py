@@ -39,6 +39,8 @@ RECENT_PAGES = 2
 # prior tokens (whole virtual pages, a multiple of 8 local pages: the prefill kernel's prior segment), picked by the same
 # bound with the chunk's queries; 0 (default) attends to the whole prior
 PREFILL_KEEP = int(os.environ.get("SGLANG_NEURON_HY3_SPARSE_PREFILL_KEEP", "0") or 0)
+# the chunk's queries score the prior pages in groups of this many (prefill_select)
+PREFILL_QUERY_GROUP = 128
 # the kept pages are whole quanta of 32 pages (4096 tokens): the kernel reads the packed FP8 K cache in tiles of
 # 2 x LNC x P_MAX tokens (4 pages), and a row of s_prior tokens in blocks of gcd(page, s_prior / 256), 16 at 4096
 # (runtime.LOCAL_ALIGN)
@@ -264,11 +266,16 @@ def prefill_select(state: SparseState, q, table_row, cached, size: int, page: in
     ``keep`` pages keeps the request's own table, position and prior (dense)."""
     pages = table_row.shape[0]
     full = torch.div(cached.reshape(1).to(torch.int64), size * page, rounding_mode="floor")  # local prior pages
-    qa = neuron_collectives.all_gather(dcp_group, q.contiguous(), dim=0).float()  # the group's heads [H, T, d]
-    qa = qa.reshape(-1, qa.shape[-1])
+    # each group of PREFILL_QUERY_GROUP queries scores by its per-dimension envelope: relu(max q) . max k +
+    # min(min q, 0) . min k bounds q . k for every q of the group, so only the envelopes go over the DCP group
+    h, t, d = q.shape
+    groups = q.float().reshape(h, t // PREFILL_QUERY_GROUP, PREFILL_QUERY_GROUP, d)
+    envelope = torch.cat([groups.amax(dim=2), groups.amin(dim=2)], dim=-1).reshape(-1, 2 * d)  # [h * G, 2d]
+    envelope = neuron_collectives.all_gather(dcp_group, envelope.contiguous(), dim=0)  # the group's heads
+    qmax, qmin = envelope[:, :d], envelope[:, d:]
     blocks = table_row.to(torch.int64)
     summ = state.summary.index_select(0, blocks).float()  # [pages, 2, d]
-    bound = (F.relu(qa) @ summ[:, 1].t() + torch.clamp(qa, max=0) @ summ[:, 0].t()).amax(dim=0)  # [pages]
+    bound = (F.relu(qmax) @ summ[:, 1].t() + torch.clamp(qmin, max=0) @ summ[:, 0].t()).amax(dim=0)  # [pages]
     idx = torch.arange(pages, device=table_row.device)
     big = torch.finfo(torch.float32).max
     forced = (idx < SINK_PAGES) | (idx >= full - RECENT_PAGES)
