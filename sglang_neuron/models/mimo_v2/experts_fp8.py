@@ -115,12 +115,94 @@ def _down(slices: list, cols: slice) -> dict:
     return {"weight": torch.stack(weights).view(FP8), "scale": torch.stack(scales)}
 
 
+# keep each rank's converted experts on disk and read them back at the next launch (_ExpertCache)
+CACHE_ENV = "SGLANG_NEURON_MIMO_EXPERT_CACHE"
+_CHECKPOINT = {"path": None}
+
+
+def set_checkpoint(path: str) -> None:
+    """The checkpoint the next load reads (model.load_weights), which names the expert cache's directory."""
+    _CHECKPOINT["path"] = path
+
+
+def _sources_digest() -> str:
+    """This module's and weights.py's sources: the conversion the cached tensors came from."""
+    import hashlib
+
+    from sglang_neuron.models.mimo_v2 import weights as weights_module
+
+    digest = hashlib.sha256()
+    for module_file in (__file__, weights_module.__file__):
+        with open(module_file, "rb") as f:
+            digest.update(f.read())
+    return digest.hexdigest()[:16]
+
+
+class _ExpertCache:
+    """The converted experts of each (layer, gate_up | down, local expert range, intermediate shard), kept as one
+    safetensors file (``SGLANG_NEURON_MIMO_EXPERT_CACHE=1``, off by default).
+
+    The conversion is CPU work (dequantize MXFP4, requantize each row): 3 minutes of a 64-rank launch, every launch,
+    for the same bytes. The first launch writes each result here, a later one reads it instead of reading and
+    converting the checkpoint slices. A file is named by what decides its contents (the layer, which experts, which
+    rows or columns, the shapes), not by the rank, so launches of other layouts with the same split share it; the
+    directory by the checkpoint (its path and every file's size and mtime) and the conversion's sources. It sits
+    beside torch-neuronx's NEFF cache root (``mimo_v2_experts/<fingerprint>``); about 1 byte a routed-expert
+    parameter (~300 GB for V2.6-Flash), written once."""
+
+    _directory = None
+    _lock = threading.Lock()
+
+    @classmethod
+    def directory(cls):
+        if os.environ.get(CACHE_ENV, "0").strip() != "1" or _CHECKPOINT["path"] is None:
+            return None
+        with cls._lock:
+            if cls._directory is None:
+                import hashlib
+                from pathlib import Path
+
+                root = Path(_CHECKPOINT["path"]).resolve()
+                digest = hashlib.sha256(str(root).encode())
+                for f in sorted(root.glob("*.safetensors")) + sorted(root.glob("*.json")):
+                    st = f.stat()
+                    digest.update(f"{f.name}:{st.st_size}:{st.st_mtime_ns}".encode())
+                digest.update(_sources_digest().encode())
+                neff = os.environ.get("TORCH_NEURONX_NEFF_CACHE_DIR") or "/tmp/neff_cache"
+                cls._directory = (Path(neff).resolve().parent / "mimo_v2_experts" / digest.hexdigest()[:24])
+                cls._directory.mkdir(parents=True, exist_ok=True)
+        return cls._directory
+
+    @classmethod
+    def get_or_compute(cls, name: str, compute) -> dict:
+        directory = cls.directory()
+        if directory is None:
+            return compute()
+        from safetensors.torch import load_file, save_file
+
+        path = directory / f"{name}.safetensors"
+        if path.exists():
+            try:
+                return load_file(str(path))
+            except Exception:  # noqa: BLE001 - a torn or foreign file: convert again and replace it
+                pass
+        out = compute()
+        tmp = path.with_name(f".{path.name}.{os.getpid()}.{threading.get_ident()}")
+        save_file({k: v.contiguous() for k, v in out.items()}, str(tmp))
+        os.replace(tmp, path)
+        return out
+
+
 def make_fp8(moe, layer_key: str) -> None:
     """Give ``moe`` (moe.MiMoV2MoE) FP8 expert weights and their per-row scales in place of its bf16 ones; each
     weight's mapping is its scale's too (moe.MiMoV2MoE.weight_mappings)."""
     e, (h, _, i) = moe.num_local_experts, moe.gate_up_weight.shape[1:]
     shard = slice(moe.expert_tp_rank * i, (moe.expert_tp_rank + 1) * i)
     memo = _Memo()
+    experts = moe.local_experts
+    # what decides a conversion's bytes (_ExpertCache); no cache without a layer key to tell the layers apart
+    names = ({kind: f"{layer_key}.{kind}.x{experts.start}-{experts.stop}.s{shard.start}-{shard.stop}.h{h}"
+              for kind in ("gate_up", "down")} if layer_key else None)
     moe.gate_up_weight = nn.Parameter(torch.empty(e, h, 2, i, dtype=FP8), requires_grad=False)
     moe.down_weight = nn.Parameter(torch.empty(e, i, h, dtype=FP8), requires_grad=False)
     moe.gate_up_scale = nn.Parameter(torch.empty(e, 2, i, dtype=torch.float32), requires_grad=False)
@@ -129,8 +211,10 @@ def make_fp8(moe, layer_key: str) -> None:
     def loader(kind: str, part: str):
         compute = (lambda slices: _gate_up(slices, e, shard)) if kind == "gate_up" else (
             lambda slices: _down(slices, shard))
+        cached = compute if names is None else (lambda slices: _ExpertCache.get_or_compute(
+            names[kind], lambda: compute(slices)))
         return SafetensorsWeightLoader(transform=lambda slices, rank: memo.take(
-            (layer_key, kind, rank), part, lambda: compute(slices)))
+            (layer_key, kind, rank), part, lambda: cached(slices)))
 
     set_weight_loader(moe.gate_up_weight, loader("gate_up", "weight"))
     set_weight_loader(moe.gate_up_scale, loader("gate_up", "scale"))

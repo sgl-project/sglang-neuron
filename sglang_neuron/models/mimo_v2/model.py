@@ -445,6 +445,10 @@ class MiMoV2Graph(nn.Module):
         disk_tp = weights.qkv_disk_tp(checkpoint_path)
         for layer in self.decoder_layers():
             layer.self_attn.set_qkv_disk_tp(disk_tp)
+        from sglang_neuron.models.mimo_v2 import experts_fp8
+
+        # the converted experts' disk cache is named by the checkpoint (experts_fp8._ExpertCache)
+        experts_fp8.set_checkpoint(checkpoint_path)
         checkpoint = SafetensorsCheckpoint(checkpoint_path)
         state = checkpoint.load_sharded_pipelined(self.tp_group.rank_in_group, self.tp_group.world_size, self,
                                                   self.hf_weight_mappings(), device).state_dict

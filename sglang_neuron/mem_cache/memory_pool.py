@@ -139,21 +139,29 @@ class NeuronMHATokenToKVPool(KVCache):
         return (self.store_dtype in (torch.float8_e4m3fn, torch.float8_e5m2)
                 and getattr(self, "fp8_k_layout_packed", True))
 
+    def _zeros(self, shape) -> torch.Tensor:
+        """A zeroed device buffer, zeroed on the host and copied over. torch.zeros on the device runs an eager
+        program that carries the zeros from the host anyway, a fresh compile in each process and about 2 GB/s: a
+        64-rank MiMo-V2 launch spent 85 s in its 12 GB FP8 pool (the host copy is 2-4x faster there, and 15x on one
+        rank). FP8 buffers go over as bytes (no CPU FP8 fill needed; zero bytes are +0.0)."""
+        fp8 = self.store_dtype in (torch.float8_e4m3fn, torch.float8_e5m2)
+        host = torch.zeros(tuple(shape), dtype=torch.uint8 if fp8 else self.store_dtype)
+        out = host.to(self.kv_device)
+        return out.view(self.store_dtype) if fp8 else out
+
     def _create_buffers(self):
         k_shape, shape = self.get_kv_buffer_shape()
         if self.paired_layers:
             nb = self.num_blocks
-            k_pairs = [torch.zeros((2 * nb, *k_shape[1:]), dtype=self.store_dtype, device=self.kv_device)
-                       for _ in range(self.layer_num // 2)]
-            v_pairs = [torch.zeros((2 * nb, *shape[1:]), dtype=self.store_dtype, device=self.kv_device)
-                       for _ in range(self.layer_num // 2)]
+            k_pairs = [self._zeros((2 * nb, *k_shape[1:])) for _ in range(self.layer_num // 2)]
+            v_pairs = [self._zeros((2 * nb, *shape[1:])) for _ in range(self.layer_num // 2)]
             self.k_buffer = [half for pair in k_pairs for half in (pair[:nb], pair[nb:])]
             self.v_buffer = [half for pair in v_pairs for half in (pair[:nb], pair[nb:])]
             self.layer_pairs = (k_pairs, v_pairs)
             return
         for _ in range(self.layer_num):
-            self.k_buffer.append(torch.zeros(k_shape, dtype=self.store_dtype, device=self.kv_device))
-            self.v_buffer.append(torch.zeros(shape, dtype=self.store_dtype, device=self.kv_device))
+            self.k_buffer.append(self._zeros(k_shape))
+            self.v_buffer.append(self._zeros(shape))
 
     def _clear_buffers(self):
         del self.k_buffer, self.v_buffer
@@ -220,6 +228,11 @@ class NeuronMHATokenToKVPoolKind(NeuronMHATokenToKVPool, MHATokenToKVPool):
     Only the type comes from ``MHATokenToKVPool``. Its constructor never runs, and any of its methods the Neuron pool
     doesn't override raises (``_refuse_mha_methods``), since those address SGLang's token-major buffers. Pool options
     this pool doesn't implement are refused."""
+
+    # the page layout SGLang's PD transfer reads off an MHA pool (kv_cache_layout; MHATokenToKVPool's constructor,
+    # which sets it, never runs here): head-major, [kv_heads, page, head_dim]. SGLang moves a hybrid SWA pool's window
+    # pages whole between equal attention-TP sizes and refuses its per-token head slice of an "hnd" pool otherwise
+    kv_cache_layout = "hnd"
 
     def __init__(self, *args, **kwargs):
         if kwargs.get("enable_kv_cache_copy") and _neuron_mtp():

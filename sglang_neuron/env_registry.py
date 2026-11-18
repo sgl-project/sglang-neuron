@@ -44,6 +44,11 @@ KNOBS: dict = {
     "SGLANG_NEURON_MIMO_KV_SCALE": CONFIG,
     "SGLANG_NEURON_HYBRID_SWA_HICACHE": CONFIG,
     "SGLANG_NEURON_MIMO_PD_MTP_KV": CONFIG,
+    "SGLANG_NEURON_PD_HYBRID_SWA": CONFIG,
+    "SGLANG_NEURON_COMPILE_SPEEDUPS": CONFIG,
+    "SGLANG_NEURON_COMPILE_SPEEDUPS_DEBUG": CONFIG,
+    # MiMo-V2: the converted FP8 experts kept on disk across launches (models/mimo_v2/experts_fp8._ExpertCache)
+    "SGLANG_NEURON_MIMO_EXPERT_CACHE": CONFIG,
     # the Kimi-K3 prompt cache on the PD prefill (--radix-cache-backend kimi-prompt, mem_cache/kimi_prompt_backend):
     # its host tier, keep_previous, the chunk ends and the read-back of each page copy of a hit
     "SGLANG_NEURON_KIMI_PROMPT_HOST_SLOTS": CONFIG,
