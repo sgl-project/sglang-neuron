@@ -47,6 +47,10 @@ def check_layout(config: MiMoV2Config, tp: int, ep: int, attn_dp: int, role: str
         raise ValueError(f"{NAME}: " + "; ".join(problems))
 
 
+# the decode graphs' context rungs, a comma list (tokens, or K = 1024 tokens); the ladder of 1/1..1/64 by default
+DECODE_CONTEXTS_ENV = "SGLANG_NEURON_MIMO_DECODE_CONTEXTS"
+
+
 class MiMoV2ForCausalLM(ModelHost):
     name = NAME
 
@@ -69,6 +73,22 @@ class MiMoV2ForCausalLM(ModelHost):
         """The decode's contexts (graph_runner.BucketConfig): the decode attention reads its graph's whole table, so a
         row's step costs its graph's context, not its own. Rungs at 1/2, 1/4, 1/16 and 1/64 of the context, none
         below 8K: an AgentX step of rows of 10K-200K at a 1M server runs a 16K-256K graph instead of a 256K one."""
+        import os
+
+        listed = os.environ.get(DECODE_CONTEXTS_ENV, "").strip()
+        if listed:
+            # the rungs themselves, in tokens or with a K suffix (1024 tokens): a batch's step costs its longest row's
+            # rung times its batch bucket, so rungs closer together cost less padding (a 300K row in a 512K graph
+            # costs its whole batch 85 ms a step at bs 8, the 320K graph's ~65)
+            rungs = set()
+            for item in listed.split(","):
+                item = item.strip().lower()
+                value = int(item[:-1]) * 1024 if item.endswith("k") else int(item)
+                if value <= 0:
+                    raise ValueError(f"{DECODE_CONTEXTS_ENV}={listed!r}: a rung must be above 0")
+                rungs.add(min(value, context))
+            rungs.add(context)
+            return sorted(rungs)
         rungs = {context // q for q in (1, 2, 4, 16, 64)}
         return sorted(r for r in rungs if r >= min(8192, context))
 
