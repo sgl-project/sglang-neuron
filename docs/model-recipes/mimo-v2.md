@@ -9,8 +9,8 @@ that port's eager fp32 attention gathers the whole context every step and cannot
 **Status:** served on a trn2.48xlarge at 8K, 256K and 1M contexts with FP8 experts (the measurements below; Neuron SDK
 2.33.0, the release image `pytorch-inference-sglang-neuron:v0.1.0` with this tree on `PYTHONPATH`), and with
 `--speculative-algorithm NEURON_MTP` (the checkpoint's 3 MTP layers, [below](#mtp-neuron_mtp)) and the FP8 KV cache
-(`--kv-cache-dtype fp8_e4m3`, [below](#fp8-kv-cache)) and DCP (`--dcp-size 8`, [below](#dcp---dcp-size-8)). Not yet: DP
-attention (PD decode only), PD.
+(`--kv-cache-dtype fp8_e4m3`, [below](#fp8-kv-cache)) and DCP (`--dcp-size 8`, [below](#dcp---dcp-size-8)). PD runs over
+NIXL on two nodes ([below](#pd-two-trn248xlarge-nixl-over-efa)).
 
 ## The model
 
@@ -235,6 +235,28 @@ layers, not the fused attention half). The pool holds 2620 pages of 128 tokens a
 context over the group: DCP is the capacity point (1M contexts, more of them), not the latency one. With the FP8 cache
 (`--kv-cache-dtype fp8_e4m3`): GSM8K 0.910, TPOT 34.96 / 46.88 ms at c = 1 / 8, 5240 pages a rank (5.37M tokens). Not yet with
 NEURON_MTP or the hybrid window pool.
+
+### PD (two trn2.48xlarge, NIXL over EFA)
+
+A TP64 prefill on one node in front of a TP64 decode on the other, both on one KV pool (the window pool is not served on
+a PD role), the plugin's balancer in front:
+
+```bash
+# both: SGLANG_NEURON_HYBRID_SWA_RADIX=0, the container with /dev/infiniband (--privileged) and --network host
+# prefill node
+HOST=<prefill ip> PORT=30000 bash examples/mimo_v2/run_server.sh --disable-hybrid-swa-memory \
+  --disaggregation-mode prefill --disaggregation-transfer-backend nixl --disaggregation-bootstrap-port 8998
+# decode node
+HOST=<decode ip> PORT=30001 bash examples/mimo_v2/run_server.sh --disable-hybrid-swa-memory \
+  --disaggregation-mode decode --disaggregation-transfer-backend nixl
+python3 -m sglang_neuron.disaggregation.balancer --prefill http://<prefill ip>:30000 \
+  --decode http://<decode ip>:30001 --bootstrap-port 8998 --port 8000
+```
+
+Measured at a 64K context (bf16 cache, no MTP): GSM8K 0.900 (1319, parallel 8) through the balancer; decode TPOT
+20.92 / 23.09 / 26.23 ms at c = 1 / 8 / 16. Without EFA NIXL's LIBFABRIC backend registers no device memory
+(`registerMem: no available backends for mem type 'VRAM_SEG'`), so a one-node pair
+(`examples/mimo_v2/run_pd_one_node.sh`) needs a node with EFA too.
 
 ### Pools, measured (`--mem-fraction-static 0.85`, bf16 KV, a rank)
 
