@@ -268,6 +268,16 @@ hands its KV to the DP decode as is. Measured: GSM8K 0.904; decode TPOT 41.8 ms 
 (the groups step in lockstep at 8 rows each), 181 / 643 / 1110 tok/s at c = 8 / 32 / 64, against the TP64 decode's
 23.1 ms and 317 tok/s at c = 8 and 530 tok/s at its c = 16 ceiling: the throughput layout.
 
+### HiCache over the window pool
+
+`SGLANG_NEURON_HYBRID_SWA_HICACHE=1` with `--enable-hierarchical-cache --hicache-size <GB a rank>` keeps evicted radix
+pages in host memory with hybrid SWA memory on: SGLang's hybrid pool assembler builds one host pool for the full pool
+and one for the window pool (`build_hybrid_swa_group`), each the Neuron MHA host pool (`mem_cache/host_pool.py`), and
+its controller moves a request's full pages and its window's pages between them. `--hicache-size` is per rank: 64
+ranks x 8 GB is 512 GB of the node's 2 TB. Checked at 8K with MTP and the FP8 cache and a 32K-token device pool
+(`--max-total-tokens 32768 --swa-full-tokens-ratio 1.0`): 60 distinct 2.3K-token prompts twice, the second pass hits
+2257 tokens a prompt on average (mostly from the host); GSM8K 0.927 / 0.930 over two passes.
+
 ### Pools, measured (`--mem-fraction-static 0.85`, bf16 KV, a rank)
 
 | Experts | full-attention pool | window pool |

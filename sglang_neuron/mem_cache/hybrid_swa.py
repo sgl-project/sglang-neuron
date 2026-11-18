@@ -73,6 +73,20 @@ _SOURCES_MD5 = {
 }
 
 
+# opt-in HiCache over the two pools: SGLang's hybrid pool assembler builds a host pool for the full pool and one for the
+# window pool (build_hybrid_swa_group), each the Neuron MHA host pool (host_pool.host_pool_cls), and its controller
+# moves a request's full pages and its window's pages between them
+HICACHE_MODE = "SGLANG_NEURON_HYBRID_SWA_HICACHE"
+
+
+def hicache_mode(environ=os.environ) -> bool:
+    """Whether hybrid SWA memory serves HiCache (HICACHE_MODE), ``0`` or ``1``."""
+    value = environ.get(HICACHE_MODE, "0").strip()
+    if value not in ("0", "1"):
+        raise ValueError(f"{HICACHE_MODE}={value!r}: set 1 (HiCache over the full and the window pools) or 0")
+    return value == "1"
+
+
 def radix_mode(environ=os.environ) -> bool:
     """Whether hybrid SWA memory runs under the radix tree (RADIX_MODE). Only ``0`` and ``1`` are accepted, so ``true``
     or ``yes`` cannot silently leave it off."""
@@ -118,8 +132,10 @@ def unserved(server_args, architecture: str, spec, policy) -> list:
     if radix and policy.pp_size > 1:
         reasons.append(f"--pp-size {policy.pp_size} with the radix cache: no run covers hybrid SWA memory under a "
                        "pipelined server's tree")
-    if getattr(server_args, "enable_hierarchical_cache", False):
-        reasons.append("--enable-hierarchical-cache: the Neuron host pool (mem_cache.host_pool) mirrors one KV pool")
+    if getattr(server_args, "enable_hierarchical_cache", False) and not hicache_mode():
+        reasons.append(f"--enable-hierarchical-cache: the Neuron host pool (mem_cache.host_pool) mirrors one KV pool "
+                       f"({HICACHE_MODE}=1 builds one for each of the two: SGLang's hybrid SWA HiCache group over "
+                       "the full and the window pools)")
     if chunk_keyed_tree.selected(server_args):
         reasons.append(f"--radix-cache-backend {chunk_keyed_tree.BACKEND}, whose tree keys a plain KV pool only "
                        "(mem_cache.chunk_keyed_tree)")
