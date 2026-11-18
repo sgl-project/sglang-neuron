@@ -258,6 +258,13 @@ Measured at a 64K context (bf16 cache, no MTP): GSM8K 0.900 (1319, parallel 8) t
 (`registerMem: no available backends for mem type 'VRAM_SEG'`), so a one-node pair
 (`examples/mimo_v2/run_pd_one_node.sh`) needs a node with EFA too.
 
+**NEURON_MTP and the FP8 cache on a PD pair**: the prefill takes `SGLANG_NEURON_MIMO_PD_MTP_KV=1` (it holds the MTP
+layers and writes their KV over each chunk, so both pools hold 51 layers and the transfer carries the MTP layers' KV)
+and the decode `--speculative-algorithm NEURON_MTP` (`MTP=1`); both `--kv-cache-dtype fp8_e4m3`. Measured at 64K:
+GSM8K 0.920; accepted length 3.43 (the aggregated server's 3.39); decode TPOT 6.85 / 8.23 / 9.70 ms at c = 1 / 8 / 16,
+1146 tok/s at c = 16 (the aggregated server's 11.53 ms there: the decode no longer pauses for prefill chunks). A pool of
+51 layers holds 4917 pages of 128 tokens a rank (629K tokens).
+
 **DP attention on the decode** (`--dp-size 8 --enable-dp-attention --enable-dp-attention-local-control-broadcast`, the
 decode's `MAX_RUNNING=64`: a DP batch is a multiple of the attention TP, 8 rows a group): eight groups of attention TP 8
 (8 query heads a rank over its one KV head), the experts over EP64 across them (`moe.MiMoV2MoE.serves_dp_attention`):

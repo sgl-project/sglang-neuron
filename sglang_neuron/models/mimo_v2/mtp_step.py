@@ -15,7 +15,8 @@ from sglang_neuron.models.hy_v3.mtp_step import (  # noqa: F401 - the host inter
     CTRL_BASE, CTRL_COLUMNS, CTRL_FRESH, CTRL_LIVE, CTRL_TOKEN, NUM_STEPS, SPEC, StepHost, accept, host_rows,
     request_rows, slot_of, span_inputs)
 
-PREFILL_SETTING = None
+# the PD prefill of an MTP decode writes the MTP layers' KV (mtp.PD_MTP_KV_ENV)
+PREFILL_SETTING = "SGLANG_NEURON_MIMO_PD_MTP_KV=1 (and the decode's SGLANG_NEURON_MIMO_MTP_LAYERS)"
 # an aggregated server: the target's prefill graph writes the MTP layer's KV (mtp.py)
 AGGREGATED = True
 
@@ -24,8 +25,11 @@ def launch_problems(server_args) -> list:
     problems = []
     if int(getattr(server_args, "dcp_size", 1) or 1) > 1:
         problems.append("--dcp-size (the step's span attention does not run over DCP shards yet)")
-    if str(getattr(server_args, "disaggregation_mode", "null")) != "null":
-        problems.append("a PD role (MiMo's MTP step is served on an aggregated server)")
+    mode = str(getattr(server_args, "disaggregation_mode", "null"))
+    if mode not in ("null", "decode"):
+        problems.append(f"a --disaggregation-mode {mode} (the step is the decode's)")
+    if getattr(server_args, "enable_dp_attention", False):
+        problems.append("DP attention (the step's carry and control are one TP group's)")
     return problems
 
 

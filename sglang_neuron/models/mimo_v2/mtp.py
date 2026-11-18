@@ -41,15 +41,27 @@ from sglang_neuron.parallel import groups
 from sglang_neuron.utils.weight_loader import SafetensorsWeightLoader, set_weight_loader
 
 LAYERS_ENV = "SGLANG_NEURON_MIMO_MTP_LAYERS"
+# SGLANG_NEURON_MIMO_PD_MTP_KV=1 on a --disaggregation-mode prefill: build the MTP layers and write their KV over each
+# chunk, for a NEURON_MTP decode (whose pool holds the layers; the prefill itself runs no speculative step)
+PD_MTP_KV_ENV = "SGLANG_NEURON_MIMO_PD_MTP_KV"
 
 
 def enabled() -> bool:
-    """Whether the launch serves NEURON_MTP, whose graphs hold the MTP layers."""
+    """Whether the launch holds the MTP layers: it serves NEURON_MTP (an aggregated server or a PD decode), or it is the
+    PD prefill of such a decode (``PD_MTP_KV_ENV``)."""
     from sglang.srt.runtime_context import get_server_args
 
     from sglang_neuron.speculative.neuron_mtp import is_neuron_mtp
 
-    return is_neuron_mtp(getattr(get_server_args(), "speculative_algorithm", None))
+    args = get_server_args()
+    if is_neuron_mtp(getattr(args, "speculative_algorithm", None)):
+        return True
+    if os.environ.get(PD_MTP_KV_ENV, "0") == "1":
+        if str(getattr(args, "disaggregation_mode", "null")) != "prefill":
+            raise ValueError(f"{PD_MTP_KV_ENV}=1 is for a --disaggregation-mode prefill; a decode or an aggregated "
+                             "server holds the MTP layers with --speculative-algorithm NEURON_MTP")
+        return True
+    return False
 
 
 def num_layers(environ=os.environ) -> int:
