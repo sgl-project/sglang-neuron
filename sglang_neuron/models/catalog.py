@@ -205,6 +205,7 @@ MODELS = {
     ),
     "Qwen3ForCausalLM": ModelSpec(package="sglang_neuron.models.qwen3", kv_cache_dtypes=("auto", "bf16", "bfloat16")),
     "Glm4ForCausalLM": ModelSpec(package="sglang_neuron.models.glm4", kv_cache_dtypes=("auto", "bf16", "bfloat16")),
+    "LlamaForCausalLM": ModelSpec(package="sglang_neuron.models.llama", kv_cache_dtypes=("auto", "bf16", "bfloat16")),
     "Qwen3MoeForCausalLM": ModelSpec(package="sglang_neuron.models.qwen3_moe",
                                      kv_cache_dtypes=("auto", "bf16", "bfloat16")),
     # the paged giga prefill writes each forward's final GDN state into SGLang's tracking slot, so the chunk-keyed tree
