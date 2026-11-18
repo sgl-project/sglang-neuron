@@ -60,9 +60,16 @@ def derive_hybrid_model(original_fn, self, *args, **kwargs):
     result = original_fn(self, *args, **kwargs)
     from sglang_neuron.speculative.neuron_mtp import is_neuron_mtp
 
+    import os
+
+    from sglang_neuron.models.mimo_v2.mtp import PD_MTP_KV_ENV
+
     ids = getattr(self, "swa_attention_layer_ids", None)
-    if (_is_mimo_v2(getattr(self.hf_config, "architectures", None)) and ids is not None
-            and is_neuron_mtp(getattr(self, "speculative_algorithm", None)) and not self.is_draft_model):
+    # the MTP layers' KV: a NEURON_MTP server's, or the PD prefill's that writes it for one (mtp.PD_MTP_KV_ENV)
+    holds_mtp = (is_neuron_mtp(getattr(self, "speculative_algorithm", None))
+                 or os.environ.get(PD_MTP_KV_ENV, "0") == "1")
+    if (_is_mimo_v2(getattr(self.hf_config, "architectures", None)) and ids is not None and holds_mtp
+            and not self.is_draft_model):
         from sglang_neuron.models.mimo_v2.mtp import num_layers
 
         first = int(self.hf_text_config.num_hidden_layers)

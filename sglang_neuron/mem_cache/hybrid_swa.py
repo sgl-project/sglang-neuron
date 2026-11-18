@@ -79,6 +79,21 @@ _SOURCES_MD5 = {
 HICACHE_MODE = "SGLANG_NEURON_HYBRID_SWA_HICACHE"
 
 
+# opt-in hybrid SWA memory on a PD role: between a prefill and a decode of one attention-TP size SGLang moves a request's
+# window pages whole (NixlKVManager._state_component_is_whole_slot: attn_tp_size == decode_tp_size), whatever their
+# layout, so only the token-major per-token slice of unequal sizes needs refusing; launch both roles with it and with one
+# attention-TP size
+PD_MODE = "SGLANG_NEURON_PD_HYBRID_SWA"
+
+
+def pd_mode(environ=os.environ) -> bool:
+    """Whether hybrid SWA memory serves a PD role (PD_MODE), ``0`` or ``1``."""
+    value = environ.get(PD_MODE, "0").strip()
+    if value not in ("0", "1"):
+        raise ValueError(f"{PD_MODE}=1 (hybrid SWA on a PD pair of equal attention-TP sizes) or 0, not {value!r}")
+    return value == "1"
+
+
 def hicache_mode(environ=os.environ) -> bool:
     """Whether hybrid SWA memory serves HiCache (HICACHE_MODE), ``0`` or ``1``."""
     value = environ.get(HICACHE_MODE, "0").strip()
@@ -114,12 +129,13 @@ def unserved(server_args, architecture: str, spec, policy) -> list:
     if spec.hybrid_swa_memory and policy.pp_size > 1 and policy.role == "aggregated" and not radix:
         # only where PP is served (chunk cache); a model without hybrid SWA memory need not declare layer kinds
         reasons += stage_layout_reasons(server_args, architecture, policy.pp_size)
-    if policy.role != "aggregated":
+    if policy.role != "aggregated" and not pd_mode():
         # (DCP, served on a PD decode only, is refused with the PD roles)
         reasons.append(f"a {policy.role} server: a PD pair would send each request's window pages through SGLang's "
                        "window-state transfer, which slices a page between attention TPs per token, as if it were "
                        "token-major, while the Neuron pool's pages are head-major (sglang_patches.nixl_head_major "
-                       "adapts the KV pages only)")
+                       f"adapts the KV pages only); {PD_MODE}=1 serves a pair of equal attention-TP sizes, whose "
+                       "window pages SGLang moves whole")
     # None: SGLang sets a positive chunk after the platform's defaults (handle_gpu_memory_settings)
     chunk = getattr(server_args, "chunked_prefill_size", None)
     if chunk is not None and chunk <= 0:
@@ -269,8 +285,10 @@ def check_window_pool(model_runner, window: int) -> None:
     demand = window_demand(
         window=window, page=int(model_runner.page_size), requests=int(model_runner.max_running_requests),
         interval=max(1, int(envs.SGLANG_SWA_EVICTION_INTERVAL.get())), chunk=chunk,
-        chunks_in_flight=prefill_chunks_in_flight(int(getattr(sa, "pp_size", 1) or 1),
-                                                  bool(resolution_result(sa, "disable_overlap_schedule", False))),
+        # a PD decode runs no prefill chunk: its requests' window pages arrive by transfer, into pages it allocates
+        # (and waits for) before each transfer, so they never retract a running request
+        chunks_in_flight=0 if str(getattr(sa, "disaggregation_mode", "null")) == "decode" else prefill_chunks_in_flight(
+            int(getattr(sa, "pp_size", 1) or 1), bool(resolution_result(sa, "disable_overlap_schedule", False))),
         tree=tree)
     cache = "radix cache" if tree else "chunk cache"
     if pool < demand:
