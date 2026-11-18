@@ -15,28 +15,34 @@ from sglang_neuron.models.mimo_v2.model import MiMoV2Graph, expert_scale_suffix
 from sglang_neuron.models.transformer.config import check_bf16_launch
 
 
-def check_layout(config: MiMoV2Config, tp: int, ep: int, attn_dp: int) -> None:
-    """Refuse a parallel layout the graphs cannot shard, before any weight loads."""
+def check_layout(config: MiMoV2Config, tp: int, ep: int, attn_dp: int, role: str = "null") -> None:
+    """Refuse a parallel layout the graphs cannot shard, before any weight loads. DP attention is served on a PD
+    decode, with the experts over EP across the replicas (moe.MiMoV2MoE.serves_dp_attention)."""
     problems = []
-    if attn_dp > 1:
-        problems.append("DP attention is not served; the experts run on attention TP (launch without "
-                        "--enable-dp-attention / --dp-size)")
+    if attn_dp > 1 and role != "decode":
+        problems.append("DP attention on a server that is not a --disaggregation-mode decode (the runtime serves it on "
+                        "a PD decode only)")
+    if attn_dp > 1 and ep != tp:
+        problems.append(f"DP attention with --ep-size {ep}: the experts span the replicas, --ep-size {tp}")
+    attn_tp = tp // max(attn_dp, 1)
     for kind_name, kind in (("full", config.full), ("sliding", config.swa)):
-        if kind.num_heads % tp:
-            problems.append(f"{kind.num_heads} {kind_name}-attention heads do not shard over --tp-size {tp}")
-        if tp % kind.num_kv_heads:
+        if kind.num_heads % attn_tp:
+            problems.append(f"{kind.num_heads} {kind_name}-attention heads do not shard over an attention TP of "
+                            f"{attn_tp}")
+        if attn_tp % kind.num_kv_heads:
             # the decode kernel attends one KV head per rank, so every rank replicates exactly one
             problems.append(f"{kind.num_kv_heads} {kind_name}-attention KV heads do not replicate one a rank across "
-                            f"--tp-size {tp} (a multiple of {kind.num_kv_heads})")
+                            f"an attention TP of {attn_tp} (a multiple of {kind.num_kv_heads})")
     if config.num_experts % ep or tp % ep:
         problems.append(f"{config.num_experts} experts do not split over --ep-size {ep} within --tp-size {tp}")
     elif config.moe_intermediate_size % (tp // ep):
         problems.append(f"an expert intermediate size of {config.moe_intermediate_size} does not shard over the "
                         f"{tp // ep} ranks of each expert")
-    if config.intermediate_size % tp:
-        problems.append(f"a dense intermediate size of {config.intermediate_size} does not shard over --tp-size {tp}")
-    if config.vocab_size % tp:
-        problems.append(f"a vocabulary of {config.vocab_size} does not shard over --tp-size {tp}")
+    if config.intermediate_size % attn_tp:
+        problems.append(f"a dense intermediate size of {config.intermediate_size} does not shard over an attention TP "
+                        f"of {attn_tp}")
+    if config.vocab_size % attn_tp:
+        problems.append(f"a vocabulary of {config.vocab_size} does not shard over an attention TP of {attn_tp}")
     if problems:
         raise ValueError(f"{NAME}: " + "; ".join(problems))
 
@@ -72,7 +78,10 @@ class MiMoV2ForCausalLM(ModelHost):
         check_bf16_launch(config, self.name)
         mimo = mimo_v2_config(config)
         pc = sglang_tree.parallel_config()
-        check_layout(mimo, int(pc.tp_size), int(pc.ep_size or 1), sglang_tree.attention_dp_size(pc))
+        from sglang.srt.runtime_context import get_server_args as _args
+
+        check_layout(mimo, int(pc.tp_size), int(pc.ep_size or 1), sglang_tree.attention_dp_size(pc),
+                     str(getattr(_args(), "disaggregation_mode", "null") or "null"))
         dcp = int(getattr(pc, "attn_dcp_size", 1) or 1)
         if dcp > 1:
             from sglang.srt.runtime_context import get_server_args

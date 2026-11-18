@@ -37,11 +37,25 @@ def fused_enabled() -> bool:
 
 
 class MiMoV2MoE(SparseMoE):
+    # under DP attention (a PD decode) the experts span the replicas: each step gathers the DP groups' tokens, runs this
+    # rank's experts over all of them, sums the outputs over the world and keeps its group's rows (models/gpt_oss/mxfp4's
+    # cross-DP EP)
+    serves_dp_attention = True
+
     def __init__(self, *, hidden_size: int, num_experts: int, top_k: int, intermediate_size: int, norm_topk_prob: bool,
                  scaling: float, expert_scale_suffix: str, prefill: bool, layer_key: str = ""):
         super().__init__(hidden_size=hidden_size, num_experts=num_experts, top_k=top_k,
                          intermediate_size=intermediate_size, norm_topk_prob=norm_topk_prob, prefill=prefill)
         self.scaling = scaling
+        from sglang_neuron.parallel import groups as neuron_groups
+        from sglang_neuron.parallel.state import STATE
+
+        self.dp_size = STATE.dp_size
+        if self.dp_size > 1:
+            if prefill:
+                raise ValueError("MiMo-V2's experts take DP attention on a PD decode only")
+            self.dp_group = neuron_groups.get_dp_group()
+            self.wide_ep_group = neuron_groups.get_wide_ep_group()
         self.expert_bias = nn.Parameter(torch.empty(num_experts, dtype=torch.float32))
         # "" for a bf16 checkpoint, else the experts' scale key (weight_scale: MXFP4, weight_scale_inv: FP8 blocks)
         self.expert_scale_suffix = expert_scale_suffix
@@ -63,6 +77,7 @@ class MiMoV2MoE(SparseMoE):
                 set_weight_loader(p, weights.dequantizing(get_weight_loader(p)))
 
     def forward(self, x, real=None):
+        x = self._gather(x)
         affinities, experts = hy3_route(x, self.router_weight, self.expert_bias, self.top_k, self.norm_topk_prob,
                                         self.scaling)
         # the kernels take fp32 affinities; rounded through bf16 as the HF model's bf16 expert sum weighs them
@@ -82,7 +97,28 @@ class MiMoV2MoE(SparseMoE):
         else:
             out = moe_experts(x, gate_up=self.gate_up_weight, down=self.down_weight, affinities=affinities,
                               index=experts.to(torch.int32), rank_id=self._ep_rank_id())
-        return neuron_collectives.all_reduce(self.attn_tp_group, out)
+        return self._reduce(out)
+
+    def _gather(self, x: torch.Tensor) -> torch.Tensor:
+        """The rows every DP group decodes this step (DP attention), else ``x``. Over the world, then each group's first
+        rank's copy: on a Trn2 64-rank layout the DP columns (ranks 8 apart) form no collective group the runtime can
+        build ("no_hier no_mesh")."""
+        if self.dp_size == 1:
+            return x
+        rows, tp = x.shape[0], self.attn_tp_group.world_size
+        every = neuron_collectives.all_gather(self.wide_ep_group, x, dim=0).view(self.dp_size * tp, rows, -1)
+        leaders = torch.arange(self.dp_size, device=x.device, dtype=torch.int64) * tp
+        return every.index_select(0, leaders).reshape(self.dp_size * rows, -1)
+
+    def _reduce(self, out: torch.Tensor) -> torch.Tensor:
+        """This rank's partial expert output summed over the ranks holding experts: the attention TP group, or under DP
+        attention the world, and this rank's group's rows of it."""
+        if self.dp_size == 1:
+            return neuron_collectives.all_reduce(self.attn_tp_group, out)
+        from sglang_neuron.parallel.groups import shard_select
+
+        out = neuron_collectives.all_reduce(self.wide_ep_group, out)
+        return shard_select(out, 0, self.dp_group, n_shards=self.dp_size)
 
     def fused_decode(self, x, ln_w, eps: float, ebase) -> torch.Tensor:
         """The decode MoE half in one kernel (kernels/moe_half.py) on the residual stream ``x`` [T, H] (before the norm,
@@ -92,12 +128,13 @@ class MiMoV2MoE(SparseMoE):
         from sglang_neuron.utils.hardware_config import get_logical_nc_config
 
         kernel = wrap_nki(moe_half)[get_logical_nc_config()]
+        x = self._gather(x)
         tiles = [kernel(x[s:s + experts_fp8.MAX_TOKENS], ln_w.view(1, -1), self.router_wT, self.expert_bias.view(1, -1),
                         ebase, self.gate_up_weight, self.down_weight, self.gate_up_scale, self.down_scale, eps=eps,
                         route_scale=float(self.scaling), top_k=self.top_k)
                  for s in range(0, x.shape[0], experts_fp8.MAX_TOKENS)]
         out = tiles[0] if len(tiles) == 1 else torch.cat(tiles, dim=0)
-        return neuron_collectives.all_reduce(self.attn_tp_group, out)
+        return self._reduce(out)
 
     def weight_mappings(self, src: str, dst: str) -> dict:
         mlp, experts = f"{src}.mlp", f"{src}.mlp.experts"

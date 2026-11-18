@@ -258,6 +258,16 @@ Measured at a 64K context (bf16 cache, no MTP): GSM8K 0.900 (1319, parallel 8) t
 (`registerMem: no available backends for mem type 'VRAM_SEG'`), so a one-node pair
 (`examples/mimo_v2/run_pd_one_node.sh`) needs a node with EFA too.
 
+**DP attention on the decode** (`--dp-size 8 --enable-dp-attention --enable-dp-attention-local-control-broadcast`, the
+decode's `MAX_RUNNING=64`: a DP batch is a multiple of the attention TP, 8 rows a group): eight groups of attention TP 8
+(8 query heads a rank over its one KV head), the experts over EP64 across them (`moe.MiMoV2MoE.serves_dp_attention`):
+each MoE step all-gathers the groups' rows over the world, runs the rank's 4 experts over all of them, all-reduces over
+the world and keeps its group's rows. The world, not the DP columns: on a Trn2 64-rank layout the columns (ranks 8
+apart) form no collective group the runtime can build (`ENC:enc_init_comm ... no_hier no_mesh`). The TP64 prefill
+hands its KV to the DP decode as is. Measured: GSM8K 0.904; decode TPOT 41.8 ms at every concurrency from 1 to 64
+(the groups step in lockstep at 8 rows each), 181 / 643 / 1110 tok/s at c = 8 / 32 / 64, against the TP64 decode's
+23.1 ms and 317 tok/s at c = 8 and 530 tok/s at its c = 16 ceiling: the throughput layout.
+
 ### Pools, measured (`--mem-fraction-static 0.85`, bf16 KV, a rank)
 
 | Experts | full-attention pool | window pool |
@@ -299,7 +309,7 @@ start with another `CACHE_DIR`.
 
 ## What a launch refuses
 
-- DP attention, `--pp-size`; `--dcp-size` above 8, or with the hybrid window pool or NEURON_MTP; a layout whose heads, KV heads, experts or intermediate sizes do not shard
+- DP attention but on a PD decode with `--ep-size` equal to `--tp-size`, `--pp-size`; `--dcp-size` above 8, or with the hybrid window pool or NEURON_MTP; a layout whose heads, KV heads, experts or intermediate sizes do not shard
   (every rank holds exactly one KV head: `--tp-size` a multiple of 8).
 - A `--kv-cache-dtype` other than bf16 or `fp8_e4m3`, a dtype other than bfloat16;
   `SGLANG_NEURON_MIMO_FULL_DECODE=posid` with the FP8 cache.
