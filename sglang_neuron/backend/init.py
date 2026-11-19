@@ -48,10 +48,10 @@ def _init_torchneuronx_backend() -> None:
     In order: refuse a compiler environment from the launch and keep NKI's trace cache off (CPU mode too); reserve the
     compiler variables the compile scopes replace; turn off the vocab-sharding pass; check that torch_neuronx is the
     native backend with its "neuron" dynamo backend registered; then refuse a compile cache built from other NKI
-    kernel sources or another kernel library (backend.compile_cache, which stamps an empty one) and install the
-    executor binding cache and the submit's upload wait, all before the first compile. torch-neuronx registers its
-    device, dynamo backend, torch.neuron and replica-mesh registry itself when torch imports it. A CPU-mode process
-    only installs the stand-in device."""
+    kernel sources or another kernel library (backend.compile_cache, which stamps an empty one), turn on the
+    precompile cache when asked (backend.precompile_cache) and install the executor binding cache and the submit's
+    upload wait, all before the first compile. torch-neuronx registers its device, dynamo backend, torch.neuron and
+    replica-mesh registry itself when torch imports it. A CPU-mode process only installs the stand-in device."""
     from sglang_neuron.backend import envs, stack
 
     stack.refuse_launch_compiler_env()
@@ -74,9 +74,11 @@ def _init_torchneuronx_backend() -> None:
 
     if "neuron" not in torch._dynamo.list_backends(exclude_tags=()):
         raise RuntimeError("torch-neuronx did not register its 'neuron' dynamo backend")
-    from sglang_neuron.backend import compile_cache, device_io, executor_cache
+    from sglang_neuron.backend import compile_cache, device_io, executor_cache, precompile_cache
 
     compile_cache.check_compile_caches()
+    # dynamo's trace of each serving graph kept across launches, when the launch asks (SGLANG_NEURON_PRECOMPILE_CACHE)
+    precompile_cache.enable()
     executor_cache.install()
     # every graph submit waits for its thread's uploads, whichever call site launches the graph
     device_io.install()

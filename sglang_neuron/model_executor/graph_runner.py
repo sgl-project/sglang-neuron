@@ -684,8 +684,33 @@ class NeuronModelRuntime:
         self.precompiles = self._precompiles(cpu_mode, declared_direct)
         if self.precompiles:
             backend = _deferrable(backend, self)
-        self.compiled = torch.compile(self.execution_model, backend=backend, fullgraph=True, dynamic=False,
-                                      options=options)
+        from sglang_neuron.backend import precompile_cache
+        from torch._dynamo.utils import counters as dynamo_counters
+
+        # the package directory of this launch's graphs, before the first compiled frame looks one up
+        if precompile_cache.configure() is not None:
+            # a restored package's guards read model modules a traced launch imported lazily
+            precompile_cache.import_model_modules(self.execution_model)
+        hits = dynamo_counters["dynamo_cache"]["dynamo_cache_hit"]
+        try:
+            self.compiled = torch.compile(self.execution_model, backend=backend, fullgraph=True, dynamic=False,
+                                          options=options)
+        except Exception:
+            if precompile_cache.configure() is None:
+                raise
+            # a package that does not install (its guards fail to build) costs this launch its trace, never the launch
+            logger.warning("[neuron] %s graphs: the precompile package did not restore; tracing them", self.graphs,
+                           exc_info=True)
+            hits = dynamo_counters["dynamo_cache"]["dynamo_cache_hit"]
+            with torch._dynamo.config.patch(caching_precompile=False):
+                self.compiled = torch.compile(self.execution_model, backend=backend, fullgraph=True, dynamic=False,
+                                              options=options)
+        # a package restored at this compile (backend/precompile_cache) holds the shapes a past warm-up traced: their
+        # calls run without tracing, so the deferred trace of every shape (_precompile) has nothing to queue
+        self.precompile_restored = dynamo_counters["dynamo_cache"]["dynamo_cache_hit"] > hits
+        if self.precompile_restored:
+            logger.info("[neuron] %s graphs: dynamo package restored, no shape traced unless its guards fail",
+                        self.graphs)
         # the ranks meet before a model execution whose NEFF differs from the last one (program_fence), in place of the
         # runtime's per-execution barrier: on an aggregated server, and wherever this runtime has more than one shape
         from sglang_neuron.model_executor import program_fence
@@ -747,7 +772,8 @@ class NeuronModelRuntime:
         # it when they run a queued compile, not when it is submitted
         scope = contextlib.ExitStack()
         scope.enter_context(stack.compile_scope(self.compiler_args))
-        if getattr(self, "precompiles", False):
+        # a restored package's calls execute at once, each rank at its own first shape (_precompile): skipped
+        if getattr(self, "precompiles", False) and not getattr(self, "precompile_restored", False):
             self._precompile(shapes)
         # the ranks compare each executor's NEFF before its first submit (spmd_check.note_first_call)
         group = None
@@ -795,6 +821,10 @@ class NeuronModelRuntime:
             world_barrier()
         self._warmed = True
         logger.info("[neuron] warmup done in %.1fs (%d shapes)", time.time() - t0, len(shapes))
+        # every graph this process compiled so far, for the next launch to restore instead of trace
+        from sglang_neuron.backend import precompile_cache
+
+        precompile_cache.save(self.graphs)
 
     def _precompiles(self, cpu_mode: bool, direct: bool) -> bool:
         """Whether warmup_all lowers every shape before it executes the first (``SGLANG_NEURON_PRECOMPILE``, on by
@@ -815,7 +845,12 @@ class NeuronModelRuntime:
         compile starts within the first rounds of tracing instead of after all the shapes before it."""
         t0 = time.time()
         compiled = getattr(self.compiled, "__wrapped__", self.compiled)
-        start = self.tp_rank % len(shapes) if shapes else 0
+        from sglang_neuron.backend import precompile_cache
+
+        # under the precompile cache (backend/precompile_cache) a shape's lowered program depends on the shapes its
+        # rank traced before it (ranks that started at different shapes lowered different programs for one shape, and
+        # the SPMD check refused them), so every rank traces in the same order there
+        start = self.tp_rank % len(shapes) if shapes and not precompile_cache._enabled else 0
         self.defer_execution = True
         try:
             for kind, bucket, context in shapes[start:] + shapes[:start]:

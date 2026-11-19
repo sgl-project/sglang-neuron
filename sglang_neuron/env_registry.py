@@ -20,6 +20,8 @@ import re
 CONFIG, DEBUG, INTERNAL, BENCHMARK = "config", "debug", "internal", "benchmark"
 
 KNOBS: dict = {
+    # keep dynamo's trace of each serving graph across launches (backend/precompile_cache)
+    "SGLANG_NEURON_PRECOMPILE_CACHE": CONFIG,
     # the device sampler
     "SGLANG_NEURON_SAMPLER": CONFIG,
     "SGLANG_NEURON_MAX_TOP_LOGPROBS": CONFIG,
