@@ -84,13 +84,15 @@ def _top(work, n: int, k: int, T: int, vals, idx):
 
 
 @nki.jit
-def sample(x, norm_w, lm_wT, rank, mesh, temperatures, seeds, filters, positions, eps=1e-6, span=1):
+def sample(x, norm_w, lm_wT, rank, mesh, temperatures, seeds, filters, positions, eps=1e-6, span=1, rows=None):
     """x [T, H] bf16 (T <= 128) the states before the final norm; norm_w [1, H] bf16; lm_wT [H, Vr] bf16 this rank's
     LM head columns; rank [1] int32; per request (T / ``span`` of them, a request's ``span`` rows consecutive):
     temperatures [T / span, 1] fp32, seeds [T / span, 1] int32 (sampling.fold_seeds), filters [T / span, 3] fp32
     (top_k, top_p, min_p normalized; min_p unused); per row positions [T, 1] int32 (the row's input position).
-    Returns each row's sampled token [T, 1] int32."""
-    T, H = x.shape
+    With ``rows`` [T, 1] int32 the rows are x's and positions' rows at them (a prefill chunk's sampled rows), gathered
+    in the kernel. Returns each row's sampled token [T, 1] int32."""
+    H = x.shape[1]
+    T = x.shape[0] if rows is None else rows.shape[0]
     Vr = lm_wT.shape[1]
     H1 = H // P
     n_prg = nl.num_programs(axes=0)
@@ -105,7 +107,13 @@ def sample(x, norm_w, lm_wT, rank, mesh, temperatures, seeds, filters, positions
 
     # ---- the final RMSNorm (head.greedy's) and this program's half of the shard's logits ----
     hf = nl.ndarray((P, H), dtype=nl.bfloat16, buffer=nl.sbuf)
-    nisa.dma_copy(dst=hf[0:T, 0:H], src=x.ap(pattern=[[H, T], [1, H]], offset=0))
+    if rows is None:
+        nisa.dma_copy(dst=hf[0:T, 0:H], src=x.ap(pattern=[[H, T], [1, H]], offset=0))
+    else:
+        ri = nl.ndarray((P, 1), dtype=rows.dtype, buffer=nl.sbuf)
+        nisa.dma_copy(dst=ri[0:T, 0:1], src=rows.ap(pattern=[[1, T], [1, 1]], offset=0))
+        nisa.dma_copy(dst=hf[0:T, 0:H], src=x.ap(pattern=[[H, T], [1, H]], offset=0, vector_offset=ri[0:T, 0:1],
+                                                 indirect_dim=0))
     gam = nl.ndarray((P, H), dtype=nl.bfloat16, buffer=nl.sbuf)
     nisa.dma_copy(dst=gam[0:T, 0:H], src=norm_w.ap(pattern=[[0, T], [1, H]], offset=0))
     sq = nl.ndarray((P, H), dtype=nl.float32, buffer=nl.sbuf)
@@ -186,7 +194,11 @@ def sample(x, norm_w, lm_wT, rank, mesh, temperatures, seeds, filters, positions
     nisa.dma_copy(dst=sd[0:T, 0:1], src=seeds.ap(pattern=[[1, T], [1, 1]], offset=0, vector_offset=rq[0:T, 0:1],
                                                  indirect_dim=0))
     po = nl.ndarray((P, 1), dtype=nl.int32, buffer=nl.sbuf)
-    nisa.dma_copy(dst=po[0:T, 0:1], src=positions.ap(pattern=[[1, T], [1, 1]], offset=0))
+    if rows is None:
+        nisa.dma_copy(dst=po[0:T, 0:1], src=positions.ap(pattern=[[1, T], [1, 1]], offset=0))
+    else:
+        nisa.dma_copy(dst=po[0:T, 0:1], src=positions.ap(pattern=[[1, T], [1, 1]], offset=0, vector_offset=ri[0:T, 0:1],
+                                                         indirect_dim=0))
     u = _draws(sd, po, T)
 
     col = nl.ndarray((P, K_POOL), dtype=nl.float32, buffer=nl.sbuf)

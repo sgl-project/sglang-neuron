@@ -165,6 +165,12 @@ class MiMoV2Graph(nn.Module):
                 self.mtp_width = self.mtp_slots
                 self.register_buffer("mtp_carry", torch.zeros(self.mtp_slots + 1, mtp_step.SPEC, dtype=torch.int32))
                 self.register_buffer("mtp_len", torch.zeros(self.mtp_slots + 1, dtype=torch.int32))
+            else:
+                from sglang_neuron import sampling as neuron_sampling
+
+                # the prefill samples its chunk's row in its own forward too (_prefill_sample): kernels on a device
+                self.samples_in_forward = True
+                self.sampler_modes = neuron_sampling.SAMPLER_MODES
 
     def _build_mlp(self, layer_idx: int) -> nn.Module:
         config = self.config
@@ -334,11 +340,53 @@ class MiMoV2Graph(nn.Module):
                     hidden = hidden + layer.mlp.fused_decode(hidden, norm.weight, norm.eps, step["ebase"])
                 else:
                     hidden = hidden + layer.mlp(norm(hidden))
+        if self.phase == "prefill" and getattr(self, "samples_in_forward", False):
+            out = self._prefill_sample(hidden, positions, sampling_positions, sampling_temperatures, sampling_seeds,
+                                       sampling_filters)
+            self._mtp_prefill(hidden, input_ids, None, sampling_positions, attn_metadata[self._first_layer(True)],
+                              tables[True], rank)
+            return out
         logits = self.lm_head(self.norm(hidden.index_select(0, sampling_positions)))
         if self.mtp is not None:
             self._mtp_prefill(hidden, input_ids, logits, sampling_positions, attn_metadata[self._first_layer(True)],
                               tables[True], rank)
         return logits
+
+    def _prefill_sample(self, hidden, positions, sampling_positions, temperatures, seeds, filters):
+        """The chunk's sampled row's token, as host.SampledExecution draws it from the logits: on a device the final
+        norm, the LM head and the draw in one kernel (head.greedy, kernels/sample.py with the row gathered in it); the
+        torch below is the CPU reference."""
+        from sglang_neuron import sampling
+
+        mode = sampling.sampler_mode()
+        if can_run_kernel(hidden):
+            rows = sampling_positions.reshape(-1, 1).to(torch.int32)
+            if mode == "greedy" or temperatures is None:
+                return {"token_ids": self.greedy(hidden, self.norm, rows)}
+            if mode != "topk_topp":
+                raise ValueError(f"NEURON_MTP samples in kernels/sample.py: SGLANG_NEURON_SAMPLER=topk_topp or greedy, "
+                                 f"not {mode}")
+            from sglang_neuron.backend.stack import wrap_nki
+            from sglang_neuron.models.mimo_v2.kernels.sample import sample
+            from sglang_neuron.utils.hardware_config import get_logical_nc_config
+
+            n = rows.shape[0]
+            out = wrap_nki(sample)[get_logical_nc_config()](
+                hidden, self.norm.weight.view(1, -1), self.lm_head_T, self.lm_head_tp_group.rank_in_group_tensor,
+                self._head_mesh(), temperatures.reshape(n, 1).to(torch.float32), seeds.reshape(n, 1).to(torch.int32),
+                filters.reshape(n, 3).to(torch.float32), positions.reshape(-1, 1).to(torch.int32), eps=self.norm.eps,
+                rows=rows)
+            return {"token_ids": out.reshape(-1)}
+        logits = self.lm_head(self.norm(hidden.index_select(0, sampling_positions)))
+        group = self.lm_head_tp_group
+        rank = group.rank_in_group_tensor
+        if mode == "greedy" or temperatures is None:
+            return sampling.greedy_sharded_logits(logits, group, rank, self.config.vocab_size)
+        keys = sampling.noise_row_keys(seeds, sampling.sampled_positions(positions, sampling_positions))
+        if mode == "topk_topp":
+            return sampling.sample_filtered_sharded_logits(logits, group, rank, self.config.vocab_size, temperatures,
+                                                           keys, filters)
+        return sampling.sample_sharded_logits(logits, group, rank, self.config.vocab_size, temperatures, keys)
 
     # -- NEURON_MTP (mtp_step.py) -------------------------------------------------------------------------------------
 
@@ -358,6 +406,8 @@ class MiMoV2Graph(nn.Module):
                 if k + 1 < len(self.mtp):
                     token = self.greedy(states, layer.final_layernorm, at32).reshape(1, 1)
             return
+        if logits is None:
+            logits = self.lm_head(self.norm(hidden.index_select(0, sampling_positions)))
         at = sampling_positions.reshape(-1)[-1:].to(torch.int64)
         ids = input_ids.reshape(1, -1)
         token = self.greedy_token(logits).reshape(-1)[-1:]
