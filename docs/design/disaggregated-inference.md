@@ -444,7 +444,11 @@ emulated writes without an error, which is why the platform fixes it on both rol
 `sglang_neuron/disaggregation/balancer.py` is the PD load balancer: the one to run in front of a deployment and the one
 this repository validates. It listens on
 `127.0.0.1:8000` by default and takes repeatable `--prefill` and `--decode` URLs, the prefill servers'
-`--bootstrap-port` (8998), a per-request `--timeout-s` (3600), an optional `--trace-file` and `--no-retry`. It serves
+`--bootstrap-port` (8998; one, or one per `--prefill` in order), `--prefill-routing` (`load`, the default, or `hash`), a
+per-request `--timeout-s` (3600), an optional `--trace-file` and `--no-retry`. A session's turns (the request's
+`session_id`, else its user) go to the prefill server of its first turn, whose prefix cache holds the previous turns; a
+first turn goes to the server with the fewest request bytes still prefilling (`load`) or by a hash of the session (`hash`).
+It serves
 `/generate`, `/v1/completions` and `/v1/chat/completions` for single-prompt requests (a batch of prompts gets 400), and
 `/health` (the balancer's own), `/server_info` (every server's, and the balancer's `balancer_retries`) and
 `/flush_cache` (every server), `/v1/models`, `/model_info` and its older name `/get_model_info`, which SGLang's GSM8K
@@ -973,9 +977,9 @@ support of DP attention on a decode server is in
 [Feature and model compatibility](../guides/feature-model-compatibility.md).
 
 A prefill and a decode server on one node, on disjoint NeuronCores, is not refused, and is not tested: every
-tested layout puts the prefill server on one node and the decode servers on the other nodes. Several prefill
-servers behind the balancer must share one bootstrap port, because the balancer gives every prefill half the same
-`--bootstrap-port`; two prefill servers on one node need two bootstrap ports, so the balancer cannot front them both. A
+tested layout puts the prefill server on one node and the decode servers on the other nodes. Two prefill
+servers on one node (disjoint NeuronCores, two bootstrap ports) are tested: give the balancer one `--bootstrap-port`
+per `--prefill`. A
 decode of plain `--dp-size` replicas without DP attention is served by the code, and is not tested
 ([Data parallelism](parallelism.md#data-parallelism---dp-size-replicas)).
 

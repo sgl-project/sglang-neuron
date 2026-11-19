@@ -98,13 +98,17 @@ python3 -m sglang.launch_server --model-path /models/Hy3-FP8 --served-model-name
 - `SGLANG_NEURON_PREFILL_YIELD=2048` (optional, `sglang_patches/prefill_yield.py`) lets a prompt of at most 2048 new tokens
   prefill between two chunks of a long one: under AgentX it lowers TTFT and raises the decode's P90 ITL (below).
 
-Disaggregated over NIXL: a TP64 prefill without DCP in front of a TP64 DCP8 `NEURON_MTP` decode, both with the FP8 cache
+Disaggregated over NIXL: two TP32 prefills without DCP on one node (`NEURON_RT_VISIBLE_CORES` 0-31 and 32-63, two
+ports and two bootstrap ports) in front of a TP64 DCP8 `NEURON_MTP` decode, all with the FP8 cache
 and the same KV scale profile. The prefill takes `SGLANG_NEURON_HY3_PD_MTP_KV=1` (it holds the MTP layer and writes its
 KV, so both pools hold the same layers) and, in front of a sparse decode, the same `SGLANG_NEURON_HY3_SPARSE_DECODE`: it
 then keeps the summaries of the pages each chunk writes, and the transfer sends them with their pages
 (`memory_pool.PAGE_SIDE_BUFFERS`). Add the role flags (`--disaggregation-mode prefill|decode`,
 `--disaggregation-transfer-backend nixl`, the prefill's `--disaggregation-bootstrap-port`) and put the balancer in front,
-as for [Qwen3-MoE](qwen3-moe.md#serving).
+as for [Qwen3-MoE](qwen3-moe.md#serving), with one `--bootstrap-port` per `--prefill`. The balancer keeps a session's
+turns on one prefill server. AgentX revisits long prefixes, so give each prefill a large pool
+(`--max-total-tokens 524288`) and HiCache L2 (`--enable-hierarchical-cache --hicache-size 20`, about 950k host tokens a
+server; the host pool keeps the sparse summaries with their pages).
 
 ## What a launch refuses
 
@@ -134,7 +138,19 @@ How the AgentX point moved (same run each, one change at a time): 149.1 (the con
 (span summaries from the computed K) -> 206.9 (`--prefill-decode-interval 2`).
 
 PD (one trn2.48xlarge each for the prefill and the decode): GSM8K (200 problems) 0.945 with the sparse decode, 80k-token
-needle retrieval correct, decode TPOT 19.0 ms at concurrency 8.
+needle retrieval correct, decode TPOT 19.0 ms at concurrency 8. AgentX on the 2P1D layout above (two TP32 prefills, one
+TP64 DCP8 decode):
+
+| | output tokens/s | TTFT p50/p90/p99 | ITL p50/p90 | prefix hit |
+| --- | --- | --- | --- | --- |
+| concurrency 8, 1 h, prefill pools 524288 tokens, no HiCache | 216.0 | 2.16/28.1/55.3 s | 21.8/26.9 ms | 87.8% |
+| concurrency 8, 20 min, with HiCache | 155.9 | 1.71/3.80/8.78 s | 22.0/28.2 ms | 95.6% |
+| concurrency 8, 20 min, no HiCache | 153.6 | 1.76/5.81/33.2 s | | |
+| concurrency 16, 20 min, with HiCache | 293.6 | 3.44/33.3/62.3 s | 23.1/28.3 ms | 86.8% |
+| concurrency 16, 20 min, no HiCache | 217.1 | 11.9/65.6/106.8 s | | 69.6% |
+
+A 20-minute run (`--benchmark-duration 1200 --warmup-requests-per-lane 1`) is mostly first turns, so its output tokens/s
+compares with other 20-minute runs only.
 
 ## Status and next steps
 
