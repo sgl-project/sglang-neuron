@@ -154,8 +154,8 @@ class MiMoMtp(nn.Module):
         before the final norm [T, H]."""
         layer = self.layer
         x = self.project(graph.embed_tokens(next_ids, scatter_tokens=False, rank=rank), hidden)
-        x = x + self.attn.prefill(x, cos, sin, md, norm=layer.input_layernorm)
-        return x + layer.mlp(layer.post_attention_layernorm(x))
+        x, normed = self.attn.prefill(x, cos, sin, md, layer.input_layernorm, layer.post_attention_layernorm)
+        return layer.mlp.prefill_residual(x, normed)
 
     def decode(self, graph, next_ids, prev, cos, sin, md, mask, slots, span: int, caches, rank, kernel=None) -> tuple:
         """One decode pass over ``span`` tokens a row: the next tokens ``next_ids`` [N] with ``prev`` [N, H] the states

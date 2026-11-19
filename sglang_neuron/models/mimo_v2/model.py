@@ -30,6 +30,7 @@ from sglang_neuron.models.transformer.model import RMSNorm
 from sglang_neuron.parallel import collectives as neuron_collectives
 from sglang_neuron.parallel import groups
 from sglang_neuron.utils.checkpoints import SafetensorsCheckpoint
+from sglang_neuron.utils.neuron_utils import can_run_kernel
 from sglang_neuron.utils.weight_loader import SafetensorsWeightLoader, set_weight_loader
 
 # the scale key of a 128 x 128 FP8 weight; MXFP4 experts carry weight_scale (expert_scale_suffix)
@@ -73,6 +74,19 @@ class DenseMLP(nn.Module):
     def forward(self, x, real=None):
         out = (torch.nn.functional.silu(x @ self.gate_weight) * (x @ self.up_weight)) @ self.down_weight
         return neuron_collectives.all_reduce(self.attn_tp_group, out)
+
+    def prefill_residual(self, x, normed, **_):
+        """A prefill chunk's residual stream after the MLP, x + MLP(normed): on a device the MLP, its all-reduce and
+        the add in one kernel (kernels/prefill.prefill_mlp)."""
+        if not can_run_kernel(x):
+            return x + self(normed)
+        from sglang_neuron.backend.stack import resolve_full_mesh, wrap_nki
+        from sglang_neuron.models.mimo_v2.kernels.prefill import prefill_mlp
+        from sglang_neuron.utils.hardware_config import get_logical_nc_config
+
+        mesh = tuple(tuple(int(r) for r in cell) for cell in resolve_full_mesh(self.attn_tp_group))
+        return wrap_nki(prefill_mlp)[get_logical_nc_config()](normed, x, self.gate_weight, self.up_weight,
+                                                              self.down_weight, mesh)
 
 
 def _fp32_rows_loader() -> SafetensorsWeightLoader:
@@ -271,12 +285,17 @@ class MiMoV2Graph(nn.Module):
         if self.phase == "prefill":
             # the chunk's real tokens, which the MoE maps alone (models/qwen3_moe/sglang_model.Qwen3MoeGraph.forward):
             # the runtime pads a chunk with its last real position
-            real = torch.arange(positions.shape[0], device=positions.device) <= torch.argmax(positions)
+            if can_run_kernel(positions):
+                # the kernels tell the padding by its repeated position (kernels/prefill.prefill_route)
+                real, ids32 = None, positions.reshape(-1, 1).to(torch.int32)
+            else:
+                real, ids32 = torch.arange(positions.shape[0], device=positions.device) <= torch.argmax(positions), None
             for layer in self.layers:
                 cos, sin = tables[layer.is_swa]
                 attn = layer.self_attn
-                hidden = hidden + attn.prefill(hidden, cos, sin, attn_metadata[attn.name], norm=layer.input_layernorm)
-                hidden = hidden + layer.mlp(layer.post_attention_layernorm(hidden), real=real)
+                hidden, normed = attn.prefill(hidden, cos, sin, attn_metadata[attn.name], layer.input_layernorm,
+                                              layer.post_attention_layernorm)
+                hidden = layer.mlp.prefill_residual(hidden, normed, real=real, positions=ids32)
         else:
             attn0 = self.layers[0].self_attn
             # under DCP the decode attends the group's gathered query heads
@@ -352,7 +371,6 @@ class MiMoV2Graph(nn.Module):
         from sglang_neuron.backend.stack import resolve_full_mesh
         from sglang_neuron.models.mimo_v2 import mtp_step
         from sglang_neuron.models.mimo_v2.attention import span_mask, span_slots
-        from sglang_neuron.utils.neuron_utils import can_run_kernel
 
         md = {True: attn_metadata[self._first_layer(True)], False: attn_metadata[self._first_layer(False)]}
         width, spec = md[False]["block_table_tensor"].shape[0], mtp_step.SPEC

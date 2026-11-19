@@ -68,15 +68,15 @@ def main() -> int:
             vc_ref[tgt[i]] = vr[i, 0].to(dtype)
         with stack.compile_scope(cc):
             fn = torch.compile(lambda *a: wrap_nki(prefill_front)[get_logical_nc_config()](
-                *a, eps=1e-6, num_heads=nq, kv_scale=scale), backend=stack.compile_backend_name(), fullgraph=True,
-                dynamic=False)
+                *a, eps=1e-6, num_heads=nq, kv_scale=scale, q_scale=0.07), backend=stack.compile_backend_name(),
+                fullgraph=True, dynamic=False)
             dev = torch.device("neuron", 0)
             kc = torch.zeros(blocks, 1, page, d, dtype=dtype).to(dev)
             vc = torch.zeros(blocks, 1, page, d, dtype=dtype).to(dev)
             outs = fn(x.to(dev), norm.weight.view(1, -1).to(dev), w.to(dev), cos.to(dev), sin.to(dev),
                       slots.view(-1, 1).to(dev), kc, vc)
         q_k, k_k, v_k, kc_k, vc_k = (o.cpu() for o in outs)
-        dq = (q_k.float() - q.transpose(0, 1).float()).abs().max().item()
+        dq = (q_k.float() - (q * 0.07).transpose(0, 1).float()).abs().max().item()
         real = tgt[live]
         dk = (kc_k.reshape(-1, d)[real].float() - kc_ref[real].float()).abs().max().item()
         dv = (vc_k.reshape(-1, d)[real].float() - vc_ref[real].float()).abs().max().item()

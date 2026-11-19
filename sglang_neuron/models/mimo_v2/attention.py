@@ -209,10 +209,29 @@ class MiMoAttention(nn.Module):
 
     # -- prefill ------------------------------------------------------------------------------------------------------
 
-    def prefill(self, x: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor, md: dict, norm) -> torch.Tensor:
-        """The chunk's attention output [T, H] for its hidden states ``x`` [T, H] (before the layer's input RMSNorm
-        ``norm``). On a device the norm, projection, RoPE and K/V write are kernels/prefill.prefill_front; the torch
-        below is the CPU reference."""
+    def prefill(self, x: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor, md: dict, norm, post_norm) -> tuple:
+        """The chunk's attention block over its residual stream ``x`` [T, H]: (h, hn) [T, H], h = x + attention and hn
+        its post-attention RMSNorm ``post_norm`` (the MLP's input); ``norm`` is the layer's input RMSNorm. On a device
+        the norm, projection, RoPE and K/V write run as kernels/prefill.prefill_front and the output projection,
+        all-reduce, residual and norm as kernels/prefill.prefill_back; the torch below is the CPU reference."""
+        heads, scale = self._prefill_heads(x, cos, sin, md, norm)
+        if can_run_kernel(x):
+            from sglang_neuron.backend.stack import resolve_full_mesh, wrap_nki
+            from sglang_neuron.models.mimo_v2.kernels.prefill import prefill_back
+            from sglang_neuron.utils.hardware_config import get_logical_nc_config
+
+            mesh = tuple(tuple(int(r) for r in cell) for cell in resolve_full_mesh(self.attn_tp_group))
+            return wrap_nki(prefill_back)[get_logical_nc_config()](
+                heads, self.o_weight, x, post_norm.weight.view(1, -1), mesh, eps=post_norm.eps,
+                v_head_dim=self.v_head_dim, kv_scale=scale)
+        if scale != 1.0:
+            heads = heads / scale
+        h = x + self._project_out(heads.transpose(0, 1))
+        return h, post_norm(h)
+
+    def _prefill_heads(self, x, cos, sin, md: dict, norm) -> tuple:
+        """(the chunk's attention heads [num_heads, T, d] before the output projection, the FP8 scale they are still
+        times: 1 where none)."""
         if can_run_kernel(x):
             from sglang_neuron.backend.stack import wrap_nki
             from sglang_neuron.models.mimo_v2.kernels.prefill import prefill_front
@@ -222,12 +241,16 @@ class MiMoAttention(nn.Module):
                 raise ValueError(f"the prefill front kernel takes one KV head a rank and whole 128-token tiles "
                                  f"({self.num_kv_heads} KV heads, {x.shape[0]} tokens): raise the attention TP size")
             slots = md["slot_mapping"].to(torch.int32).reshape(-1, 1)
+            # without DCP the queries come out times the segmented attention's softmax scale (over an FP8 cache, over
+            # its scale too), which the attention then takes as 1
+            q_scale = 1.0 if self.dcp_size > 1 else self.scaling / (self.kv_scale if self.fp8_kv else 1.0)
             heads, k, v, k_cache, v_cache = wrap_nki(prefill_front)[get_logical_nc_config()](
                 x, norm.weight.view(1, -1), self.qkv_weight, cos, sin, slots, self.k_cache, self.v_cache,
-                eps=norm.eps, num_heads=self.num_heads, kv_scale=float(self.kv_scale) if self.fp8_kv else 1.0)
+                eps=norm.eps, num_heads=self.num_heads, kv_scale=float(self.kv_scale) if self.fp8_kv else 1.0,
+                q_scale=float(q_scale))
             if self.dcp_size > 1:
                 return self._prefill_dcp(heads.transpose(0, 1), k.unsqueeze(1), v.unsqueeze(1), k_cache, v_cache, md)
-            return self._prefill_attend(heads, k_cache, v_cache, md, x.shape[0])
+            return self._prefill_attend(heads, k_cache, v_cache, md, x.shape[0], prescaled=True)
         x = norm(x)
         q, k, v = self._split(x @ self.qkv_weight)
         q, k = rotate(q, cos, sin), rotate(k, cos, sin)
@@ -239,8 +262,10 @@ class MiMoAttention(nn.Module):
             return self._prefill_dcp(q, k, v, k_cache, v_cache, md)
         return self._prefill_attend(q.transpose(0, 1).contiguous(), k_cache, v_cache, md, x.shape[0])
 
-    def _prefill_attend(self, heads, k_cache, v_cache, md: dict, tokens: int) -> torch.Tensor:
-        """The chunk's attention over the written caches, ``heads`` [num_heads, T, d] its rotated queries."""
+    def _prefill_attend(self, heads, k_cache, v_cache, md: dict, tokens: int, prescaled: bool = False) -> tuple:
+        """The chunk's attention over the written caches, ``heads`` [num_heads, T, d] its rotated queries (times the
+        softmax scale already where ``prescaled``: prefill_front's): (its output heads [num_heads, T, d], the FP8 scale
+        they are still times)."""
         import sglang_neuron.ops as NF
 
         table, scale = md["block_table_tensor"], self.scaling
@@ -253,22 +278,31 @@ class MiMoAttention(nn.Module):
                               n_cols=(tokens + self.sliding_window - 1) // page + 2)
             k_cache, v_cache, table = pack_prior(k_cache, v_cache, table, **window)
             scale = scale / self.kv_scale
+        if prescaled:
+            from sglang_neuron.backend.stack import wrap_nki
+            from sglang_neuron.ops.attention.attention_segmented_cte import _attention_segmented_cte
+            from sglang_neuron.utils.hardware_config import get_logical_nc_config
+
+            out = wrap_nki(_attention_segmented_cte)[get_logical_nc_config()](
+                q=heads, k_cache=k_cache, v_cache=v_cache, block_tables=table, prior_tokens=md["cached_seq_len"],
+                block_size=md["block_size"], prior_seg_size=md["kv_segment_size"], scale=1.0,
+                sliding_window=self.sliding_window, sink=self._sink_column(), num_q_heads=heads.shape[0],
+                fp8_packed=k_cache.dim() == v_cache.dim() + 1)
+            return out, (float(self.kv_scale) if self.kv_scale != 1.0 else 1.0)
         out = NF.segmented_attention(
             heads, k_cache=k_cache, v_cache=v_cache,
             block_tables=table, prior_tokens=md["cached_seq_len"], block_size=md["block_size"],
             kv_segment_size=md["kv_segment_size"], scale=scale, sliding_window=self.sliding_window,
             sink=self._sink_column(),
         )
-        if self.kv_scale != 1.0:
-            out = out / self.kv_scale
-        return self._project_out(out.transpose(0, 1))
+        return out, (float(self.kv_scale) if self.kv_scale != 1.0 else 1.0)
 
     def _mesh(self) -> tuple:
         from sglang_neuron.backend.stack import resolve_full_mesh
 
         return tuple(tuple(int(r) for r in cell) for cell in resolve_full_mesh(self.dcp_group))
 
-    def _prefill_dcp(self, q, k, v, k_cache, v_cache, md) -> torch.Tensor:
+    def _prefill_dcp(self, q, k, v, k_cache, v_cache, md) -> tuple:
         """A chunk's attention under DCP (module docstring); ``k`` / ``v`` [T, 1, d] its K/V as the cache holds them
         (times the FP8 scale), the caches as written."""
         import sglang_neuron.ops as NF
@@ -292,7 +326,7 @@ class MiMoAttention(nn.Module):
                     1, 1), torch.div(cached, size, rounding_mode="floor"), ks, vs, scale=self.scaling,
                 block_size=page, seg_size=min(tokens, size * page), dcp_size=size, dcp_mesh=self._mesh(),
                 fp8_packed=self.fp8_kv)
-            return self._project_out(out.transpose(0, 1))
+            return out, 1.0
         # a sliding layer: the window's prior block from the group's last rank, then the chunk, attended locally
         from sglang_neuron.parallel import collectives as neuron_collectives_
 
@@ -320,7 +354,7 @@ class MiMoAttention(nn.Module):
             heads, k_cache=k_local, v_cache=v_local, block_tables=local_table, prior_tokens=prior_tokens,
             block_size=page, kv_segment_size=md["kv_segment_size"], scale=self.scaling,
             sliding_window=self.sliding_window, sink=self._sink_column())
-        return self._project_out(out.transpose(0, 1))
+        return out, 1.0
 
     def _dcp_decode(self, x, norm, cos, sin, md, mask, slots, span: int = 1) -> torch.Tensor:
         """``span`` tokens a row (one outside a NEURON_MTP step) over the DCP group's shards: ``mask`` the group's (the

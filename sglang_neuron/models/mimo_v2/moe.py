@@ -18,6 +18,7 @@ from sglang_neuron.models.mimo_v2 import experts_fp8, weights
 from sglang_neuron.models.qwen3_moe.moe import SparseMoE
 from sglang_neuron.ops.moe.moe_tkg_bf16 import moe_experts
 from sglang_neuron.parallel import collectives as neuron_collectives
+from sglang_neuron.utils.neuron_utils import can_run_kernel
 from sglang_neuron.utils.weight_loader import SafetensorsWeightLoader, get_weight_loader, set_weight_loader
 
 def route(x: torch.Tensor, router_weight: torch.Tensor, expert_bias: torch.Tensor, top_k: int, route_norm: bool,
@@ -75,6 +76,20 @@ class MiMoV2MoE(SparseMoE):
             for p in (self.gate_up_weight, self.down_weight):
                 set_weight_loader(p, weights.dequantizing(get_weight_loader(p)))
 
+    def prefill_residual(self, x, normed, real=None, positions=None):
+        """A prefill chunk's residual stream after the MoE block, x + MoE(normed): on a device the routing and
+        mapping (kernels/prefill.prefill_route), the FP8 experts, and the all-reduce with the add
+        (kernels/prefill.prefill_residual). ``real`` [T] marks the chunk's real tokens on the CPU reference;
+        ``positions`` [T, 1] int32 its positions (the kernels tell the padding by its repeated position)."""
+        if not (self.fp8_experts and self.dp_size == 1 and can_run_kernel(x)):
+            return x + self(normed, real=real)
+        from sglang_neuron.backend.stack import resolve_full_mesh, wrap_nki
+        from sglang_neuron.models.mimo_v2.kernels.prefill import prefill_residual
+        from sglang_neuron.utils.hardware_config import get_logical_nc_config
+
+        mesh = tuple(tuple(int(r) for r in cell) for cell in resolve_full_mesh(self.attn_tp_group))
+        return wrap_nki(prefill_residual)[get_logical_nc_config()](x, self._prefill_kernels(normed, positions), mesh)
+
     def forward(self, x, real=None):
         x = self._gather(x)
         affinities, experts = route(x, self.router_weight, self.expert_bias, self.top_k, self.norm_topk_prob,
@@ -97,6 +112,32 @@ class MiMoV2MoE(SparseMoE):
             out = moe_experts(x, gate_up=self.gate_up_weight, down=self.down_weight, affinities=affinities,
                               index=experts.to(torch.int32), rank_id=self._ep_rank_id())
         return self._reduce(out)
+
+    def _prefill_kernels(self, x: torch.Tensor, positions: torch.Tensor) -> torch.Tensor:
+        """This rank's routed-expert output [T, H] for a prefill chunk: the routing and the blockwise mapping in one
+        kernel (kernels/prefill.prefill_route), the experts in the FP8 hybrid moe_cte (kernels/moe_cte_fp8w.py)."""
+        from sglang_neuron.backend.stack import wrap_nki
+        from sglang_neuron.models.mimo_v2.experts_cte import BLOCK_SIZE
+        from sglang_neuron.models.mimo_v2.kernels.moe_cte_fp8w import moe_cte_fp8w
+        from sglang_neuron.models.mimo_v2.kernels.prefill import prefill_route
+        from sglang_neuron.ops.moe.moe_blockwise import _num_blocks
+        from sglang_neuron.utils.hardware_config import get_logical_nc_config
+
+        tokens = x.shape[0]
+        experts, intermediate, hidden = self.down_weight.shape
+        if experts % 2 or tokens % 128 or positions is None:
+            raise ValueError(f"the prefill routing kernel takes an even local expert count and whole 128-token "
+                             f"tiles with the chunk's positions ({experts} experts, {tokens} tokens)")
+        blocks = _num_blocks(tokens, self.top_k, experts, BLOCK_SIZE)
+        grid = get_logical_nc_config()
+        aff, token_position_to_id, block_to_expert, conditions = wrap_nki(prefill_route)[grid](
+            x, self.router_wT, self.expert_bias.view(1, -1), self._ep_rank_id(), positions, top_k=self.top_k,
+            route_scale=float(self.scaling), n_local=experts, block_size=BLOCK_SIZE, num_blocks=blocks)
+        out = wrap_nki(moe_cte_fp8w)[grid](
+            conditions, x, aff, self.gate_up_weight, self.down_weight, token_position_to_id, block_to_expert,
+            self.gate_up_scale.view(experts, 1, 2 * intermediate), self.down_scale.view(experts, 1, hidden),
+            block_size=BLOCK_SIZE, num_static_block=experts, skip_token=True)
+        return (out[:, 0] if out.dim() == 3 else out)[:tokens]
 
     def _gather(self, x: torch.Tensor) -> torch.Tensor:
         """The rows every DP group decodes this step (DP attention), else ``x``. Over the world, then each group's first
