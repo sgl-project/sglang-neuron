@@ -91,11 +91,12 @@ def embed(ids, weight, rank, mesh):
 
 
 @nki.jit
-def greedy(x, norm_w, lm_wT, rank, mesh, eps=1e-6):
+def greedy(x, norm_w, lm_wT, rank, mesh, eps=1e-6, rows=None):
     """x [T, H] bf16 (T <= 128), the states before the final norm; norm_w [1, H] bf16; lm_wT [H, Vr] bf16, this
     rank's LM head columns; rank [1] int32, this rank's place in the group. Returns the greedy token of each row [T, 1]
     int32."""
-    T, H = x.shape
+    H = x.shape[1]
+    T = x.shape[0] if rows is None else rows.shape[0]
     Vr = lm_wT.shape[1]
     H1 = H // P
     n_prg = nl.num_programs(axes=0)
@@ -105,9 +106,15 @@ def greedy(x, norm_w, lm_wT, rank, mesh, eps=1e-6):
     v0 = pid * VH
     rg = _replica_group(mesh)
 
-    # ---- the final RMSNorm, as moe_half's ----
+    # ---- the final RMSNorm, as moe_half's; with ``rows`` [T, 1] int32 the states are x's rows at them ----
     hf = nl.ndarray((P, H), dtype=nl.bfloat16, buffer=nl.sbuf)
-    nisa.dma_copy(dst=hf[0:T, 0:H], src=x.ap(pattern=[[H, T], [1, H]], offset=0))
+    if rows is None:
+        nisa.dma_copy(dst=hf[0:T, 0:H], src=x.ap(pattern=[[H, T], [1, H]], offset=0))
+    else:
+        ridx = nl.ndarray((P, 1), dtype=rows.dtype, buffer=nl.sbuf)
+        nisa.dma_copy(dst=ridx[0:T, 0:1], src=rows)
+        nisa.dma_copy(dst=hf[0:T, 0:H], src=x.ap(pattern=[[H, T], [1, H]], offset=0, vector_offset=ridx[0:T, 0:1],
+                                                 indirect_dim=0))
     gam = nl.ndarray((P, H), dtype=nl.bfloat16, buffer=nl.sbuf)
     nisa.dma_copy(dst=gam[0:T, 0:H], src=norm_w.ap(pattern=[[0, T], [1, H]], offset=0))
     sq = nl.ndarray((P, H), dtype=nl.float32, buffer=nl.sbuf)

@@ -184,6 +184,7 @@ class MiMoMtp(nn.Module):
         x = x + layer.mlp(layer.post_attention_layernorm(x))
         return x, (k_cache, v_cache)
 
-    def draft(self, graph, states: torch.Tensor) -> torch.Tensor:
-        """The greedy draft of each of ``states`` [R, H] (before the final norm), int64 [R]."""
-        return graph.greedy(states, self.final_layernorm).to(torch.int64)
+    def draft(self, graph, states: torch.Tensor, rows: torch.Tensor = None) -> torch.Tensor:
+        """The greedy draft of each of ``states`` [R, H] (before the final norm), or of its ``rows`` [R', 1] int32,
+        int64."""
+        return graph.greedy(states, self.final_layernorm, rows).to(torch.int64)

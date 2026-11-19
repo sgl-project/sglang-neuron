@@ -23,7 +23,7 @@ Inputs:
   ln_w           [1, H] bf16, post_attention_layernorm's weight
   router_wT      [H, EA] bf16, the router weight transposed
   expert_bias    [1, EA] fp32, the selection-only bias (e_score_correction_bias)
-  ebase          [1, 1] fp32, this rank's first local expert id
+  ebase          [1, 1] fp32, this rank's first local expert id, or its EP rank [1] int32 (times E here)
   gate_up_w      [E, H, 2, I] fp8, down_w [E, I, H] fp8, the local experts
   gate_up_scale  [E, 2, I] fp32, down_scale [E, H] fp32, their per-output-row scales
   eps, route_scale, top_k: compile-time constants
@@ -175,7 +175,14 @@ def moe_half(hidden, ln_w, router_wT, expert_bias, ebase, gate_up_w, down_w, gat
     eid = nl.ndarray((P, EA), dtype=nl.float32, buffer=nl.sbuf)
     nisa.iota(eid[0:T, 0:EA], pattern=[[1, EA]], offset=0, channel_multiplier=0)
     eb = nl.ndarray((P, 1), dtype=nl.float32, buffer=nl.sbuf)
-    nisa.dma_copy(dst=eb[0:T, 0:1], src=ebase.ap(pattern=[[0, T], [1, 1]], offset=0))
+    if ebase.dtype == nl.float32:
+        nisa.dma_copy(dst=eb[0:T, 0:1], src=ebase.ap(pattern=[[0, T], [1, 1]], offset=0))
+    else:
+        # the EP rank [1] int32: its first expert is rank x E
+        eb_i = nl.ndarray((P, 1), dtype=ebase.dtype, buffer=nl.sbuf)
+        nisa.dma_copy(dst=eb_i[0:T, 0:1], src=ebase.reshape((1, 1)).ap(pattern=[[0, T], [1, 1]], offset=0))
+        nisa.tensor_copy(dst=eb[0:T, 0:1], src=eb_i[0:T, 0:1])
+        nisa.tensor_scalar(dst=eb[0:T, 0:1], data=eb[0:T, 0:1], op0=nl.multiply, operand0=float(E))
     rel = nl.ndarray((P, EA), dtype=nl.float32, buffer=nl.sbuf)
     nisa.tensor_scalar(dst=rel[0:T, 0:EA], data=eid[0:T, 0:EA], op0=nl.subtract, operand0=eb[0:T, 0:1])
     aff = nl.ndarray((P, E), dtype=nl.float32, buffer=nl.sbuf)

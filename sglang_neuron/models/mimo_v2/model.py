@@ -232,10 +232,13 @@ class MiMoV2Graph(nn.Module):
         return wrap_nki(embed)[get_logical_nc_config()](ids.reshape(-1, 1).to(torch.int32), self.embed_tokens.weight,
                                                         self.lm_head_tp_group.rank_in_group_tensor, self._head_mesh())
 
-    def greedy(self, states: torch.Tensor, norm) -> torch.Tensor:
+    def greedy(self, states: torch.Tensor, norm, rows: torch.Tensor = None) -> torch.Tensor:
         """[T] int32 the greedy token of each of ``states`` [T, H] (T <= 128) before the final ``norm``: the norm, the
-        sharded LM head and the argmax over the ranks in one kernel (kernels/head.greedy)."""
+        sharded LM head and the argmax over the ranks in one kernel (kernels/head.greedy); with ``rows`` [T', 1] int32
+        of states' rows at them, gathered in the kernel."""
         if not head_kernel_enabled() or states.shape[0] > 128:
+            if rows is not None:
+                states = states.index_select(0, rows.reshape(-1).to(torch.int64))
             return self.greedy_token(self.lm_head(norm(states))).reshape(-1)
         from sglang_neuron.backend.stack import wrap_nki
         from sglang_neuron.models.mimo_v2.kernels.head import greedy
@@ -243,7 +246,55 @@ class MiMoV2Graph(nn.Module):
 
         return wrap_nki(greedy)[get_logical_nc_config()](
             states, norm.weight.view(1, -1), self.lm_head_T, self.lm_head_tp_group.rank_in_group_tensor,
-            self._head_mesh(), eps=norm.eps).reshape(-1)
+            self._head_mesh(), eps=norm.eps, rows=rows).reshape(-1)
+
+    def _step_kernel(self, md, row_slots, ctrl, width: int, spec: int):
+        """The MTP step's inputs by kernels/step.py: (span, the layer kernels' step inputs). ``span`` holds what the
+        accept and the drafts read (mtp_step.span_inputs' tokens, positions, valid, base, fresh and live)."""
+        from sglang_neuron.backend.stack import wrap_nki
+        from sglang_neuron.models.mimo_v2.kernels.step import step_inputs
+        from sglang_neuron.utils.hardware_config import get_logical_nc_config
+
+        outs = wrap_nki(step_inputs)[get_logical_nc_config()](
+            self.mtp_carry, self.mtp_len, ctrl.to(torch.int32), row_slots.to(torch.int32),
+            md[False]["block_table_tensor"].to(torch.int32), md[True]["block_table_tensor"].to(torch.int32),
+            md[True]["swa_kv_pos_offset"].to(torch.int32), self.full_rope.inv_freq.view(1, -1),
+            self.swa_rope.inv_freq.view(1, -1), page_shift=int(md[False]["block_size"]).bit_length() - 1,
+            window=int(self.config.swa.sliding_window), mask_heads=self._mask_heads())
+        (tokens, positions, full_slots, swa_slots, valid, fresh, live, base, full_pos, swa_pos, swa_start,
+         full_cos, full_sin, swa_cos, swa_sin, *masks) = outs
+        grid = lambda t: t.reshape(width, spec)  # noqa: E731
+        span = {"tokens": grid(tokens).to(torch.int64), "positions": grid(positions).to(torch.int64),
+                "valid": grid(valid) > 0, "base": grid(base)[:, 0].to(torch.int64),
+                "fresh": grid(fresh)[:, 0] > 0, "live": grid(live)[:, 0] > 0,
+                # the kernel's own int32 [W x S, 1] tensors, which the verify and commit kernels take as they are
+                "raw": {"tokens": tokens, "positions": positions, "valid": valid, "fresh": fresh, "live": live,
+                        "base": base}}
+        layout = lambda t: t.reshape(t.shape[0], width, spec)  # noqa: E731
+        step = {("cos", False): layout(full_cos), ("sin", False): layout(full_sin), ("cos", True): layout(swa_cos),
+                ("sin", True): layout(swa_sin), ("slots", False): full_slots, ("slots", True): swa_slots,
+                ("pos", False): grid(full_pos), ("pos", True): grid(swa_pos), ("start", True): grid(swa_start)}
+        step.update({("mask", h): m for h, m in zip(self._mask_heads(), masks)})
+        return span, step
+
+    def _mask_heads(self) -> tuple:
+        """The decoder layers' distinct per-rank query head counts: one span active mask from the step kernel each."""
+        return tuple(sorted({int(layer.self_attn.num_heads) for layer in self.decoder_layers()}))
+
+    def _sample_kernel(self, hidden, positions, params, width: int, spec: int) -> torch.Tensor:
+        """[width, spec] the target's draw at each span token by kernels/sample.py, each token with its row's
+        temperature, seed and filters (the platform's per-row sampling inputs) and its own position's draw."""
+        from sglang_neuron.backend.stack import wrap_nki
+        from sglang_neuron.models.mimo_v2.kernels.sample import sample
+        from sglang_neuron.utils.hardware_config import get_logical_nc_config
+
+        temperatures, seeds, filters = params
+        out = wrap_nki(sample)[get_logical_nc_config()](
+            hidden, self.norm.weight.view(1, -1), self.lm_head_T, self.lm_head_tp_group.rank_in_group_tensor,
+            self._head_mesh(), temperatures.reshape(width, 1).to(torch.float32), seeds.reshape(width, 1).to(torch.int32),
+            filters.reshape(width, 3).to(torch.float32), positions.reshape(-1, 1).to(torch.int32), eps=self.norm.eps,
+            span=spec)
+        return out
 
     def _first_layer(self, swa: bool) -> str:
         return next(self.config.layer_name(i) for i, s in enumerate(self.config.swa_layers) if s == swa)
@@ -343,41 +394,55 @@ class MiMoV2Graph(nn.Module):
         md = {True: attn_metadata[self._first_layer(True)], False: attn_metadata[self._first_layer(False)]}
         width, spec = md[False]["block_table_tensor"].shape[0], mtp_step.SPEC
         slots = row_slots.to(torch.int64)
-        span = mtp_step.span_inputs(self.mtp_carry.index_select(0, slots), self.mtp_len.index_select(0, slots), ctrl)
-        positions = span["positions"]
-        prior = span["base"].reshape(width, 1).expand(width, spec)
         heads = self.layers[0].self_attn.num_heads
         windows = {True: self.config.swa.sliding_window, False: None}
-        # the full layers' decode under the layer kernels masks by position (MiMoV2Graph._layer_call): no full mask
-        full_by_position = layer_kernel_enabled() and all(self._layer_kernel_serves(layer)
-                                                          for layer in self.decoder_layers())
-        # the sliding layers' too, but where the one-layer MTP draft runs its own passes on their span mask
-        by_position = {False: full_by_position, True: full_by_position and len(self.mtp) > 1}
-        masks = {k: (None if by_position[k] else
-                     span_mask(md[k], prior, positions, window=windows[k], num_heads=heads)) for k in md}
-        kv_slots = {k: span_slots(md[k], positions, span["valid"], window=windows[k]) for k in md}
-        tables = self._tables(positions.reshape(-1))
-        hidden = self.embed(span["tokens"].reshape(-1))
         ebase = self._expert_base()
-        # the one-kernel layer (kernels/layer.py) over the spans: its inputs in the kernel's layouts, built once a step
+        on_kernels = layer_kernel_enabled() and all(self._layer_kernel_serves(layer) for layer in self.decoder_layers())
         kernel_step = None
-        if layer_kernel_enabled() and all(self._layer_kernel_serves(layer) for layer in self.decoder_layers()):
-            layout = lambda t: t.reshape(width, spec, -1).permute(2, 0, 1).contiguous()  # noqa: E731
-            kernel_step = {"mesh": tuple(tuple(int(r) for r in cell) for cell in
-                                         resolve_full_mesh(self.layers[0].self_attn.attn_tp_group)),
-                           "ebase": ebase,
-                           "kv_scales": self.layers[0].self_attn._scale_tensors(hidden.device)}
-            for k, (cos, sin) in tables.items():
-                kernel_step[("cos", k)], kernel_step[("sin", k)] = layout(cos), layout(sin)
-                kernel_step[("slots", k)] = kv_slots[k].reshape(-1, 1).to(torch.int32)
-            # each span token's prior length and a sliding layer's window start, the layers' position masks (the
-            # span masks' prior_end and start: span_mask), in each kind's table frame
-            kernel_step[("pos", False)] = prior.to(torch.float32).contiguous()
-            offset = md[True]["swa_kv_pos_offset"].to(torch.int64).reshape(width, 1)
-            end = (prior.to(torch.int64) - offset).clamp(min=0)
-            start = (positions.to(torch.int64) - offset - windows[True] + 1).clamp(min=0)
-            kernel_step[("pos", True)] = end.to(torch.float32).contiguous()
-            kernel_step[("start", True)] = torch.minimum(start, end).to(torch.float32).contiguous()
+        if on_kernels and len(self.mtp) > 1 and head_kernel_enabled():
+            # the step's inputs in one kernel (kernels/step.py): the span's tokens and positions, both kinds' slots,
+            # position masks and RoPE tables in the layer kernels' layouts
+            span, kernel_step = self._step_kernel(md, row_slots, ctrl, width, spec)
+            kernel_step.update({"mesh": tuple(tuple(int(r) for r in cell) for cell in
+                                              resolve_full_mesh(self.layers[0].self_attn.attn_tp_group)),
+                                "ebase": ebase, "kv_scales": self.layers[0].self_attn._scale_tensors(
+                                    md[False]["block_table_tensor"].device)})
+            positions = span["positions"]
+            masks = {True: None, False: None}
+            kv_slots = {True: kernel_step[("slots", True)].reshape(-1), False: kernel_step[("slots", False)].reshape(-1)}
+            tables = None
+            hidden = self.embed(span["tokens"].reshape(-1))
+        else:
+            span = mtp_step.span_inputs(self.mtp_carry.index_select(0, slots), self.mtp_len.index_select(0, slots),
+                                        ctrl)
+            positions = span["positions"]
+            prior = span["base"].reshape(width, 1).expand(width, spec)
+            # the full layers' decode under the layer kernels masks by position (MiMoV2Graph._layer_call): no full
+            # mask; the sliding layers' too, but where the one-layer MTP draft runs its own passes on their span mask
+            by_position = {False: on_kernels, True: on_kernels and len(self.mtp) > 1}
+            masks = {k: (None if by_position[k] else
+                         span_mask(md[k], prior, positions, window=windows[k], num_heads=heads)) for k in md}
+            kv_slots = {k: span_slots(md[k], positions, span["valid"], window=windows[k]) for k in md}
+            tables = self._tables(positions.reshape(-1))
+            hidden = self.embed(span["tokens"].reshape(-1))
+            # the one-kernel layer (kernels/layer.py) over the spans: its inputs in the kernel's layouts, built once
+            if on_kernels:
+                layout = lambda t: t.reshape(width, spec, -1).permute(2, 0, 1).contiguous()  # noqa: E731
+                kernel_step = {"mesh": tuple(tuple(int(r) for r in cell) for cell in
+                                             resolve_full_mesh(self.layers[0].self_attn.attn_tp_group)),
+                               "ebase": ebase,
+                               "kv_scales": self.layers[0].self_attn._scale_tensors(hidden.device)}
+                for k, (cos, sin) in tables.items():
+                    kernel_step[("cos", k)], kernel_step[("sin", k)] = layout(cos), layout(sin)
+                    kernel_step[("slots", k)] = kv_slots[k].reshape(-1, 1).to(torch.int32)
+                # each span token's prior length and a sliding layer's window start, the layers' position masks
+                # (the span masks' prior_end and start: span_mask), in each kind's table frame
+                kernel_step[("pos", False)] = prior.to(torch.float32).contiguous()
+                offset = md[True]["swa_kv_pos_offset"].to(torch.int64).reshape(width, 1)
+                end = (prior.to(torch.int64) - offset).clamp(min=0)
+                start = (positions.to(torch.int64) - offset - windows[True] + 1).clamp(min=0)
+                kernel_step[("pos", True)] = end.to(torch.float32).contiguous()
+                kernel_step[("start", True)] = torch.minimum(start, end).to(torch.float32).contiguous()
         for layer in self.layers:
             if kernel_step is not None:
                 k = layer.is_swa
@@ -398,22 +463,58 @@ class MiMoV2Graph(nn.Module):
                 hidden = hidden + layer.mlp(norm(hidden))
         from sglang_neuron import sampling
 
+        # the kernels' int32 draws stay int32 into the step's tail kernels ("raw")
+        keep_i32 = "raw" in span
         if params[0] is None or sampling.sampler_mode() == "greedy":
             # the greedy target: the final norm, the LM head and the argmax in one kernel (kernels/head.greedy)
-            sampled = self.greedy(hidden, self.norm).reshape(width, spec).to(torch.int64)
+            sampled = self.greedy(hidden, self.norm)
+            sampled = sampled if keep_i32 else sampled.reshape(width, spec).to(torch.int64)
+        elif head_kernel_enabled() and hidden.shape[0] <= 128 and sampling.sampler_mode() == "topk_topp":
+            # the drawing target: the final norm, the LM head and the tail rule in one kernel (kernels/sample.py)
+            sampled = self._sample_kernel(hidden, span["raw"]["positions"] if keep_i32 else positions, params, width,
+                                          spec)
+            sampled = sampled if keep_i32 else sampled.reshape(width, spec).to(torch.int64)
         else:
             sampled = self._span_sample(self.lm_head(self.norm(hidden)), positions, params, width, spec)
+        if "raw" in span:
+            return {"token_ids": self._mtp_tail_kernels(span, hidden, sampled, md[True], kernel_step, row_slots,
+                                                        width, spec, rank)}
         out, kept = mtp_step.accept(span["tokens"], sampled, span)
         bonus = sampled.gather(1, kept.reshape(-1, 1))
         kernel = None if kernel_step is None else (kernel_step[("cos", True)], kernel_step[("sin", True)],
                                                    kernel_step[("slots", True)], kernel_step)
-        drafts = self._mtp_drafts(span, sampled, hidden, kept, md[True], masks[True], kv_slots[True], tables[True],
-                                  rank, kernel)
+        drafts = self._mtp_drafts(span, sampled, hidden, kept, md[True], masks[True], kv_slots[True],
+                                  tables[True] if tables is not None else (None, None), rank, kernel)
         self.mtp_carry.index_copy_(0, slots, torch.cat([bonus, drafts], dim=1).to(torch.int32))
         self.mtp_len.index_copy_(0, slots, (span["base"] + kept + 1).to(torch.int32))
         if self.mtp_width > width:
             out = torch.cat([out, torch.full((self.mtp_width - width, spec), -1, dtype=out.dtype, device=out.device)])
         return {"token_ids": out.to(torch.int32)}
+
+    def _mtp_tail_kernels(self, span, hidden, sampled, md, step, row_slots, width: int, spec: int, rank):
+        """The step after the target's draws, in kernels (kernels/accept.py): the verify, each MTP layer's pass and
+        greedy draft at the row's last kept token (head.greedy gathering that row), the tokens rotated for the next
+        layer, and the carry commit, whose result is the step's output."""
+        from sglang_neuron.backend.stack import wrap_nki
+        from sglang_neuron.models.mimo_v2.kernels.accept import accept, commit, rotate
+        from sglang_neuron.utils.hardware_config import get_logical_nc_config
+
+        grid = get_logical_nc_config()
+        raw = span["raw"]
+        drawn = sampled.reshape(-1, 1) if sampled.dtype == torch.int32 else sampled.reshape(-1, 1).to(torch.int32)
+        out, kept, bonus, kept_row = wrap_nki(accept)[grid](raw["tokens"], drawn, raw["valid"], raw["fresh"],
+                                                            raw["live"], span=spec, out_width=self.mtp_width)
+        kernel = (step[("cos", True)], step[("sin", True)], step[("slots", True)], step)
+        tokens, drafts = drawn, []
+        for k, layer in enumerate(self.mtp):
+            state, _ = layer.decode(self, tokens.reshape(-1), hidden, None, None, md, None, None, spec, None, rank,
+                                    kernel)
+            draft = self.greedy(state, layer.final_layernorm, kept_row).reshape(width, 1)
+            drafts.append(draft)
+            if k + 1 < len(self.mtp):
+                tokens = wrap_nki(rotate)[grid](tokens, kept, draft)
+        return wrap_nki(commit)[grid](self.mtp_carry, self.mtp_len, row_slots.to(torch.int32), bonus, *drafts,
+                                      raw["base"], kept, out)
 
     def _mtp_drafts(self, span, sampled, hidden, kept, md, mask, kv_slots, table, rank, kernel=None):
         """[W, NUM_STEPS] the MTP layer's drafts after each row's kept run (mtp.py): its pass over the span (the token
@@ -456,9 +557,14 @@ class MiMoV2Graph(nn.Module):
         return torch.stack(drafts, dim=1)
 
     def _expert_base(self):
-        """[1, 1] fp32 this rank's first local expert id (the MoE half kernel's ``ebase``), None without MoE."""
+        """The MoE half kernel's ``ebase``: this rank's EP rank [1] int32 (the kernel multiplies it by its local
+        expert count), None without MoE."""
         moe = next((m.mlp for m in self.layers if isinstance(m.mlp, MiMoV2MoE)), None)
-        return None if moe is None else (moe._ep_rank_id().to(torch.float32) * moe.num_local_experts).reshape(1, 1)
+        if moe is None:
+            return None
+        if moe.ep_group is None:
+            return torch.zeros(1, dtype=torch.int32, device=moe.gate_up_weight.device)
+        return moe.ep_group.rank_in_group_tensor
 
     @staticmethod
     def _layer_kernel_serves(layer) -> bool:
@@ -532,9 +638,14 @@ class MiMoV2Graph(nn.Module):
         kvdp = self._kvdp(layer, rows) if posid else 1
         if posid:
             # the span's active part alone (the prior is masked by position): token q sees the span's tokens k <= q
-            k_idx = torch.arange(span, device=x.device).reshape(span, 1, 1, 1)
-            q_idx = torch.arange(span, device=x.device).reshape(1, 1, 1, span)
-            mask = (k_idx <= q_idx).expand(span, rows // kvdp, attn.num_heads * kvdp, span).to(torch.uint8)
+            built = step.get(("mask", int(attn.num_heads)))
+            if built is not None and tuple(built.shape) == (span, rows * attn.num_heads, span):
+                # the step kernel's (kernels/step.py), the same memory for any kvdp: a view, no XLA op
+                mask = built.view(span, rows // kvdp, attn.num_heads * kvdp, span)
+            else:
+                k_idx = torch.arange(span, device=x.device).reshape(span, 1, 1, 1)
+                q_idx = torch.arange(span, device=x.device).reshape(1, 1, 1, span)
+                mask = (k_idx <= q_idx).expand(span, rows // kvdp, attn.num_heads * kvdp, span).to(torch.uint8)
         attn_args = (x, layer.input_norm_f32, attn.qkv_weight, cos, sin, table, attn.k_cache, attn.v_cache, mask,
                      attn._sink_column(), slots, attn._kernel_o_weight())
         k_scale, v_scale = step.get("kv_scales", (None, None))
