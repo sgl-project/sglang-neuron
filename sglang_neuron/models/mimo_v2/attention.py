@@ -271,12 +271,25 @@ class MiMoAttention(nn.Module):
         table, scale = md["block_table_tensor"], self.scaling
         if self.fp8_kv:
             page = md["block_size"]
-            window = {}
-            if self.sliding_window:
-                cached = md["cached_seq_len"].to(torch.int64).reshape(-1)
-                window = dict(first_col=torch.clamp(cached - self.sliding_window + 1, min=0) // page,
-                              n_cols=(tokens + self.sliding_window - 1) // page + 2)
-            k_cache, v_cache, table = pack_prior(k_cache, v_cache, table, **window)
+            if prescaled:
+                # on a device: the prior's pages gathered and K packed in one kernel (kernels/prefill.prefill_pack)
+                from sglang_neuron.backend.stack import wrap_nki
+                from sglang_neuron.models.mimo_v2.kernels.prefill import prefill_pack
+                from sglang_neuron.utils.hardware_config import get_logical_nc_config
+
+                window = int(self.sliding_window or 0)
+                n_cols = (tokens + window - 1) // page + 2 if window else table.shape[1]
+                n_cols = min(n_cols, table.shape[1])
+                k_cache, v_cache, table = wrap_nki(prefill_pack)[get_logical_nc_config()](
+                    k_cache, v_cache, table.to(torch.int32), md["cached_seq_len"].to(torch.int32).reshape(1, 1),
+                    n_cols=n_cols, window=window)
+            else:
+                window = {}
+                if self.sliding_window:
+                    cached = md["cached_seq_len"].to(torch.int64).reshape(-1)
+                    window = dict(first_col=torch.clamp(cached - self.sliding_window + 1, min=0) // page,
+                                  n_cols=(tokens + self.sliding_window - 1) // page + 2)
+                k_cache, v_cache, table = pack_prior(k_cache, v_cache, table, **window)
             scale = scale / self.kv_scale
         if prescaled:
             from sglang_neuron.backend.stack import wrap_nki

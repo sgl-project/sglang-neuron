@@ -851,3 +851,99 @@ def prefill_mtp_project(ids, at, token, prev, emb_w, enorm_w, hnorm_w, eh_wT, ra
     if n_prg > 1:
         nisa.core_barrier(data=out, cores=(0, 1))
     return out, next_out
+
+
+@nki.jit
+def prefill_pack(k_cache, v_cache, table, cached, n_cols=1, window=0):
+    """The pages a prefill chunk's segmented attention reads from token-major FP8 caches, in the layout it takes FP8 K
+    in, in one kernel (attention.pack_prior for one row):
+
+        first  = max(cached - window + 1, 0) / page where ``window`` (a sliding layer's), else 0
+        cols   = min(first + i, width - 1), i < n_cols            each the row's table column
+        page   = max(table[0, col], 0)
+        K      = k_cache[page] packed [page / 2, d, 2]             token 2j + e at [j, :, e]
+        V      = v_cache[page]
+        table' = column j's place among the gathered pages where j - first is in [0, n_cols), 0 elsewhere; -1 where the
+                 row's table had none
+
+    k_cache / v_cache [blocks, 1, page, d] FP8; table [1, width] int32; cached [1, 1] int32 the chunk's prior length
+    (page a power of two). Returns (K [n_cols, 1, page / 2, d, 2], V [n_cols, 1, page, d], table' [1, width] int32). The
+    pages sit on the partitions, 128 a group, each program of LNC2 gathering one half of each group."""
+    blocks, kv_heads, page, d = k_cache.shape
+    width = table.shape[1]
+    half = page // 2
+    n_prg = nl.num_programs(axes=0)
+    pid = nl.program_id(axis=0)
+    k_out = nl.ndarray((n_cols, kv_heads, half, d, 2), dtype=k_cache.dtype, buffer=nl.shared_hbm,
+                       name="prefill_pack_k")
+    v_out = nl.ndarray((n_cols, kv_heads, page, d), dtype=v_cache.dtype, buffer=nl.shared_hbm, name="prefill_pack_v")
+    t_out = nl.ndarray((1, width), dtype=nl.int32, buffer=nl.shared_hbm, name="prefill_pack_table")
+    k_rows = k_cache.reshape((blocks, page * d))
+    v_rows = v_cache.reshape((blocks, page * d))
+    fc = nl.ndarray((P, 1), dtype=nl.float32, buffer=nl.sbuf)
+    if window:
+        fc_i = nl.ndarray((P, 1), dtype=cached.dtype, buffer=nl.sbuf)
+        nisa.dma_copy(dst=fc_i[0:P, 0:1], src=cached.reshape((1, 1)).ap(pattern=[[0, P], [1, 1]], offset=0))
+        nisa.tensor_scalar(dst=fc_i[0:P, 0:1], data=fc_i[0:P, 0:1], op0=nl.add, operand0=1 - window)
+        nisa.tensor_scalar(dst=fc_i[0:P, 0:1], data=fc_i[0:P, 0:1], op0=nl.maximum, operand0=0)
+        nisa.tensor_scalar(dst=fc_i[0:P, 0:1], data=fc_i[0:P, 0:1], op0=nl.right_shift,
+                           operand0=page.bit_length() - 1)
+        nisa.tensor_copy(dst=fc[0:P, 0:1], src=fc_i[0:P, 0:1])
+    else:
+        nisa.memset(dst=fc[0:P, 0:1], value=0.0)
+    for g0 in range(0, n_cols, P):
+        gn = min(P, n_cols - g0)
+        # this program's pages of the group: the first or second half (both the whole of a group of one)
+        lo = 0 if (n_prg == 1 or gn < 2 or pid == 0) else gn // 2
+        hi = gn if (n_prg == 1 or gn < 2 or pid == 1) else gn // 2
+        m = hi - lo
+        i_f = nl.ndarray((P, 1), dtype=nl.float32, buffer=nl.sbuf)
+        nisa.iota(i_f[0:m, 0:1], pattern=[[0, 1]], offset=g0 + lo, channel_multiplier=1)
+        col = nl.ndarray((P, 1), dtype=nl.float32, buffer=nl.sbuf)
+        nisa.tensor_tensor(dst=col[0:m, 0:1], data1=i_f[0:m, 0:1], data2=fc[0:m, 0:1], op=nl.add)
+        nisa.tensor_scalar(dst=col[0:m, 0:1], data=col[0:m, 0:1], op0=nl.minimum, operand0=float(width - 1))
+        col_i = nl.ndarray((P, 1), dtype=nl.int32, buffer=nl.sbuf)
+        nisa.tensor_copy(dst=col_i[0:m, 0:1], src=col[0:m, 0:1])
+        pg_i = nl.ndarray((P, 1), dtype=table.dtype, buffer=nl.sbuf)
+        nisa.dma_copy(dst=pg_i[0:m, 0:1], src=table.reshape((width, 1)).ap(
+            pattern=[[1, m], [1, 1]], offset=0, vector_offset=col_i[0:m, 0:1], indirect_dim=0))
+        nisa.tensor_scalar(dst=pg_i[0:m, 0:1], data=pg_i[0:m, 0:1], op0=nl.maximum, operand0=0)
+        # V whole, K's even and odd tokens, each page a partition
+        vt = nl.ndarray((P, page, d), dtype=v_cache.dtype, buffer=nl.sbuf)
+        nisa.dma_copy(dst=vt[0:m, 0:page, 0:d], src=v_rows.ap(pattern=[[page * d, m], [d, page], [1, d]], offset=0,
+                                                              vector_offset=pg_i[0:m, 0:1], indirect_dim=0))
+        kp = nl.ndarray((P, half, d, 2), dtype=k_cache.dtype, buffer=nl.sbuf)
+        for e in range(2):
+            ke = nl.ndarray((P, half, d), dtype=k_cache.dtype, buffer=nl.sbuf)
+            nisa.dma_copy(dst=ke[0:m, 0:half, 0:d], src=k_rows.ap(pattern=[[page * d, m], [2 * d, half], [1, d]],
+                                                                  offset=e * d, vector_offset=pg_i[0:m, 0:1],
+                                                                  indirect_dim=0))
+            nisa.tensor_copy(dst=kp[0:m, 0:half, 0:d, e], src=ke[0:m, 0:half, 0:d])
+        nisa.dma_copy(dst=v_out[g0 + lo:g0 + hi, 0, 0:page, 0:d], src=vt[0:m, 0:page, 0:d])
+        nisa.dma_copy(dst=k_out[g0 + lo:g0 + hi, 0, 0:half, 0:d, 0:2], src=kp[0:m, 0:half, 0:d, 0:2])
+    if n_prg == 1 or pid == 0:
+        # column j: j - first where that is in [0, n_cols), else 0; -1 where the table had no page
+        j = nl.ndarray((1, width), dtype=nl.float32, buffer=nl.sbuf)
+        nisa.iota(j[0:1, 0:width], pattern=[[1, width]], offset=0, channel_multiplier=0)
+        rel = nl.ndarray((1, width), dtype=nl.float32, buffer=nl.sbuf)
+        nisa.tensor_scalar(dst=rel[0:1, 0:width], data=j[0:1, 0:width], op0=nl.subtract, operand0=fc[0:1, 0:1])
+        ins = nl.ndarray((1, width), dtype=nl.float32, buffer=nl.sbuf)
+        nisa.tensor_scalar(dst=ins[0:1, 0:width], data=rel[0:1, 0:width], op0=nl.greater_equal, operand0=0.0)
+        lt = nl.ndarray((1, width), dtype=nl.float32, buffer=nl.sbuf)
+        nisa.tensor_scalar(dst=lt[0:1, 0:width], data=rel[0:1, 0:width], op0=nl.less, operand0=float(n_cols))
+        nisa.tensor_tensor(dst=ins[0:1, 0:width], data1=ins[0:1, 0:width], data2=lt[0:1, 0:width], op=nl.multiply)
+        nisa.tensor_tensor(dst=rel[0:1, 0:width], data1=rel[0:1, 0:width], data2=ins[0:1, 0:width], op=nl.multiply)
+        tb_i = nl.ndarray((1, width), dtype=table.dtype, buffer=nl.sbuf)
+        nisa.dma_copy(dst=tb_i[0:1, 0:width], src=table[0:1, 0:width])
+        tb = nl.ndarray((1, width), dtype=nl.float32, buffer=nl.sbuf)
+        nisa.tensor_copy(dst=tb[0:1, 0:width], src=tb_i[0:1, 0:width])
+        has = nl.ndarray((1, width), dtype=nl.float32, buffer=nl.sbuf)
+        nisa.tensor_scalar(dst=has[0:1, 0:width], data=tb[0:1, 0:width], op0=nl.greater_equal, operand0=0.0)
+        # (rel + 1) x has - 1
+        nisa.tensor_scalar(dst=rel[0:1, 0:width], data=rel[0:1, 0:width], op0=nl.add, operand0=1.0)
+        nisa.tensor_tensor(dst=rel[0:1, 0:width], data1=rel[0:1, 0:width], data2=has[0:1, 0:width], op=nl.multiply)
+        nisa.tensor_scalar(dst=rel[0:1, 0:width], data=rel[0:1, 0:width], op0=nl.add, operand0=-1.0)
+        out_i = nl.ndarray((1, width), dtype=nl.int32, buffer=nl.sbuf)
+        nisa.tensor_copy(dst=out_i[0:1, 0:width], src=rel[0:1, 0:width])
+        nisa.dma_copy(dst=t_out[0:1, 0:width], src=out_i[0:1, 0:width])
+    return k_out, v_out, t_out

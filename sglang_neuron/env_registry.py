@@ -118,7 +118,7 @@ KNOBS: dict = {
     "SGLANG_NEURON_PROFILE_DIR": DEBUG,
     "SGLANG_NEURON_PROFILE_RANKS": DEBUG,
     "SGLANG_NEURON_PROFILE_DEVICE_MODE": DEBUG,
-    **{f"SGLANG_NEURON_PROFILE_SERVE_{field}": DEBUG for field in ("RANKS", "START", "STEPS")},
+    **{f"SGLANG_NEURON_PROFILE_SERVE_{field}": DEBUG for field in ("RANKS", "START", "STEPS", "PHASE")},
     # the SGLang Diffusion platform (sglang_neuron/diffusion/envs.py; docs/model-recipes/flux1-dev.md)
     "SGLANG_NEURON_REQUIRE_NKI_KERNELS": DEBUG,
     "SGLANG_NEURON_DISABLE_NKI_KERNELS": DEBUG,
