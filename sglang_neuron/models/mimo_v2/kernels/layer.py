@@ -83,7 +83,7 @@ def _residual(x2d, add2d, B: int, H: int, name: str):
 def moe_layer(X, attn_gamma, W_qkv, cos, sin, active_blocks_table, K_cache, V_cache, attention_mask, sink, slots,
               W_o, moe_gamma, router_wT, expert_bias, ebase, gate_up_w, down_w, gate_up_scale, down_scale, mesh,
               k_scale=None, v_scale=None, eps=1e-6, softmax_scale=1.0, v_head_dim=128, route_scale=1.0, top_k=8,
-              fp8_act=True, prefetch=6, pos=None, rank=None, kvdp=1, kvdp_mesh=None):
+              fp8_act=True, prefetch=6, pos=None, rank=None, kvdp=1, kvdp_mesh=None, start=None):
     """X [B, S, H] bf16, the layer's input (S tokens a row, a NEURON_MTP span or 1); the attention half's inputs as
     attn_half's (``k_scale`` / ``v_scale`` over an FP8 cache), the MoE half's as moe_half's. Returns the layer's
     output [B x S, H] bf16. The caches are written in place and not returned: returned beside the output, the
@@ -108,7 +108,7 @@ def moe_layer(X, attn_gamma, W_qkv, cos, sin, active_blocks_table, K_cache, V_ca
     attn, _, _ = attn_half(X, attn_gamma, W_qkv, cos, sin, active_blocks_table, K_cache, V_cache,
                            attention_mask, sink, slots, W_o, k_scale, v_scale, rmsnorm_X_eps=eps,
                            softmax_scale=softmax_scale, v_head_dim=v_head_dim, out_in_sbuf=True, pos=pos, rank=rank,
-                           kvdp=kvdp, kvdp_mesh=kvdp_mesh)
+                           kvdp=kvdp, kvdp_mesh=kvdp_mesh, start=start)
     attn = _sb_all_reduce(attn, R, H, rg, pid, n_prg, 3)
     h = nl.ndarray((P, H), dtype=X.dtype, buffer=nl.sbuf)
     nisa.tensor_tensor(dst=h[0:R, 0:H], data1=x_sb[0:R, 0:H], data2=attn[0:R, 0:H], op=nl.add)
@@ -127,7 +127,7 @@ def moe_layer(X, attn_gamma, W_qkv, cos, sin, active_blocks_table, K_cache, V_ca
 @nki.jit
 def dense_layer(X, attn_gamma, W_qkv, cos, sin, active_blocks_table, K_cache, V_cache, attention_mask, sink, slots,
                 W_o, mlp_gamma, W_gate, W_up, W_down, mesh, k_scale=None, v_scale=None, eps=1e-6, softmax_scale=1.0,
-                v_head_dim=128, pos=None, rank=None, kvdp=1, kvdp_mesh=None):
+                v_head_dim=128, pos=None, rank=None, kvdp=1, kvdp_mesh=None, start=None):
     """A dense layer's decode (layer 0): moe_layer with nkilib's mlp (RMSNorm, SiLU-gated gate / up, down) in place of
     the MoE half; W_gate / W_up [H, I] and W_down [I, H] this rank's shard of the intermediate dimension. Returns the
     layer's output [B x S, H] bf16; the caches are written in place."""
@@ -141,7 +141,7 @@ def dense_layer(X, attn_gamma, W_qkv, cos, sin, active_blocks_table, K_cache, V_
 
     attn, _, _ = attn_half(X, attn_gamma, W_qkv, cos, sin, active_blocks_table, K_cache, V_cache, attention_mask,
                            sink, slots, W_o, k_scale, v_scale, rmsnorm_X_eps=eps, softmax_scale=softmax_scale,
-                           v_head_dim=v_head_dim, pos=pos, rank=rank, kvdp=kvdp, kvdp_mesh=kvdp_mesh)
+                           v_head_dim=v_head_dim, pos=pos, rank=rank, kvdp=kvdp, kvdp_mesh=kvdp_mesh, start=start)
     attn = _all_reduce(attn, rg, n_prg, "dense_attn_reduced")
     h = _residual(X.reshape((R, H)), attn, R, H, "dense_attn_residual")
     outputs = mlp(hidden_tensor=h.reshape((R, 1, H)), gate_proj_weights_tensor=W_gate, up_proj_weights_tensor=W_up,

@@ -348,7 +348,13 @@ class MiMoV2Graph(nn.Module):
         prior = span["base"].reshape(width, 1).expand(width, spec)
         heads = self.layers[0].self_attn.num_heads
         windows = {True: self.config.swa.sliding_window, False: None}
-        masks = {k: span_mask(md[k], prior, positions, window=windows[k], num_heads=heads) for k in md}
+        # the full layers' decode under the layer kernels masks by position (MiMoV2Graph._layer_call): no full mask
+        full_by_position = layer_kernel_enabled() and all(self._layer_kernel_serves(layer)
+                                                          for layer in self.decoder_layers())
+        # the sliding layers' too, but where the one-layer MTP draft runs its own passes on their span mask
+        by_position = {False: full_by_position, True: full_by_position and len(self.mtp) > 1}
+        masks = {k: (None if by_position[k] else
+                     span_mask(md[k], prior, positions, window=windows[k], num_heads=heads)) for k in md}
         kv_slots = {k: span_slots(md[k], positions, span["valid"], window=windows[k]) for k in md}
         tables = self._tables(positions.reshape(-1))
         hidden = self.embed(span["tokens"].reshape(-1))
@@ -364,9 +370,14 @@ class MiMoV2Graph(nn.Module):
             for k, (cos, sin) in tables.items():
                 kernel_step[("cos", k)], kernel_step[("sin", k)] = layout(cos), layout(sin)
                 kernel_step[("slots", k)] = kv_slots[k].reshape(-1, 1).to(torch.int32)
-            # each span token's prior length, the full layers' position mask under KVDP (their span masks open the
-            # same prior: span_mask's prior_end)
+            # each span token's prior length and a sliding layer's window start, the layers' position masks (the
+            # span masks' prior_end and start: span_mask), in each kind's table frame
             kernel_step[("pos", False)] = prior.to(torch.float32).contiguous()
+            offset = md[True]["swa_kv_pos_offset"].to(torch.int64).reshape(width, 1)
+            end = (prior.to(torch.int64) - offset).clamp(min=0)
+            start = (positions.to(torch.int64) - offset - windows[True] + 1).clamp(min=0)
+            kernel_step[("pos", True)] = end.to(torch.float32).contiguous()
+            kernel_step[("start", True)] = torch.minimum(start, end).to(torch.float32).contiguous()
         for layer in self.layers:
             if kernel_step is not None:
                 k = layer.is_swa
@@ -517,8 +528,9 @@ class MiMoV2Graph(nn.Module):
 
         attn, mlp = layer.self_attn, layer.mlp
         rows, span = x.shape[0], x.shape[1]
-        kvdp = self._kvdp(layer, rows) if ("pos", False) in step else 1
-        if kvdp > 1:
+        posid = ("pos", layer.is_swa) in step
+        kvdp = self._kvdp(layer, rows) if posid else 1
+        if posid:
             # the span's active part alone (the prior is masked by position): token q sees the span's tokens k <= q
             k_idx = torch.arange(span, device=x.device).reshape(span, 1, 1, 1)
             q_idx = torch.arange(span, device=x.device).reshape(1, 1, 1, span)
@@ -531,6 +543,8 @@ class MiMoV2Graph(nn.Module):
         if kvdp > 1:
             common.update(pos=step[("pos", False)], rank=attn.attn_tp_group.rank_in_group_tensor, kvdp=kvdp,
                           kvdp_mesh=self._kvdp_mesh(layer, kvdp))
+        elif posid:
+            common.update(pos=step[("pos", layer.is_swa)], start=step.get(("start", layer.is_swa)))
         gamma = layer.post_attention_layernorm.weight.view(1, -1)
         if isinstance(mlp, DenseMLP):
             return wrap_nki(dense_layer)[get_logical_nc_config()](

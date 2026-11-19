@@ -45,6 +45,25 @@ def _attention(X, X_hidden_dim_actual, rmsnorm_X_eps, rmsnorm_X_gamma, W_qkv, co
     )
 
 
+def _attention_posid(X, H, eps, gamma, W_qkv, cos, sin, table, K_cache, V_cache, active_mask, sink, softmax_scale,
+                     k_scale, v_scale, pos, start=None):
+    """_attention masked by position: ``pos`` [B, S] fp32 each token's prior length (the prior mask is the kernel's
+    own), ``start`` [B, S] fp32 or None each token's window start (a sliding layer's, in its trimmed table's frame),
+    ``active_mask`` [S, B, heads, S] uint8 the span's active part."""
+    return attention_block_tkg(
+        X=X, X_hidden_dim_actual=H, rmsnorm_X_enabled=True, rmsnorm_X_eps=eps, rmsnorm_X_gamma=gamma, W_qkv=W_qkv,
+        bias_qkv=None, quantization_type_qkv=QuantizationType.NONE, weight_dequant_scale_qkv=None,
+        input_dequant_scale_qkv=None, rmsnorm_QK_pre_rope_enabled=False, rmsnorm_QK_pre_rope_eps=0.0,
+        rmsnorm_QK_pre_rope_W_Q=None, rmsnorm_QK_pre_rope_W_K=None, cos=cos, sin=sin, rope_contiguous_layout=True,
+        rmsnorm_QK_post_rope_enabled=False, rmsnorm_QK_post_rope_eps=0.0, rmsnorm_QK_post_rope_W_Q=None,
+        rmsnorm_QK_post_rope_W_K=None, K_cache_transposed=False, active_blocks_table=table, K_cache=K_cache,
+        V_cache=V_cache, attention_mask=active_mask, sink=sink, update_cache=False, kv_cache_update_idx=None,
+        W_out=None, bias_out=None, quantization_type_out=QuantizationType.NONE, weight_dequant_scale_out=None,
+        input_dequant_scale_out=None, transposed_out=False, out_in_sb=False, softmax_scale=softmax_scale,
+        pos_ids=pos, swa_start_pos_ids=start, k_scale=k_scale, v_scale=v_scale,
+    )
+
+
 def _attention_kvdp(X, H, eps, gamma, W_qkv, cos, sin, table, K_cache, V_cache, active_mask, sink, softmax_scale,
                     k_scale, v_scale, pos, rank, kvdp, kvdp_mesh):
     """The attention of this rank's B / kvdp rows of the batch (attn_half's ``kvdp``): its place in the group, its
@@ -107,7 +126,7 @@ def _attention_kvdp(X, H, eps, gamma, W_qkv, cos, sin, table, K_cache, V_cache, 
 @nki.jit
 def attn_half(X, rmsnorm_X_gamma, W_qkv, cos, sin, active_blocks_table, K_cache, V_cache, attention_mask, sink,
               slots, W_o, k_scale=None, v_scale=None, rmsnorm_X_eps=1e-6, softmax_scale=1.0, v_head_dim=128,
-              out_in_sbuf=False, pos=None, rank=None, kvdp=1, kvdp_mesh=None):
+              out_in_sbuf=False, pos=None, rank=None, kvdp=1, kvdp_mesh=None, start=None):
     """X [B, S, H] bf16 (S tokens a row: 1, or a NEURON_MTP span, which attend each other causally under the span
     mask); W_qkv [H, (heads + 2) x d]; cos / sin [d / 2, B, S]; the caches [pages, 1, page, d]; the mask in the
     kernel's layout; sink [heads, 1] fp32 or None; slots [B x S, 1] int32 (row-major: token s of row b at b x S + s);
@@ -136,6 +155,10 @@ def attn_half(X, rmsnorm_X_gamma, W_qkv, cos, sin, active_blocks_table, K_cache,
         heads_out, k_new, v_new = _attention_kvdp(X, H, rmsnorm_X_eps, rmsnorm_X_gamma, W_qkv, cos, sin,
                                                   active_blocks_table, K_cache, V_cache, attention_mask, sink,
                                                   softmax_scale, k_scale, v_scale, pos, rank, kvdp, kvdp_mesh)
+    elif pos is not None:
+        heads_out, k_new, v_new = _attention_posid(X, H, rmsnorm_X_eps, rmsnorm_X_gamma, W_qkv, cos, sin,
+                                                   active_blocks_table, K_cache, V_cache, attention_mask, sink,
+                                                   softmax_scale, k_scale, v_scale, pos, start)
     else:
         heads_out, k_new, v_new = _attention(X, H, rmsnorm_X_eps, rmsnorm_X_gamma, W_qkv, cos, sin,
                                              active_blocks_table, K_cache, V_cache, attention_mask, sink,

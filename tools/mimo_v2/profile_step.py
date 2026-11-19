@@ -27,6 +27,15 @@ def main(path: str) -> int:
     h = pq.read_table(f"{path}/HloInstruction.parquet").to_pandas()
     h = h[(h.start_ts >= t0) & (h.end_ts <= t1)].sort_values("start_ts")
     calls = h[h.hlo_name.str.contains("custom-call")]
+    # the step's XLA ops (everything but the kernel calls and the containers of the step's body)
+    import re
+
+    other = h[~h.hlo_name.str.contains(r"custom-call|= tuple\(|region_", regex=True)]
+    kinds = other.hlo_name.map(lambda n: (re.search(r"= (\S+?)\(", n) or [None, n[:16]])[1])
+    dur = (other.end_ts - other.start_ts) / 1e3
+    print(f"XLA ops: {len(other)}, {dur.sum():.0f} us summed (by op: "
+          + ", ".join(f"{k} {v:.0f}" for k, v in dur.groupby(kinds).sum().sort_values(ascending=False).head(8).items())
+          + ")")
     starts = [(r.start_ts - t0) / 1e3 for r in calls.itertuples()]
     print(f"execution {pick}: {len(calls)} kernel calls")
     # the decoder layers: the long run of calls at a steady period
