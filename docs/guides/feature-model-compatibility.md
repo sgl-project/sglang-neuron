@@ -10,16 +10,16 @@ message that names the setting at fault.
 - **refused**: the launch fails at startup;
 - **—**: does not apply to the model.
 
-The models are GPT-OSS-120B (`GptOssForCausalLM`), Qwen3-0.6B and Qwen3-8B (`Qwen3ForCausalLM`), Qwen3-30B-A3B
-(`Qwen3MoeForCausalLM`), GLM-4-9B-0414 (`Glm4ForCausalLM`), DeepSeek-V2-Lite (`DeepseekV2ForCausalLM`), GLM-5.2
+The models are GPT-OSS-120B (`GptOssForCausalLM`), Qwen3-0.6B and Qwen3-8B (`Qwen3ForCausalLM`), Qwen3-30B-A3B and
+Qwen3-235B-A22B (`Qwen3MoeForCausalLM`), GLM-4-9B-0414 (`Glm4ForCausalLM`), DeepSeek-V2-Lite (`DeepseekV2ForCausalLM`), GLM-5.2
 (`GlmMoeDsaForCausalLM`), Qwen3.5-397B-A17B (`Qwen3_5MoeForCausalLM`) and Kimi-K3 (`KimiK3ForConditionalGeneration`).
 
 ## Serving and parallelism
 
 | Feature | GPT-OSS | Qwen3 | Qwen3-MoE | GLM-4 | DeepSeek-V2 | GLM-5.2 | Qwen3.5 | Kimi-K3 |
 | --- | --- | --- | --- | --- | --- | --- | --- | --- |
-| Aggregated server | tested (TP8, EP8) | tested (TP4; Qwen3-8B also TP8) | tested (TP4, EP4) | tested (TP4) | tested (TP4) | refused | served (TP128 of eight DP-attention replicas, EP128; [Qwen3.5 radix](../model-recipes/qwen35-radix.md)) | refused |
-| Disaggregated prefill and decode | tested ¹ | tested (TP4; one prefill to two decode servers for Qwen3-8B, to five for Qwen3-0.6B) | tested (TP4 EP4; one prefill to one decode server) | tested (TP4; one prefill to two decode servers) | tested (TP4; one prefill to five decode servers) | tested ⁵ | tested ⁷ | tested ⁸ |
+| Aggregated server | tested (TP8, EP8) | tested (TP4; Qwen3-8B also TP8) | tested (TP4, EP4; Qwen3-235B-A22B TP64 EP32 and TP32 EP16 on trn2, [Qwen3-235B-A22B](../model-recipes/qwen3-moe.md#qwen3-235b-a22b)) | tested (TP4) | tested (TP4) | refused | served (TP128 of eight DP-attention replicas, EP128; [Qwen3.5 radix](../model-recipes/qwen35-radix.md)) | refused |
+| Disaggregated prefill and decode | tested ¹ | tested (TP4; one prefill to two decode servers for Qwen3-8B, to five for Qwen3-0.6B) | tested (TP4 EP4; one prefill to one decode server; Qwen3-235B-A22B TP32 EP16 on trn2) | tested (TP4; one prefill to two decode servers) | tested (TP4; one prefill to five decode servers) | tested ⁵ | tested ⁷ | tested ⁸ |
 | DP attention on a decode server | tested | served | refused | served | refused | refused | tested (eight replicas of attention TP16) | tested (eight groups of attention TP32) |
 | DP attention on a prefill server | served | served | refused | served | refused | refused | tested (eight replicas of attention TP16) | refused |
 | DP attention on an aggregated server | refused | refused | refused | refused | refused | refused | served (every rank plans each step from SGLang's DP-attention exchange) | refused |
