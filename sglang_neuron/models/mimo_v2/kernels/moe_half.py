@@ -42,7 +42,10 @@ DN_COLS = 1024
 
 @nki.jit
 def moe_half(hidden, ln_w, router_wT, expert_bias, ebase, gate_up_w, down_w, gate_up_scale, down_scale, eps=1e-6,
-             route_scale=1.0, top_k=8):
+             route_scale=1.0, top_k=8, hidden_sb=None, out_in_sbuf=False):
+    """Inside another kernel (layer.py) ``hidden_sb`` holds the rows in SBUF (``hidden`` then gives the shape only),
+    and ``out_in_sbuf`` returns this program's half of H of the partial in SBUF (rows 0 .. T - 1 of a [128, H /
+    programs] tile) in place of the HBM output."""
     T, H = hidden.shape
     E, _, _, I = gate_up_w.shape  # noqa: E741 - the expert intermediate size, as the kernels name it
     EA = router_wT.shape[1]
@@ -56,11 +59,12 @@ def moe_half(hidden, ln_w, router_wT, expert_bias, ebase, gate_up_w, down_w, gat
     ILe = I // n_prg
     n_ic = ILe // P
 
-    out = nl.ndarray((T, H), dtype=hidden.dtype, buffer=nl.shared_hbm, name="moe_half_out")
-
     # ---- RMSNorm (fp32 math, bf16 result like the torch path) ----
     hf = nl.ndarray((P, H), dtype=nl.bfloat16, buffer=nl.sbuf)
-    nisa.dma_copy(dst=hf[0:T, 0:H], src=hidden.ap(pattern=[[H, T], [1, H]], offset=0))
+    if hidden_sb is None:
+        nisa.dma_copy(dst=hf[0:T, 0:H], src=hidden.ap(pattern=[[H, T], [1, H]], offset=0))
+    else:
+        nisa.tensor_copy(dst=hf[0:T, 0:H], src=hidden_sb[0:T, 0:H])
     gam = nl.ndarray((P, H), dtype=nl.bfloat16, buffer=nl.sbuf)
     nisa.dma_copy(dst=gam[0:T, 0:H], src=ln_w.ap(pattern=[[0, T], [1, H]], offset=0))
     sq = nl.ndarray((P, H), dtype=nl.float32, buffer=nl.sbuf)
@@ -208,5 +212,8 @@ def moe_half(hidden, ln_w, router_wT, expert_bias, ebase, gate_up_w, down_w, gat
                   send_to_rank=other, recv_from_rank=other, pipe_id=2)
     o_sb = nl.ndarray((P, HH), dtype=hidden.dtype, buffer=nl.sbuf)
     nisa.tensor_tensor(o_sb[0:T, 0:HH], recv_o[0:T, 0:HH], acc[0:T, h0 : h0 + HH], nl.add)
+    if out_in_sbuf:
+        return o_sb
+    out = nl.ndarray((T, H), dtype=hidden.dtype, buffer=nl.shared_hbm, name="moe_half_out")
     nisa.dma_copy(dst=out.ap(pattern=[[H, T], [1, HH]], offset=h0), src=o_sb[0:T, 0:HH])
     return out

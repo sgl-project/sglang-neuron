@@ -143,12 +143,19 @@ class MiMoMtp(nn.Module):
         x = x + self.attn.prefill(layer.input_layernorm(x), cos, sin, md)
         return x + layer.mlp(layer.post_attention_layernorm(x))
 
-    def decode(self, graph, next_ids, prev, cos, sin, md, mask, slots, span: int, caches, rank) -> tuple:
+    def decode(self, graph, next_ids, prev, cos, sin, md, mask, slots, span: int, caches, rank, kernel=None) -> tuple:
         """One decode pass over ``span`` tokens a row: the next tokens ``next_ids`` [N] with ``prev`` [N, H] the states
         it reads, into the layer's KV at ``slots`` [N]. Returns (its states before the final norm [N, H], the caches as
-        written)."""
+        written). ``kernel`` (cos, sin, slots and the step's inputs in the one-kernel layer's layouts,
+        model.MiMoV2Graph._layer_call) runs the layer as one kernel (kernels/layer.dense_layer)."""
         layer = self.layer
         x = self.project(graph.embed_tokens(next_ids.to(torch.int32), scatter_tokens=False, rank=rank), prev)
+        if kernel is not None and caches is None:
+            k_cos, k_sin, k_slots, step = kernel
+            rows = x.shape[0] // span
+            out = graph._layer_call(layer, x.view(rows, span, -1), md["block_table_tensor"], mask, k_cos, k_sin,
+                                    k_slots, step)
+            return out, (self.attn.k_cache, self.attn.v_cache)
         out, k_cache, v_cache = self.attn.span_decode(x, layer.input_layernorm, cos, sin, md, mask, slots, span,
                                                       caches)
         x = x + out

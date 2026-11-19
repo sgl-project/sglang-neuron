@@ -6,8 +6,8 @@ nkilib's ``attention_block_tkg`` runs the input RMSNorm, the QKV projection, RoP
 sinks) for heads of config.KV_HEAD_DIM channels; above 128 channels it takes neither the output projection nor the
 cache write (``W_out=None``, ``update_cache=False``), so this kernel does both after it:
 
-- the K/V write (after the attention, whose mask never reads the new token's slot from the cache, so the write cannot
-  change what it attends to): the new token's K (``[d, B, 1]``, the kernel's layout for one KV head) is read
+- the K/V write (after the attention, whose mask never reads the new tokens' slots from the cache, so the write cannot
+  change what they attend to; a span's tokens see each other through the kernel's active K/V): the new token's K (``[d, B, 1]``, the kernel's layout for one KV head) is read
   token-major through a transposing access pattern, its V (``[B, 1, 1, d]``) as it is, and both rows go to each
   token's slot by an indirect DMA (with one KV head per rank a slot is its row of the flattened ``[pages x page, d]``
   cache); the two programs take V and K. A padding row's slot is 0, SGLang's reserved page;
@@ -46,13 +46,18 @@ def _attention(X, X_hidden_dim_actual, rmsnorm_X_eps, rmsnorm_X_gamma, W_qkv, co
 
 @nki.jit
 def attn_half(X, rmsnorm_X_gamma, W_qkv, cos, sin, active_blocks_table, K_cache, V_cache, attention_mask, sink,
-              slots, W_o, k_scale=None, v_scale=None, rmsnorm_X_eps=1e-6, softmax_scale=1.0, v_head_dim=128):
-    """X [B, 1, H] bf16; W_qkv [H, (heads + 2) x d]; cos / sin [d / 2, B, 1]; the caches [pages, 1, page, d]; the mask
-    in the kernel's layout; sink [heads, 1] fp32 or None; slots [B, 1] int32; W_o [heads x v_head_dim, H] bf16.
-    Over an FP8 cache (``k_scale`` / ``v_scale`` [1, 1] fp32) the attention quantizes the new token's K/V, which are
-    written as they come; the caller folds 1 / k_scale into ``softmax_scale`` and 1 / v_scale into ``W_o``.
-    Returns (partial [B, H] bf16, K_cache, V_cache)."""
-    B, _, H = X.shape
+              slots, W_o, k_scale=None, v_scale=None, rmsnorm_X_eps=1e-6, softmax_scale=1.0, v_head_dim=128,
+              out_in_sbuf=False):
+    """X [B, S, H] bf16 (S tokens a row: 1, or a NEURON_MTP span, which attend each other causally under the span
+    mask); W_qkv [H, (heads + 2) x d]; cos / sin [d / 2, B, S]; the caches [pages, 1, page, d]; the mask in the
+    kernel's layout; sink [heads, 1] fp32 or None; slots [B x S, 1] int32 (row-major: token s of row b at b x S + s);
+    W_o [heads x v_head_dim, H] bf16. Over an FP8 cache (``k_scale`` / ``v_scale`` [1, 1] fp32) the attention
+    quantizes the new tokens' K/V, which are written as they come; the caller folds 1 / k_scale into
+    ``softmax_scale`` and 1 / v_scale into ``W_o``. Returns (partial [B x S, H] bf16, K_cache, V_cache); with
+    ``out_in_sbuf`` (inside another kernel: layer.py) the partial is this program's half of H in SBUF instead, rows
+    ``0 .. B x S - 1`` of a [128, H / programs] tile, row-major."""
+    B, S, H = X.shape
+    R = B * S
     pages, _, page, d = K_cache.shape
     heads = W_o.shape[0] // v_head_dim
     n_prg = nl.num_programs(axes=0)
@@ -69,31 +74,36 @@ def attn_half(X, rmsnorm_X_gamma, W_qkv, cos, sin, active_blocks_table, K_cache,
         nisa.core_barrier(data=k_new, cores=(0, 1))
         nisa.core_barrier(data=v_new, cores=(0, 1))
 
-    # ---- the new token's K / V into its slot: program 0 writes V, program 1 K (both on one program at LNC1) ----
+    # ---- the new tokens' K / V into their slots: program 0 writes V, program 1 K (both on one program at LNC1) ----
+    # K [d, B, S]: token r = b x S + s, channel j at j x R + r; V [B, 1, S, d]: token r at r x d
     idx = nl.ndarray((P, 1), dtype=slots.dtype, buffer=nl.sbuf)
-    nisa.dma_copy(dst=idx[0:B, 0:1], src=slots.ap(pattern=[[1, B], [1, 1]], offset=0))
+    nisa.dma_copy(dst=idx[0:R, 0:1], src=slots.ap(pattern=[[1, R], [1, 1]], offset=0))
     k_flat = K_cache.reshape((pages * page, d))
     v_flat = V_cache.reshape((pages * page, d))
     # every buffer before the branches on the program, so it sits at one address in both programs' traces
     v_rows = nl.ndarray((P, d), dtype=V_cache.dtype, buffer=nl.sbuf)
     k_rows = nl.ndarray((P, d), dtype=K_cache.dtype, buffer=nl.sbuf)
     if n_prg == 1 or pid == 0:
-        nisa.dma_copy(dst=v_rows[0:B, 0:d], src=v_new.ap(pattern=[[d, B], [1, d]], offset=0))
-        nisa.dma_copy(dst=v_flat.ap(pattern=[[d, B], [1, d]], offset=0, vector_offset=idx[0:B, 0:1], indirect_dim=0),
-                      src=v_rows[0:B, 0:d], oob_mode=oob_mode.skip)
+        nisa.dma_copy(dst=v_rows[0:R, 0:d], src=v_new.ap(pattern=[[d, R], [1, d]], offset=0))
+        nisa.dma_copy(dst=v_flat.ap(pattern=[[d, R], [1, d]], offset=0, vector_offset=idx[0:R, 0:1], indirect_dim=0),
+                      src=v_rows[0:R, 0:d], oob_mode=oob_mode.skip)
     if n_prg == 1 or pid == 1:
-        # K [d, B, 1]: element (b, j) at j * B + b
-        nisa.dma_copy(dst=k_rows[0:B, 0:d], src=k_new.ap(pattern=[[1, B], [B, d]], offset=0))
-        nisa.dma_copy(dst=k_flat.ap(pattern=[[d, B], [1, d]], offset=0, vector_offset=idx[0:B, 0:1], indirect_dim=0),
-                      src=k_rows[0:B, 0:d], oob_mode=oob_mode.skip)
+        nisa.dma_copy(dst=k_rows[0:R, 0:d], src=k_new.ap(pattern=[[1, R], [R, d]], offset=0))
+        nisa.dma_copy(dst=k_flat.ap(pattern=[[d, R], [1, d]], offset=0, vector_offset=idx[0:R, 0:1], indirect_dim=0),
+                      src=k_rows[0:R, 0:d], oob_mode=oob_mode.skip)
 
     # ---- the output projection of this program's half of H ----
-    # heads_out [B, heads, d, 1]: head h's channel j of row b at (b * heads + h) * d + j
+    # heads_out [B, heads, d, S]: head h's channel j of token s of row b at ((b x heads + h) x d + j) x S + s; lhsT's
+    # columns are the tokens, row-major (column b x S + s)
     lhsT = nl.ndarray((P, heads, P), dtype=heads_out.dtype, buffer=nl.sbuf)
     for h in range(heads):
-        nisa.dma_copy(dst=lhsT[0:v_head_dim, h, 0:B],
-                      src=heads_out.ap(pattern=[[1, v_head_dim], [heads * d, B]], offset=h * d))
-    out = nl.ndarray((B, H), dtype=X.dtype, buffer=nl.shared_hbm, name="attn_half_out")
+        if S == 1:
+            nisa.dma_copy(dst=lhsT[0:v_head_dim, h, 0:B],
+                          src=heads_out.ap(pattern=[[1, v_head_dim], [heads * d, B]], offset=h * d))
+        else:
+            for b in range(B):
+                nisa.dma_copy(dst=lhsT[0:v_head_dim, h, b * S:(b + 1) * S],
+                              src=heads_out.ap(pattern=[[S, v_head_dim], [1, S]], offset=(b * heads + h) * d * S))
     o_sb = nl.ndarray((P, HH), dtype=X.dtype, buffer=nl.sbuf)
     for c in range(HH // COLS):
         ps = nl.ndarray((P, COLS), dtype=nl.float32, buffer=nl.psum)
@@ -101,7 +111,10 @@ def attn_half(X, rmsnorm_X_gamma, W_qkv, cos, sin, active_blocks_table, K_cache,
             w = nl.ndarray((P, COLS), dtype=W_o.dtype, buffer=nl.sbuf)
             nisa.dma_copy(dst=w[0:v_head_dim, 0:COLS],
                           src=W_o.ap(pattern=[[H, v_head_dim], [1, COLS]], offset=h * v_head_dim * H + h0 + c * COLS))
-            nisa.nc_matmul(dst=ps[0:B, 0:COLS], stationary=lhsT[0:v_head_dim, h, 0:B], moving=w[0:v_head_dim, 0:COLS])
-        nisa.tensor_copy(dst=o_sb[0:B, c * COLS:(c + 1) * COLS], src=ps[0:B, 0:COLS])
-    nisa.dma_copy(dst=out.ap(pattern=[[H, B], [1, HH]], offset=h0), src=o_sb[0:B, 0:HH])
+            nisa.nc_matmul(dst=ps[0:R, 0:COLS], stationary=lhsT[0:v_head_dim, h, 0:R], moving=w[0:v_head_dim, 0:COLS])
+        nisa.tensor_copy(dst=o_sb[0:R, c * COLS:(c + 1) * COLS], src=ps[0:R, 0:COLS])
+    if out_in_sbuf:
+        return o_sb, K_cache, V_cache
+    out = nl.ndarray((R, H), dtype=X.dtype, buffer=nl.shared_hbm, name="attn_half_out")
+    nisa.dma_copy(dst=out.ap(pattern=[[H, R], [1, HH]], offset=h0), src=o_sb[0:R, 0:HH])
     return out, K_cache, V_cache

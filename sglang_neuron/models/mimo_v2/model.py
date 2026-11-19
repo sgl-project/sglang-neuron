@@ -34,15 +34,16 @@ from sglang_neuron.utils.weight_loader import SafetensorsWeightLoader, set_weigh
 
 # the scale key of a 128 x 128 FP8 weight; MXFP4 experts carry weight_scale (expert_scale_suffix)
 FP8_SCALE = "weight_scale_inv"
-# each MoE layer's decode in one kernel with its all-reduces inside (kernels/layer.py): 1 or 0 (the default, until it is
-# validated on hardware) for the attention and MoE halves as separate kernels with the all-reduces in the graph
+# each decoder layer's decode in one kernel with its all-reduces inside (kernels/layer.py), the target's and the MTP
+# draft layers': 1 (the default: no XLA op between layers, the residual and collectives in SBUF, measured equal or faster
+# than the half kernels) or 0 for the attention and MoE halves as separate kernels with the all-reduces in the graph
 LAYER_KERNEL_ENV = "SGLANG_NEURON_MIMO_DECODE_LAYER_KERNEL"
 
 
 def layer_kernel_enabled() -> bool:
     import os
 
-    value = os.environ.get(LAYER_KERNEL_ENV, "0").strip()
+    value = os.environ.get(LAYER_KERNEL_ENV, "1").strip()
     if value not in ("0", "1"):
         raise ValueError(f"{LAYER_KERNEL_ENV}={value!r}: set 1 (each MoE layer's decode in one kernel) or 0")
     return value == "1"
@@ -268,6 +269,7 @@ class MiMoV2Graph(nn.Module):
         """One MTP step (mtp_step.py): ``{"token_ids": [width, SPEC]}`` int32, each row's kept run, -1 after it, at the
         decode width. Every layer runs the rows' spans (attention.MiMoAttention.span_decode), each kind over its own
         span mask and slots, built once."""
+        from sglang_neuron.backend.stack import resolve_full_mesh
         from sglang_neuron.models.mimo_v2 import mtp_step
         from sglang_neuron.models.mimo_v2.attention import span_mask, span_slots
 
@@ -284,7 +286,25 @@ class MiMoV2Graph(nn.Module):
         tables = self._tables(positions.reshape(-1))
         hidden = self.embed_tokens(span["tokens"].reshape(-1).to(torch.int32), scatter_tokens=False, rank=rank)
         ebase = self._expert_base()
+        # the one-kernel layer (kernels/layer.py) over the spans: its inputs in the kernel's layouts, built once a step
+        kernel_step = None
+        if layer_kernel_enabled() and all(self._layer_kernel_serves(layer) for layer in self.decoder_layers()):
+            layout = lambda t: t.reshape(width, spec, -1).permute(2, 0, 1).contiguous()  # noqa: E731
+            kernel_step = {"mesh": tuple(tuple(int(r) for r in cell) for cell in
+                                         resolve_full_mesh(self.layers[0].self_attn.attn_tp_group)),
+                           "ebase": ebase,
+                           "kv_scales": self.layers[0].self_attn._scale_tensors(hidden.device)}
+            for k, (cos, sin) in tables.items():
+                kernel_step[("cos", k)], kernel_step[("sin", k)] = layout(cos), layout(sin)
+                kernel_step[("slots", k)] = kv_slots[k].reshape(-1, 1).to(torch.int32)
         for layer in self.layers:
+            if kernel_step is not None:
+                k = layer.is_swa
+                hidden = self._layer_call(layer, hidden.view(width, spec, -1),
+                                          attn_metadata[layer.self_attn.name]["block_table_tensor"], masks[k],
+                                          kernel_step[("cos", k)], kernel_step[("sin", k)], kernel_step[("slots", k)],
+                                          kernel_step)
+                continue
             cos, sin = tables[layer.is_swa]
             attn = layer.self_attn
             out, _, _ = attn.span_decode(hidden, layer.input_layernorm, cos, sin, attn_metadata[attn.name],
@@ -298,15 +318,17 @@ class MiMoV2Graph(nn.Module):
         sampled = self._span_sample(self.lm_head(self.norm(hidden)), positions, params, width, spec)
         out, kept = mtp_step.accept(span["tokens"], sampled, span)
         bonus = sampled.gather(1, kept.reshape(-1, 1))
+        kernel = None if kernel_step is None else (kernel_step[("cos", True)], kernel_step[("sin", True)],
+                                                   kernel_step[("slots", True)], kernel_step)
         drafts = self._mtp_drafts(span, sampled, hidden, kept, md[True], masks[True], kv_slots[True], tables[True],
-                                  rank)
+                                  rank, kernel)
         self.mtp_carry.index_copy_(0, slots, torch.cat([bonus, drafts], dim=1).to(torch.int32))
         self.mtp_len.index_copy_(0, slots, (span["base"] + kept + 1).to(torch.int32))
         if self.mtp_width > width:
             out = torch.cat([out, torch.full((self.mtp_width - width, spec), -1, dtype=out.dtype, device=out.device)])
         return {"token_ids": out.to(torch.int32)}
 
-    def _mtp_drafts(self, span, sampled, hidden, kept, md, mask, kv_slots, table, rank):
+    def _mtp_drafts(self, span, sampled, hidden, kept, md, mask, kv_slots, table, rank, kernel=None):
         """[W, NUM_STEPS] the MTP layer's drafts after each row's kept run (mtp.py): its pass over the span (the token
         after each position is the target's sample there) writes its KV and gives the first draft at the row's last
         kept position; each further draft is a one-token pass at the next position, from the previous draft and the
@@ -322,7 +344,8 @@ class MiMoV2Graph(nn.Module):
             # one draft a layer, each layer's tokens one position further ahead (mtp.rotate)
             tokens, drafts = sampled, []
             for k, layer in enumerate(self.mtp):
-                state, _ = layer.decode(self, tokens.reshape(-1), hidden, *table, md, mask, kv_slots, spec, None, rank)
+                state, _ = layer.decode(self, tokens.reshape(-1), hidden, *table, md, mask, kv_slots, spec, None, rank,
+                                        kernel)
                 drafts.append(layer.draft(self, at_kept(state)))
                 if k + 1 < len(self.mtp):
                     tokens = mtp.rotate(tokens, kept, drafts[-1])
@@ -354,8 +377,8 @@ class MiMoV2Graph(nn.Module):
     def _layer_kernel_serves(layer) -> bool:
         """Whether ``layer``'s decode runs as one kernel: a dense layer, or an MoE layer whose experts the MoE half
         kernel takes (moe.MiMoV2MoE.fused)."""
-        if layer.self_attn.fp8_kv or layer.self_attn.dcp_size > 1:
-            return False  # its attention half takes the bf16 cache, without DCP
+        if layer.self_attn.dcp_size > 1:
+            return False  # its attention half attends this rank's own KV, without DCP
         return isinstance(layer.mlp, DenseMLP) or getattr(layer.mlp, "fused", False)
 
     def _step_inputs(self, tables, attn_metadata, layer) -> dict:
@@ -375,20 +398,29 @@ class MiMoV2Graph(nn.Module):
                 slots = attn_metadata[other.self_attn.name]["slot_mapping"]
                 step[key] = slots.view(slots.shape[0], 1).to(torch.int32)
         step["ebase"] = self._expert_base()
+        step["kv_scales"] = layer.self_attn._scale_tensors(layer.self_attn.qkv_weight.device)
         return step
 
     def _layer_kernel(self, layer, hidden, md, inputs, step):
         """One layer's decode in one kernel (kernels/layer.py), its all-reduces inside."""
+        rows = hidden.shape[0]
+        return self._layer_call(layer, hidden.view(rows, 1, -1), md["block_table_tensor"], inputs.mask,
+                                step[("cos", layer.is_swa)], step[("sin", layer.is_swa)],
+                                step[("slots", layer.is_swa)], step)
+
+    def _layer_call(self, layer, x, table, mask, cos, sin, slots, step):
+        """kernels/layer.py's moe_layer / dense_layer over ``x`` [B, S, H] (S tokens a row), cos / sin [d / 2, B, S],
+        slots [B x S, 1] int32. Returns the layer's output [B x S, H]."""
         from sglang_neuron.backend.stack import wrap_nki
         from sglang_neuron.models.mimo_v2.kernels.layer import dense_layer, moe_layer
         from sglang_neuron.utils.hardware_config import get_logical_nc_config
 
         attn, mlp = layer.self_attn, layer.mlp
-        rows = hidden.shape[0]
-        attn_args = (hidden.view(rows, 1, -1), layer.input_norm_f32, attn.qkv_weight, step[("cos", layer.is_swa)],
-                     step[("sin", layer.is_swa)], md["block_table_tensor"], attn.k_cache, attn.v_cache, inputs.mask,
-                     attn._sink_column(), step[("slots", layer.is_swa)], attn.o_weight)
-        common = dict(eps=layer.input_layernorm.eps, softmax_scale=attn.scaling, v_head_dim=attn.v_head_dim)
+        attn_args = (x, layer.input_norm_f32, attn.qkv_weight, cos, sin, table, attn.k_cache, attn.v_cache, mask,
+                     attn._sink_column(), slots, attn._kernel_o_weight())
+        k_scale, v_scale = step.get("kv_scales", (None, None))
+        common = dict(k_scale=k_scale, v_scale=v_scale, eps=layer.input_layernorm.eps,
+                      softmax_scale=attn.scaling / attn.kv_scale, v_head_dim=attn.v_head_dim)
         gamma = layer.post_attention_layernorm.weight.view(1, -1)
         if isinstance(mlp, DenseMLP):
             return wrap_nki(dense_layer)[get_logical_nc_config()](

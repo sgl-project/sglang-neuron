@@ -71,8 +71,8 @@ Three forms, chosen by environment (the default is the fastest measured):
 | Form | Per layer | Switch |
 | --- | --- | --- |
 | per-layer graph | nkilib `attention_block_tkg` (`W_out=None, update_cache=False` above 128 channels), the K/V scatter, the output projection, the router and nkilib's `moe_tkg` in the graph | `SGLANG_NEURON_MIMO_DECODE_ATTN_FUSED=0 SGLANG_NEURON_MIMO_DECODE_MOE_FUSED=0` |
-| **two half kernels** (default) | `kernels/attn_half.py`: the attention block, the K/V write and the output projection in one call; `kernels/moe_half.py`: the RMSNorm, the noaux router, the 4 local FP8 experts in one call; the two all-reduces in the graph | the default |
-| one kernel a layer | `kernels/layer.py`: both halves and both all-reduces in one call, no XLA op in a layer (the dense layer 0 with nkilib's `mlp`) | `SGLANG_NEURON_MIMO_DECODE_LAYER_KERNEL=1` |
+| two half kernels | `kernels/attn_half.py`: the attention block, the K/V write and the output projection in one call; `kernels/moe_half.py`: the RMSNorm, the noaux router, the 4 local FP8 experts in one call; the two all-reduces in the graph | `SGLANG_NEURON_MIMO_DECODE_LAYER_KERNEL=0` |
+| **one kernel a layer** (default) | `kernels/layer.py`: both halves and both all-reduces in one call, no XLA op in a layer or between layers; the MoE layers keep the residual stream and both all-reduces in SBUF (SBUF-to-SBUF all-reduce, the program halves crossed by sendrecv); the dense layer 0 and the 3 MTP draft layers with nkilib's `mlp`; spans (NEURON_MTP) and the FP8 cache | the default |
 
 Measured on a trn2.48xlarge, TP64 / EP64, FP8 experts, `--context-length 8192 --chunked-prefill-size 2048
 --max-running-requests 8`, 1000 tokens in and 256 out (`examples/mimo_v2/bench_decode.py`, medians):
@@ -83,7 +83,19 @@ Measured on a trn2.48xlarge, TP64 / EP64, FP8 experts, `--context-length 8192 --
 | **two half kernels** | **19.45 ms** | **21.32 ms** | **347.8** |
 | one kernel a layer | 20.55 ms | 22.51 ms | 330.7 |
 
-The one-kernel layer is correct (below) but about 1.1 ms a step slower than the half kernels with the graph's
+With NEURON_MTP and the FP8 cache, `--context-length 8192 --max-running-requests 8`, 1000/4000-token prompts, a
+decode step (TPOT x accept length) and GSM8K/1319:
+
+| Form | step c=1 | step c=4 | step c=8 | GSM8K |
+| --- | --- | --- | --- | --- |
+| two half kernels, the all-reduces in the graph | 23.0 ms | 26.2 ms | 30.6 ms | 91.6% |
+| one kernel a layer, the all-reduces through HBM | 24.0 ms | 26.2 ms | 31.1 ms | 90.8% |
+| **one kernel a layer, residual and all-reduces in SBUF** | **23.2 ms** | **26.6 ms** | **29.6 ms** | **91.4%** |
+
+`tools/mimo_v2/bench_cc.py` times the all-reduce alone, 96 of [32, 4096] bf16 over 64 ranks: 37.5 us each in the
+graph, 45.1 us through HBM with the core barriers, 36.1 us SBUF to SBUF.
+
+The table below is the older bf16-cache, no-MTP measurement. The one-kernel layer is correct (below) but about 1.1 ms a step slower than the half kernels with the graph's
 all-reduces: its 96 in-kernel all-reduces of 64 ranks, each with its fences, cost more than the graph's. Making them
 cheaper (SBUF-to-SBUF all-reduce and residual, as nkilib's `transformer_tkg` `sbuf_residual_and_cc`) and running every
 layer in one call are the next steps ([the design](../design/mimo-v2-decode-megakernel.md)).
@@ -202,7 +214,6 @@ declares `KVLayout(fp8_k_packed=False)` because nkilib's decode attention reads 
   (`attention.pack_prior`: a sliding layer its window's few pages, a full layer its table), by an FP8 gather and
   transpose (a uint8 view of the cache fails the compiler's type check: `Type mismatch uint8 vs float8_e4m3`)
   (`tools/mimo_v2/check_prefill_fp8.py`: equal to the bf16 kernel over the dequantized cache).
-- The one-kernel layer (`SGLANG_NEURON_MIMO_DECODE_LAYER_KERNEL=1`) keeps the bf16 cache.
 
 Measured at 8K with `MTP=1` (the same server as the MTP table, bf16 cache in brackets): GSM8K 0.914 (0.895), decode TPOT
 6.54 / 8.84 / 11.48 ms at c = 1 / 8 / 16 (6.67 / 9.18 / 11.53); the pool holds 2.79M full-layer tokens a rank (1.53M).

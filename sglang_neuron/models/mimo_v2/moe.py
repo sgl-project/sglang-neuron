@@ -1,12 +1,12 @@
 # SPDX-License-Identifier: Apache-2.0
 """MiMo-V2's MoE block: Qwen3-MoE's expert-parallel experts (models/qwen3_moe/moe.py) behind a sigmoid router with a
-selection-only bias, which is Hy3's (models/hy_v3/moe.hy3_route), and no shared expert.
+selection-only bias (``route``, the same rule as Hy3's, kept as MiMo's own copy), and no shared expert.
 
 The HF gate (``MiMoV2MoEGate``, noaux_tc with one group) is, in fp32: scores = sigmoid(x W^T); the top-k experts of
 scores + ``e_score_correction_bias``; their weights the chosen scores renormalized (``norm_topk_prob``) and times
 ``routed_scaling_factor``. With ``n_group = topk_group = 1`` its group step keeps every expert, so it is exactly
-hy3_route. At EP64 a rank holds 4 of the 256 experts; the decode runs nkilib's bf16 moe_tkg over them, the prefill
-Hy3's hybrid I-sharded moe_cte (models/hy_v3/experts_cte.py), which skips the blocks the routing leaves empty.
+route. At EP64 a rank holds 4 of the 256 experts; the decode runs nkilib's bf16 moe_tkg over them, the prefill
+nkilib's hybrid I-sharded moe_cte (experts_cte.py, MiMo's own copy), which skips the blocks the routing leaves empty.
 
 The checkpoint's experts (MXFP4 on V2.6, 128 x 128 FP8 blocks on V2.5) load as Trn2 FP8 with a power-of-two scale per
 output row, exactly for MXFP4 (experts_fp8.py), or with ``SGLANG_NEURON_MIMO_EXPERTS=bf16`` dequantized to bf16
@@ -15,7 +15,6 @@ output row, exactly for MXFP4 (experts_fp8.py), or with ``SGLANG_NEURON_MIMO_EXP
 import torch
 from torch import nn
 
-from sglang_neuron.models.hy_v3.moe import hy3_route
 from sglang_neuron.models.mimo_v2 import experts_fp8, weights
 from sglang_neuron.models.qwen3_moe.moe import SparseMoE
 from sglang_neuron.ops.moe.moe_tkg_bf16 import moe_experts
@@ -35,6 +34,20 @@ def fused_enabled() -> bool:
         raise ValueError(f"{FUSED_ENV}={value!r}: set 1 (the decode MoE half in one kernel) or 0")
     return value == "1"
 
+
+
+def route(x: torch.Tensor, router_weight: torch.Tensor, expert_bias: torch.Tensor, top_k: int, route_norm: bool,
+          scaling: float) -> tuple:
+    """Dense [T, E] fp32 affinities (zero off the chosen experts) and the [T, K] chosen experts: scores =
+    sigmoid(x W_r^T) in fp32, the top k chosen on scores + expert_bias (the bias selects only), their weights the
+    chosen scores, renormalized to sum to one (``route_norm``) and scaled by ``scaling``."""
+    scores = torch.sigmoid(x.float() @ router_weight.float().t())
+    _, experts = torch.topk(scores + expert_bias, top_k, dim=-1)
+    chosen = scores.gather(1, experts)
+    if route_norm:
+        chosen = chosen / (chosen.sum(dim=-1, keepdim=True) + 1e-20)
+    affinities = torch.zeros_like(scores).scatter(1, experts, chosen * scaling)
+    return affinities, experts
 
 class MiMoV2MoE(SparseMoE):
     # under DP attention (a PD decode) the experts span the replicas: each step gathers the DP groups' tokens, runs this
@@ -78,12 +91,12 @@ class MiMoV2MoE(SparseMoE):
 
     def forward(self, x, real=None):
         x = self._gather(x)
-        affinities, experts = hy3_route(x, self.router_weight, self.expert_bias, self.top_k, self.norm_topk_prob,
+        affinities, experts = route(x, self.router_weight, self.expert_bias, self.top_k, self.norm_topk_prob,
                                         self.scaling)
         # the kernels take fp32 affinities; rounded through bf16 as the HF model's bf16 expert sum weighs them
         affinities = affinities.to(x.dtype).float()
         if self.prefill:
-            from sglang_neuron.models.hy_v3 import experts_cte
+            from sglang_neuron.models.mimo_v2 import experts_cte
 
             local = (torch.arange(self.num_local_experts, device=x.device, dtype=torch.int32)
                      + self._ep_rank_id().reshape(1) * self.num_local_experts)

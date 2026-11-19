@@ -12,7 +12,7 @@ The experts then hold half the bf16 bytes (4.7 instead of 9.5 GB a rank at EP64)
 activations, FP8 weights, the per-row scale applied after each matmul):
 
 - decode: nkilib's moe_tkg in its ROW mode (gate/up scales [E, 2, I], down scales [E, H]), every local expert;
-- prefill: Hy3's hybrid I-sharded moe_cte copy that feeds FP8 tiles to the matmul (models/hy_v3/experts_cte.py,
+- prefill: the hybrid I-sharded moe_cte copy that feeds FP8 tiles to the matmul (experts_cte.py,
   kernels/moe_cte_fp8w.py), which takes per-channel scales.
 
 The tensors are ``float8_e4m3fn`` holding values of at most 240, which the graphs compile as Trn2's e4m3 (the same
@@ -126,15 +126,26 @@ def set_checkpoint(path: str) -> None:
 
 
 def _sources_digest() -> str:
-    """This module's and weights.py's sources: the conversion the cached tensors came from."""
+    """This module's and weights.py's code (their syntax trees, docstrings and comments left out, so an edit of the
+    prose keeps the cache): the conversion the cached tensors came from."""
+    import ast
     import hashlib
 
     from sglang_neuron.models.mimo_v2 import weights as weights_module
 
+    def code_only(source: str) -> str:
+        tree = ast.parse(source)
+        for node in ast.walk(tree):
+            body = getattr(node, "body", None)
+            if isinstance(body, list) and body and isinstance(body[0], ast.Expr) and isinstance(
+                    getattr(body[0], "value", None), ast.Constant) and isinstance(body[0].value.value, str):
+                node.body = body[1:] or [ast.Pass()]
+        return ast.dump(tree, include_attributes=False)
+
     digest = hashlib.sha256()
     for module_file in (__file__, weights_module.__file__):
-        with open(module_file, "rb") as f:
-            digest.update(f.read())
+        with open(module_file) as f:
+            digest.update(code_only(f.read()).encode())
     return digest.hexdigest()[:16]
 
 
