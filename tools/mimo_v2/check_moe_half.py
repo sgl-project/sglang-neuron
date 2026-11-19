@@ -2,7 +2,7 @@
 # SPDX-License-Identifier: Apache-2.0
 """Hardware check of MiMo-V2's decode MoE half kernel (models/mimo_v2/kernels/moe_half.py) on one NeuronCore, against
 a torch reference of the model's served form: torch's RMSNorm (models/transformer/model.RMSNorm), the noaux router
-(models/hy_v3/moe.hy3_route, the affinities rounded through bf16 as moe.MiMoV2MoE.forward) and the local experts on
+(models/mimo_v2/moe.route, the affinities rounded through bf16 as moe.MiMoV2MoE.forward) and the local experts on
 their FP8 weights and power-of-two per-row scales (models/mimo_v2/experts_fp8.py), in fp32.
 
 Seeded random weights at MiMo-V2.6-Flash's per-rank shapes at EP64 (H 4096, 4 local experts of 256, I 2048); the

@@ -82,7 +82,8 @@ def _residual(x2d, add2d, B: int, H: int, name: str):
 @nki.jit
 def moe_layer(X, attn_gamma, W_qkv, cos, sin, active_blocks_table, K_cache, V_cache, attention_mask, sink, slots,
               W_o, moe_gamma, router_wT, expert_bias, ebase, gate_up_w, down_w, gate_up_scale, down_scale, mesh,
-              k_scale=None, v_scale=None, eps=1e-6, softmax_scale=1.0, v_head_dim=128, route_scale=1.0, top_k=8):
+              k_scale=None, v_scale=None, eps=1e-6, softmax_scale=1.0, v_head_dim=128, route_scale=1.0, top_k=8,
+              fp8_act=True):
     """X [B, S, H] bf16, the layer's input (S tokens a row, a NEURON_MTP span or 1); the attention half's inputs as
     attn_half's (``k_scale`` / ``v_scale`` over an FP8 cache), the MoE half's as moe_half's. Returns the layer's
     output [B x S, H] bf16. The caches are written in place and not returned: returned beside the output, the
@@ -108,7 +109,8 @@ def moe_layer(X, attn_gamma, W_qkv, cos, sin, active_blocks_table, K_cache, V_ca
     h = nl.ndarray((P, H), dtype=X.dtype, buffer=nl.sbuf)
     nisa.tensor_tensor(dst=h[0:R, 0:H], data1=x_sb[0:R, 0:H], data2=attn[0:R, 0:H], op=nl.add)
     moe = moe_half(X.reshape((R, H)), moe_gamma, router_wT, expert_bias, ebase, gate_up_w, down_w, gate_up_scale,
-                   down_scale, eps=eps, route_scale=route_scale, top_k=top_k, hidden_sb=h, out_in_sbuf=True)
+                   down_scale, eps=eps, route_scale=route_scale, top_k=top_k, hidden_sb=h, out_in_sbuf=True,
+                   fp8_act=fp8_act)
     moe = _sb_all_reduce(moe, R, H, rg, pid, n_prg, 3)
     o_sb = nl.ndarray((P, H), dtype=X.dtype, buffer=nl.sbuf)
     nisa.tensor_tensor(dst=o_sb[0:R, 0:H], data1=h[0:R, 0:H], data2=moe[0:R, 0:H], op=nl.add)

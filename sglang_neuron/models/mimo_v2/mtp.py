@@ -104,6 +104,11 @@ class MiMoMtp(nn.Module):
         rows = self.eh_proj.out_features_per_rank
         set_weight_loader(self.eh_proj.weight, SafetensorsWeightLoader(
             transform=lambda slices, rank: slices[0][rank * rows:(rank + 1) * rows]))
+        # the same rows transposed, [2H, H / ranks]: the columns the decode's projection kernel streams
+        # (kernels/mtp_head.mtp_project)
+        self.eh_wT = nn.Parameter(torch.empty(2 * hidden, rows, dtype=DTYPE), requires_grad=False)
+        set_weight_loader(self.eh_wT, SafetensorsWeightLoader(
+            transform=lambda slices, rank: slices[0][rank * rows:(rank + 1) * rows].t().contiguous()))
         self.layer = MiMoDecoderLayer(config, self.layer_idx,
                                       DenseMLP(hidden, config.intermediate_size, quantized), kind=config.swa)
 
@@ -118,6 +123,7 @@ class MiMoMtp(nn.Module):
             f"{dst}.enorm.weight": f"{src}.enorm.weight", f"{dst}.hnorm.weight": f"{src}.hnorm.weight",
             f"{dst}.final_layernorm.weight": f"{src}.final_layernorm.weight",
             f"{dst}.eh_proj.weight": f"{src}.eh_proj.weight",
+            f"{dst}.eh_wT": f"{src}.eh_proj.weight",
             f"{dst}.layer.self_attn.qkv_weight": fp8([f"{attn}.qkv_proj.weight"]),
             f"{dst}.layer.self_attn.o_weight": f"{attn}.o_proj.weight",
             f"{dst}.layer.input_layernorm.weight": f"{src}.input_layernorm.weight",
@@ -134,6 +140,22 @@ class MiMoMtp(nn.Module):
         """The layer's input from the next tokens' embeddings and the states before a final norm, [T, H]."""
         return self.eh_proj(torch.cat([self.enorm(embeds), self.hnorm(target.to(embeds.dtype))], dim=-1))
 
+    def project_ids(self, graph, next_ids: torch.Tensor, prev: torch.Tensor) -> torch.Tensor:
+        """``project`` of the embeddings of ``next_ids`` [T]: at most 128 rows in one kernel (kernels/mtp_head.py: the
+        embedding, both norms, eh_proj and its all-gather), else in torch."""
+        from sglang_neuron.models.mimo_v2.model import head_kernel_enabled
+
+        if not head_kernel_enabled() or next_ids.shape[0] > 128:
+            return self.project(graph.embed(next_ids), prev)
+        from sglang_neuron.backend.stack import wrap_nki
+        from sglang_neuron.models.mimo_v2.kernels.mtp_head import mtp_project
+        from sglang_neuron.utils.hardware_config import get_logical_nc_config
+
+        return wrap_nki(mtp_project)[get_logical_nc_config()](
+            next_ids.reshape(-1, 1).to(torch.int32), prev.to(graph.embed_tokens.weight.dtype),
+            graph.embed_tokens.weight, self.enorm.weight.view(1, -1), self.hnorm.weight.view(1, -1), self.eh_wT,
+            graph.lm_head_tp_group.rank_in_group_tensor, graph._head_mesh(), eps=self.enorm.eps)
+
     def prefill(self, graph, hidden: torch.Tensor, next_ids: torch.Tensor, md: dict, cos, sin, rank) -> torch.Tensor:
         """Write this layer's KV over a prefill chunk from the target's states ``hidden`` [T, H] and the tokens
         ``next_ids`` [T] it reads at each position (``md``: a target sliding layer's metadata); returns its states
@@ -149,7 +171,7 @@ class MiMoMtp(nn.Module):
         written). ``kernel`` (cos, sin, slots and the step's inputs in the one-kernel layer's layouts,
         model.MiMoV2Graph._layer_call) runs the layer as one kernel (kernels/layer.dense_layer)."""
         layer = self.layer
-        x = self.project(graph.embed_tokens(next_ids.to(torch.int32), scatter_tokens=False, rank=rank), prev)
+        x = self.project_ids(graph, next_ids, prev)
         if kernel is not None and caches is None:
             k_cos, k_sin, k_slots, step = kernel
             rows = x.shape[0] // span
@@ -164,4 +186,4 @@ class MiMoMtp(nn.Module):
 
     def draft(self, graph, states: torch.Tensor) -> torch.Tensor:
         """The greedy draft of each of ``states`` [R, H] (before the final norm), int64 [R]."""
-        return graph.greedy_token(graph.lm_head(self.final_layernorm(states))).reshape(-1).to(torch.int64)
+        return graph.greedy(states, self.final_layernorm).to(torch.int64)

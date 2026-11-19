@@ -40,6 +40,32 @@ FP8_SCALE = "weight_scale_inv"
 LAYER_KERNEL_ENV = "SGLANG_NEURON_MIMO_DECODE_LAYER_KERNEL"
 
 
+# the step's embedding and greedy LM head in NKI kernels (kernels/head.py): 1 (the default) or 0 for torch's
+HEAD_KERNEL_ENV = "SGLANG_NEURON_MIMO_HEAD_KERNEL"
+
+
+def head_kernel_enabled() -> bool:
+    import os
+
+    value = os.environ.get(HEAD_KERNEL_ENV, "1").strip()
+    if value not in ("0", "1"):
+        raise ValueError(f"{HEAD_KERNEL_ENV}={value!r}: set 1 (the embedding and greedy LM head as kernels) or 0")
+    return value == "1"
+
+
+# the decode experts' activations in FP8, per token (kernels/moe_half.py fp8_act): 1 (the default) or 0 for bf16
+MOE_W8A8_ENV = "SGLANG_NEURON_MIMO_MOE_W8A8"
+
+
+def moe_w8a8() -> bool:
+    import os
+
+    value = os.environ.get(MOE_W8A8_ENV, "1").strip()
+    if value not in ("0", "1"):
+        raise ValueError(f"{MOE_W8A8_ENV}={value!r}: set 1 (FP8 activations, double-row matmuls) or 0 (bf16)")
+    return value == "1"
+
+
 def layer_kernel_enabled() -> bool:
     import os
 
@@ -132,6 +158,12 @@ class MiMoV2Graph(nn.Module):
         else:
             set_weight_loader(self.lm_head.weight,
                               dense_weights.vocab_rows_loader(self.lm_head.out_features_per_rank, config.hidden_size))
+        # the LM head transposed, [H, vocabulary shard]: the columns the greedy kernel streams (kernels/head.greedy)
+        rows = self.lm_head.out_features_per_rank
+        self.lm_head_T = nn.Parameter(torch.empty(config.hidden_size, rows, dtype=DTYPE), requires_grad=False)
+        rows_loader = dense_weights.vocab_rows_loader(rows, config.hidden_size)
+        set_weight_loader(self.lm_head_T, SafetensorsWeightLoader(
+            transform=lambda slices, rank: rows_loader.transform(slices, rank).t().contiguous()))
         # the runtime's layer contract (models/contract.declared_layer_kinds)
         self.layer_names = [config.layer_name(i) for i in range(config.num_hidden_layers)]
         self.sliding_windows = config.sliding_windows
@@ -177,6 +209,37 @@ class MiMoV2Graph(nn.Module):
         group = self.lm_head_tp_group
         return sampling.greedy_sharded_logits(logits, group, group.rank_in_group_tensor, self.config.vocab_size,
                                               top_logprobs=0)["token_ids"]
+
+    def _head_mesh(self):
+        from sglang_neuron.backend.stack import resolve_full_mesh
+
+        return tuple(tuple(int(r) for r in cell) for cell in resolve_full_mesh(self.lm_head_tp_group))
+
+    def embed(self, ids: torch.Tensor) -> torch.Tensor:
+        """The embeddings [T, H] of ``ids`` [T] (T <= 128): the vocabulary-sharded lookup and its sum over the ranks in
+        one kernel (kernels/head.embed), or the torch embedding with SGLANG_NEURON_MIMO_HEAD_KERNEL=0."""
+        if not head_kernel_enabled() or ids.shape[0] > 128:
+            return self.embed_tokens(ids.to(torch.int32), scatter_tokens=False,
+                                     rank=self.lm_head_tp_group.rank_in_group_tensor)
+        from sglang_neuron.backend.stack import wrap_nki
+        from sglang_neuron.models.mimo_v2.kernels.head import embed
+        from sglang_neuron.utils.hardware_config import get_logical_nc_config
+
+        return wrap_nki(embed)[get_logical_nc_config()](ids.reshape(-1, 1).to(torch.int32), self.embed_tokens.weight,
+                                                        self.lm_head_tp_group.rank_in_group_tensor, self._head_mesh())
+
+    def greedy(self, states: torch.Tensor, norm) -> torch.Tensor:
+        """[T] int32 the greedy token of each of ``states`` [T, H] (T <= 128) before the final ``norm``: the norm, the
+        sharded LM head and the argmax over the ranks in one kernel (kernels/head.greedy)."""
+        if not head_kernel_enabled() or states.shape[0] > 128:
+            return self.greedy_token(self.lm_head(norm(states))).reshape(-1)
+        from sglang_neuron.backend.stack import wrap_nki
+        from sglang_neuron.models.mimo_v2.kernels.head import greedy
+        from sglang_neuron.utils.hardware_config import get_logical_nc_config
+
+        return wrap_nki(greedy)[get_logical_nc_config()](
+            states, norm.weight.view(1, -1), self.lm_head_T, self.lm_head_tp_group.rank_in_group_tensor,
+            self._head_mesh(), eps=norm.eps).reshape(-1)
 
     def _first_layer(self, swa: bool) -> str:
         return next(self.config.layer_name(i) for i, s in enumerate(self.config.swa_layers) if s == swa)
@@ -284,7 +347,7 @@ class MiMoV2Graph(nn.Module):
         masks = {k: span_mask(md[k], prior, positions, window=windows[k], num_heads=heads) for k in md}
         kv_slots = {k: span_slots(md[k], positions, span["valid"], window=windows[k]) for k in md}
         tables = self._tables(positions.reshape(-1))
-        hidden = self.embed_tokens(span["tokens"].reshape(-1).to(torch.int32), scatter_tokens=False, rank=rank)
+        hidden = self.embed(span["tokens"].reshape(-1))
         ebase = self._expert_base()
         # the one-kernel layer (kernels/layer.py) over the spans: its inputs in the kernel's layouts, built once a step
         kernel_step = None
@@ -315,7 +378,13 @@ class MiMoV2Graph(nn.Module):
                 hidden = hidden + layer.mlp.fused_decode(hidden, norm.weight, norm.eps, ebase)
             else:
                 hidden = hidden + layer.mlp(norm(hidden))
-        sampled = self._span_sample(self.lm_head(self.norm(hidden)), positions, params, width, spec)
+        from sglang_neuron import sampling
+
+        if params[0] is None or sampling.sampler_mode() == "greedy":
+            # the greedy target: the final norm, the LM head and the argmax in one kernel (kernels/head.greedy)
+            sampled = self.greedy(hidden, self.norm).reshape(width, spec).to(torch.int64)
+        else:
+            sampled = self._span_sample(self.lm_head(self.norm(hidden)), positions, params, width, spec)
         out, kept = mtp_step.accept(span["tokens"], sampled, span)
         bonus = sampled.gather(1, kept.reshape(-1, 1))
         kernel = None if kernel_step is None else (kernel_step[("cos", True)], kernel_step[("sin", True)],
@@ -428,7 +497,7 @@ class MiMoV2Graph(nn.Module):
         return wrap_nki(moe_layer)[get_logical_nc_config()](
             *attn_args, gamma, mlp.router_wT, mlp.expert_bias.view(1, -1), step["ebase"], mlp.gate_up_weight,
             mlp.down_weight, mlp.gate_up_scale, mlp.down_scale, step["mesh"], route_scale=float(mlp.scaling),
-            top_k=mlp.top_k, **common)
+            top_k=mlp.top_k, fp8_act=moe_w8a8(), **common)
 
     def decoder_layers(self) -> list:
         """The target's decoder layers, then the MTP layers' under NEURON_MTP (the KV pool's layers after them)."""
@@ -448,6 +517,7 @@ class MiMoV2Graph(nn.Module):
         mappings = {"embed_tokens.weight": "model.embed_tokens.weight", "norm.weight": "model.norm.weight"}
         if not self.config.tie_word_embeddings:
             mappings["lm_head.weight"] = "lm_head.weight"
+        mappings["lm_head_T"] = "model.embed_tokens.weight" if self.config.tie_word_embeddings else "lm_head.weight"
         for i, layer in enumerate(self.layers):
             src, dst = f"model.layers.{i}", f"layers.{i}"
             attn = f"{src}.self_attn"
