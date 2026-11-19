@@ -5,7 +5,7 @@ Above 128 channels nkilib takes the attention only: the in-kernel output project
 ``d_head <= 128``, so both wrappers pass ``W_out=None`` and ``update_cache=False``; the kernel returns each head's
 attention output [B, heads, d, S] and the new token's K [d, B, S] and V [B, 1, S, d], which the graph projects and
 scatters itself (attention.MiMoAttention.decode). ``decode_masked`` takes a pre-built mask
-(ops/attention/attention_decode_mask, in the layout qk_swap_layout gives); ``decode_posid`` masks by position. It
+(ops/attention/attention_decode_mask, in the layout attention.qk_swap_layout gives); ``decode_posid`` masks by position. It
 passes no ``max_context_len``: the flash-attention early exit it enables is wrong past an 8K prior
 (sgl-project/sglang-neuron#4)."""
 

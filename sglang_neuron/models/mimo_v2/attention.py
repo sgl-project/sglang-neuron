@@ -498,6 +498,21 @@ class MiMoAttention(nn.Module):
         return heads, k.reshape(rows, KV_HEAD_DIM), v.reshape(rows, KV_HEAD_DIM)
 
 
+def qk_swap_layout(mask: torch.Tensor, *, d_head: int, fp8_kv: bool, fp8_packed: bool, kv_heads: int = 1):
+    """``mask`` [s_prior, bs, q_head, s_active] (gen_attention_decode_mask) in the layout attention_block_tkg takes
+    for it: as it is, or [bs, q_head, s_active, s_prior] where the kernel takes its transposed-score (QK-swap) path for
+    the shape, which nkilib's is_qk_swapped decides (a span of tokens a row, as an MTP verify, can take it)."""
+    from nkilib.core.attention.attention_tkg_utils import is_qk_swapped
+
+    from sglang_neuron.utils.hardware_config import get_logical_nc_config
+
+    s_prior, bs, q_head, s_active = (int(d) for d in mask.shape)
+    swapped = is_qk_swapped(bs=bs, q_head=q_head, d_head=d_head, s_active=s_active, curr_sprior=s_prior,
+                            lnc=get_logical_nc_config(), p_max=128, is_block_kv=True, is_2byte_kv=not fp8_kv,
+                            fp8_packed=fp8_packed, fuse_rope=False, kv_heads=kv_heads)
+    return mask.permute(1, 2, 3, 0).contiguous() if swapped else mask
+
+
 def decode_masks(attn_metadata: dict, positions: torch.Tensor, config: MiMoV2Config, num_heads: int) -> dict:
     """Each layer kind's ``DecodeInputs`` for a decode step (``{"swa": ..., "full": ...}``), built once for all of its
     layers. On a CPU none are needed (the torch path masks by position)."""
@@ -506,7 +521,6 @@ def decode_masks(attn_metadata: dict, positions: torch.Tensor, config: MiMoV2Con
     if not can_run_kernel(positions):
         return {"swa": DecodeInputs(positions=positions), "full": DecodeInputs(positions=positions)}
     from sglang_neuron.models.gpt_oss.attention_masks import decode_attention_masks
-    from sglang_neuron.ops.attention.attention_decode_mask import qk_swap_layout
 
     posid = full_decode_mode() == "posid" and full_layer is not None
     masked_full = None if posid else full_layer
@@ -538,7 +552,7 @@ def span_mask(md: dict, prior_end: torch.Tensor, positions: torch.Tensor, *, win
     """A layer kind's decode mask in the kernel's layout for ``positions`` [B, S] (S tokens a row, which see each
     other causally), whose prior ends (exclusive) at ``prior_end`` [B, S]: the full layers' over the row's whole
     table, the sliding layers' over the trimmed one (``swa_kv_pos_offset``), from each token's own window start."""
-    from sglang_neuron.ops.attention.attention_decode_mask import gen_attention_decode_mask, qk_swap_layout
+    from sglang_neuron.ops.attention.attention_decode_mask import gen_attention_decode_mask
 
     rows, span = positions.shape
     page = md["block_size"]

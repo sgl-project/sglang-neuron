@@ -44,7 +44,8 @@ def main() -> int:
     from sglang_neuron.models.mimo_v2.kernels.attention_block import decode_masked_dcp
     from sglang_neuron.models.mimo_v2.rope import RotaryTables, rotate
     from sglang_neuron.ops.attention.attention_decode import dcp_collective_mode
-    from sglang_neuron.ops.attention.attention_decode_mask import gen_attention_decode_mask, qk_swap_layout
+    from sglang_neuron.models.mimo_v2.attention import qk_swap_layout
+    from sglang_neuron.ops.attention.attention_decode_mask import gen_attention_decode_mask
     from sglang_neuron.parallel.neuron_init import init_neuron_ranks
     from sglang_neuron.parallel.state import _make_group
     from sglang_neuron.utils.hardware_config import get_logical_nc_config

@@ -86,7 +86,8 @@ def main() -> int:
     from sglang_neuron.models.mimo_v2.launch import FP8_FN_AS_E4M3
     from sglang_neuron.models.mimo_v2.kernels.attn_half import attn_half
     from sglang_neuron.models.mimo_v2.rope import RotaryTables
-    from sglang_neuron.ops.attention.attention_decode_mask import gen_attention_decode_mask, qk_swap_layout
+    from sglang_neuron.models.mimo_v2.attention import qk_swap_layout
+    from sglang_neuron.ops.attention.attention_decode_mask import gen_attention_decode_mask
     from sglang_neuron.utils.hardware_config import get_logical_nc_config
 
     compiler_args = list(COMPILER_ARGS)
