@@ -770,9 +770,10 @@ class NeuronSRTPlatform(SRTPlatform, NeuronDeviceMixin):
         return cls
 
     def get_quantization_config(self, quantization: str):
-        # MXFP4 experts and a Quark export's weights run in the model's own kernels; SGLang gets an inert config for
-        # the name (check_quantization refuses either name for a model that does not list it)
-        if quantization in ("mxfp4", "quark"):
+        # MXFP4 experts and a Quark export's weights run in the model's own kernels, and per-tensor FP8 weights are
+        # dequantized as they load (models/hy_v3/fp8.py); SGLang gets an inert config for the name (check_quantization
+        # refuses each name for a model that does not list it)
+        if quantization in ("mxfp4", "quark", "fp8"):
             from sglang_neuron.quant import passthrough_config
 
             return passthrough_config(quantization)

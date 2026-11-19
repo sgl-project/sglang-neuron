@@ -126,6 +126,12 @@ def dcp_inside_dp_attention(server_args, spec, role: str, size: int) -> bool:
             and size == layout.dcp_size)
 
 
+def _declares_decode_layout(spec) -> bool:
+    """Whether the model serves its DCP decode in a decode layout of its own (Kimi-K3), which is PD only."""
+    return bool(getattr(spec, "kv_handoff", "") or getattr(spec, "megakernel", None) is not None
+                or bool(getattr(spec, "decode_layouts", ())))
+
+
 def dcp_launch_problems(server_args, architecture: str, spec) -> list:
     """Why this DCP launch (--dcp-size above 1) cannot run, or []. Each reason names what to change.
 
@@ -137,6 +143,11 @@ def dcp_launch_problems(server_args, architecture: str, spec) -> list:
     size = dcp_size(server_args)
     problems = []
     role = str(getattr(server_args, "disaggregation_mode", "null") or "null")
+    both = getattr(spec, "prefill_context_parallel", False) and getattr(spec, "decode_context_parallel", False)
+    if role in ("null", "none") and both and not _declares_decode_layout(spec):
+        # a model whose prefill and decode both attend over DCP shards (and that declares no decode layout of its
+        # own) serves an aggregated DCP server: both graphs share the pool's placement
+        role = "decode"
     # the PD prefill of a model that declares it is served DCP, pipelined or not; every other launch is checked as a
     # DCP decode
     if not (role == "prefill" and getattr(spec, "prefill_context_parallel", False)):
