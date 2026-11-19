@@ -66,6 +66,10 @@ def moe_w8a8() -> bool:
     return value == "1"
 
 
+# the full layers' decode attention over KV data parallelism (MiMoV2Graph._kvdp): 1 (the default) or 0
+KVDP_ENV = "SGLANG_NEURON_MIMO_KVDP"
+
+
 def layer_kernel_enabled() -> bool:
     import os
 
@@ -360,6 +364,9 @@ class MiMoV2Graph(nn.Module):
             for k, (cos, sin) in tables.items():
                 kernel_step[("cos", k)], kernel_step[("sin", k)] = layout(cos), layout(sin)
                 kernel_step[("slots", k)] = kv_slots[k].reshape(-1, 1).to(torch.int32)
+            # each span token's prior length, the full layers' position mask under KVDP (their span masks open the
+            # same prior: span_mask's prior_end)
+            kernel_step[("pos", False)] = prior.to(torch.float32).contiguous()
         for layer in self.layers:
             if kernel_step is not None:
                 k = layer.is_swa
@@ -477,19 +484,53 @@ class MiMoV2Graph(nn.Module):
                                 step[("cos", layer.is_swa)], step[("sin", layer.is_swa)],
                                 step[("slots", layer.is_swa)], step)
 
+    def _kvdp(self, layer, rows: int) -> int:
+        """The KV data parallelism of ``layer``'s decode attention at ``rows`` rows (kernels/attn_half.py ``kvdp``):
+        the full layers' (no sinks, a long prior) over groups of up to 8 ranks holding the same KV head, at batches of
+        at least 4 (nkilib's all-to-all takes 4 or more ranks), 1 elsewhere (SGLANG_NEURON_MIMO_KVDP=0: never)."""
+        import os
+
+        if os.environ.get(KVDP_ENV, "1").strip() == "0" or layer.is_swa or layer.self_attn.sink is not None:
+            return 1
+        replicas = self.layers[0].self_attn.attn_tp_group.world_size // max(1, self.config.full.num_kv_heads)
+        k = 1
+        while k * 2 <= min(8, rows, replicas) and rows % (k * 2) == 0:
+            k *= 2
+        return k if k >= 4 else 1
+
+    def _kvdp_mesh(self, layer, k: int):
+        from sglang_neuron.backend.stack import resolve_full_mesh
+
+        cells = []
+        for cell in resolve_full_mesh(layer.self_attn.attn_tp_group):
+            ranks = [int(r) for r in cell]
+            cells += [tuple(ranks[i:i + k]) for i in range(0, len(ranks), k)]
+        return tuple(cells)
+
     def _layer_call(self, layer, x, table, mask, cos, sin, slots, step):
         """kernels/layer.py's moe_layer / dense_layer over ``x`` [B, S, H] (S tokens a row), cos / sin [d / 2, B, S],
-        slots [B x S, 1] int32. Returns the layer's output [B x S, H]."""
+        slots [B x S, 1] int32. Returns the layer's output [B x S, H]. A full layer's attention runs over KV data
+        parallelism (``_kvdp``) where ``step`` holds the rows' prior lengths (``("pos", False)`` [B, S] fp32)."""
         from sglang_neuron.backend.stack import wrap_nki
         from sglang_neuron.models.mimo_v2.kernels.layer import dense_layer, moe_layer
         from sglang_neuron.utils.hardware_config import get_logical_nc_config
 
         attn, mlp = layer.self_attn, layer.mlp
+        rows, span = x.shape[0], x.shape[1]
+        kvdp = self._kvdp(layer, rows) if ("pos", False) in step else 1
+        if kvdp > 1:
+            # the span's active part alone (the prior is masked by position): token q sees the span's tokens k <= q
+            k_idx = torch.arange(span, device=x.device).reshape(span, 1, 1, 1)
+            q_idx = torch.arange(span, device=x.device).reshape(1, 1, 1, span)
+            mask = (k_idx <= q_idx).expand(span, rows // kvdp, attn.num_heads * kvdp, span).to(torch.uint8)
         attn_args = (x, layer.input_norm_f32, attn.qkv_weight, cos, sin, table, attn.k_cache, attn.v_cache, mask,
                      attn._sink_column(), slots, attn._kernel_o_weight())
         k_scale, v_scale = step.get("kv_scales", (None, None))
         common = dict(k_scale=k_scale, v_scale=v_scale, eps=layer.input_layernorm.eps,
                       softmax_scale=attn.scaling / attn.kv_scale, v_head_dim=attn.v_head_dim)
+        if kvdp > 1:
+            common.update(pos=step[("pos", False)], rank=attn.attn_tp_group.rank_in_group_tensor, kvdp=kvdp,
+                          kvdp_mesh=self._kvdp_mesh(layer, kvdp))
         gamma = layer.post_attention_layernorm.weight.view(1, -1)
         if isinstance(mlp, DenseMLP):
             return wrap_nki(dense_layer)[get_logical_nc_config()](

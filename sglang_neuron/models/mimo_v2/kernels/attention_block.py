@@ -14,6 +14,7 @@ import nki.collectives as ncc
 from nkilib.core.attention.attention_kv_parallel_segmented_cte import attention_kv_parallel_segmented_cte
 from nkilib.core.utils.common_types import QuantizationType
 from nkilib.experimental.transformer.attention_block_tkg import attention_block_tkg
+from sglang_neuron.models.mimo_v2.kernels.cp.attention_block_tkg_sharding import KVDPCollectiveMode
 
 from sglang_neuron.models.mimo_v2.kernels.cp.attention_block_tkg import attention_block_tkg as attention_block_tkg_cp
 
@@ -115,4 +116,32 @@ def prefill_kv_parallel(q, k_cache, v_cache, block_tables, kvp_q_offset, kvp_ran
         replica_groups=ncc.ReplicaGroup(cells), group_size=dcp_size, block_size=block_size, seg_size=seg_size,
         scale=scale, global_q_offset=0, kvp_rank_id=kvp_rank_id, kvp_group_size=dcp_size, apc_mode=True,
         valid_num_prior_tokens=valid_num_prior_tokens, fp8_packed=fp8_packed, k_scale=k_scale, v_scale=v_scale,
+    )
+
+
+@nki.jit
+def decode_posid_kvdp(X, X_hidden_dim_actual, rmsnorm_X_eps, rmsnorm_X_gamma, W_qkv, cos, sin, active_blocks_table,
+                      K_cache, V_cache, attention_mask, sink, softmax_scale, pos_ids, kvdp_rank, kvdp_mesh, kvdp,
+                      k_scale=None, v_scale=None):
+    """``decode_posid`` with the batch's attention split over the ``kvdp`` ranks of each group of ``kvdp_mesh`` that
+    hold the same KV head (nkilib's KV data parallelism): the group's query heads are gathered, each rank attends
+    ``B / kvdp`` rows (``active_blocks_table`` / ``pos_ids`` / ``attention_mask`` its rows'), and every rank gets its
+    own heads back over all B rows, with every row's new K [d, B, S] / V [B, 1, S, d] (the vendored kernel's d-tiled
+    KVDP path, kernels/cp: nkilib's takes heads of at most 128 channels)."""
+    cells = []
+    for cell in kvdp_mesh:  # NKI's tracer takes no list comprehension
+        cells.append(list(cell))
+    return attention_block_tkg_cp(
+        X=X, X_hidden_dim_actual=X_hidden_dim_actual, rmsnorm_X_enabled=True, rmsnorm_X_eps=rmsnorm_X_eps,
+        rmsnorm_X_gamma=rmsnorm_X_gamma, W_qkv=W_qkv, bias_qkv=None, quantization_type_qkv=QuantizationType.NONE,
+        weight_dequant_scale_qkv=None, input_dequant_scale_qkv=None, rmsnorm_QK_pre_rope_enabled=False,
+        rmsnorm_QK_pre_rope_eps=0.0, rmsnorm_QK_pre_rope_W_Q=None, rmsnorm_QK_pre_rope_W_K=None, cos=cos, sin=sin,
+        rope_contiguous_layout=True, rmsnorm_QK_post_rope_enabled=False, rmsnorm_QK_post_rope_eps=0.0,
+        rmsnorm_QK_post_rope_W_Q=None, rmsnorm_QK_post_rope_W_K=None, K_cache_transposed=False,
+        active_blocks_table=active_blocks_table, K_cache=K_cache, V_cache=V_cache, attention_mask=attention_mask,
+        sink=sink, update_cache=False, kv_cache_update_idx=None, W_out=None, bias_out=None,
+        quantization_type_out=QuantizationType.NONE, weight_dequant_scale_out=None, input_dequant_scale_out=None,
+        transposed_out=False, out_in_sb=False, softmax_scale=softmax_scale, pos_ids=pos_ids, k_scale=k_scale,
+        v_scale=v_scale, KVDP=kvdp, KVDP_replica_group=ncc.ReplicaGroup(cells),
+        KVDP_collective_mode=KVDPCollectiveMode.ALL_TO_ALL, KVDP_rank=kvdp_rank,
     )

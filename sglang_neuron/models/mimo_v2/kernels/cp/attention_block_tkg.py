@@ -47,6 +47,7 @@ Features:
 from typing import Any, Dict, Optional, Tuple, Union
 
 import nki
+import nki.collectives as ncc
 import nki.isa as nisa
 import nki.language as nl
 
@@ -671,7 +672,16 @@ def attention_block_tkg(
     )
 
     # ========== KV Data Parallelism: Input Collectives ==========
-    if is_KVDP:
+    kvdp_all_K = None
+    kvdp_all_V = None
+    if is_KVDP and d_head > nl.tile_size.pmax:
+        # [MiMo-V2] d-tiled Q / K ([pmax, n_d_tiles * B*H*S], d-tile outermost): exchanged through HBM by all-to-all,
+        # the new tokens' K / V of every row kept for the caller (each rank writes all rows' K / V)
+        kvdp_all_V = V_tkg_hbm
+        Q_tkg_sb, K_tkg_sb, V_tkg_hbm, kvdp_all_K = _kvdp_input_d_tiled(
+            Q_tkg_sb, K_tkg_sb, V_tkg_hbm, q_heads, d_head, KVDP, B, B_attn, S_tkg, KVDP_replica_group, sbm,
+            dynamic_KVDP_rank_sb)
+    elif is_KVDP:
         # Gather Q heads, slice Q/K/V batch
         #   B -> B_attn (B/KVDP)
         #   q_heads -> q_heads_attn (q_heads*KVDP)
@@ -776,7 +786,9 @@ def attention_block_tkg(
 
         # Allocate attention output buffer
         # [MiMo-V2] d>128 under CP: attention_tkg's d-tiled store targets HBM only (out_in_sb below)
-        allocate_attn_out_on_HBM = (not do_out_proj and not out_in_sb and not is_KVDP
+        # [MiMo-V2] and under KVDP: its output collectives then run from HBM (_kvdp_output_d_tiled)
+        allocate_attn_out_on_HBM = (not do_out_proj and not out_in_sb
+                                    and (not is_KVDP or d_head > nl.tile_size.pmax)
                                     and (not is_CP or d_head > nl.tile_size.pmax))
         if allocate_attn_out_on_HBM:
             attn_out = nl.ndarray(
@@ -969,7 +981,11 @@ def attention_block_tkg(
         )
 
     # ========== KV Data Parallelism: Output Gather ==========
-    if is_KVDP:
+    if is_KVDP and d_head > nl.tile_size.pmax:
+        # [MiMo-V2] attention_tkg's [B_attn, q_heads_attn, d, S] HBM output to this rank's heads over every row
+        attn_out = _kvdp_output_d_tiled(attn_out, q_heads, d_head, KVDP, B_attn, S_tkg, KVDP_replica_group)
+        V_tkg_sb = None
+    elif is_KVDP:
         # Gather batch, slice heads (restore for output projection):
         #   B_attn (B/KVDP) -> B
         #   q_heads_attn (q_heads*KVDP) -> q_heads
@@ -1111,11 +1127,62 @@ def attention_block_tkg(
     sbm.close_scope()
     if update_cache:
         return kernel_output, K_cache, V_cache
+    elif kvdp_all_K is not None:
+        # [MiMo-V2] every row's new K [d, B, S] and V [B, 1, S, d], from before the batch slice
+        return kernel_output, kvdp_all_K.reshape((d_head, B, S_tkg)), kvdp_all_V
     else:
         return kernel_output, K_tkg_hbm, V_tkg_hbm
 
 
 ############### Internal ###############
+
+
+def _kvdp_input_d_tiled(Q_sb, K_sb, V_hbm, q_heads, d_head, KVDP, B, B_attn, S, replica_group, sbm, rank_sb):
+    """[MiMo-V2] KVDP's input exchange for heads above pmax channels, one query head a rank: Q, d-tiled in SBUF
+    [pmax, n_t * B*S], goes to HBM as [KVDP, d, B_attn*S] (chunk r: this rank's head over rank r's rows), an all-to-all
+    hands each rank its rows of the group's heads, [KVDP, d, B_attn, S], which load back d-tiled as
+    [pmax, n_t * B_attn*KVDP*S] in the (batch, head, token) order attention_tkg reads. K stages to HBM whole and this
+    rank's rows load back d-tiled; V's rows are sliced in HBM. Returns (Q, K, V, every row's K [d, B*S] @ HBM)."""
+    pm = nl.tile_size.pmax
+    n_t = d_head // pm
+    kernel_assert(q_heads == 1, f"d-tiled KVDP takes one query head a rank, got {q_heads}")
+    BS, BaS = B * S, B_attn * S
+    q_attn = q_heads * KVDP
+    dtype, kv_dtype = Q_sb.dtype, K_sb.dtype
+    Q_src = nl.ndarray((KVDP, d_head, BaS), dtype=dtype, buffer=nl.shared_hbm, name="mimo_kvdp_q_src")
+    for t in range(n_t):
+        nisa.dma_copy(Q_src.permute((1, 0, 2))[nl.ds(t * pm, pm), :, :],
+                      Q_sb[:, nl.ds(t * BS, BS)].reshape((pm, KVDP, BaS)))
+    Q_dst = nl.ndarray((KVDP, d_head, BaS), dtype=dtype, buffer=nl.shared_hbm, name="mimo_kvdp_q_dst")
+    ncc.all_to_all(dsts=[Q_dst], srcs=[Q_src], replica_group=replica_group, collective_dim=0)
+    nBS = B_attn * q_attn * S
+    Q_out = sbm.alloc_stack((pm, n_t * nBS), dtype=dtype, buffer=nl.sbuf)
+    Q_view = Q_dst.reshape((q_attn, d_head, B_attn, S)).permute((1, 2, 0, 3))
+    for t in range(n_t):
+        nisa.dma_copy(Q_out[:, nl.ds(t * nBS, nBS)].reshape((pm, B_attn, q_attn, S)), Q_view[nl.ds(t * pm, pm), :, :, :])
+    K_full = nl.ndarray((d_head, BS), dtype=kv_dtype, buffer=nl.shared_hbm, name="mimo_kvdp_k_full")
+    for t in range(n_t):
+        nisa.dma_copy(K_full[nl.ds(t * pm, pm), :], K_sb[:, nl.ds(t * BS, BS)])
+    K_mine = K_full.reshape((d_head, KVDP, BaS)).select(dim=1, index=rank_sb)
+    K_out = sbm.alloc_stack((pm, n_t * BaS), dtype=kv_dtype, buffer=nl.sbuf)
+    for t in range(n_t):
+        nisa.dma_copy(dst=K_out[:, nl.ds(t * BaS, BaS)], src=K_mine[nl.ds(t * pm, pm), :])
+    V_mine = V_hbm.reshape((KVDP, B_attn, 1, S, d_head)).select(dim=0, index=rank_sb)
+    V_out = nl.ndarray(V_mine.shape, dtype=kv_dtype, buffer=nl.shared_hbm, name="mimo_kvdp_v_mine")
+    nisa.dma_copy(dst=V_out, src=V_mine)
+    return Q_out, K_out, V_out, K_full
+
+
+def _kvdp_output_d_tiled(attn_hbm, q_heads, d_head, KVDP, B_attn, S, replica_group):
+    """[MiMo-V2] KVDP's output exchange for heads above pmax channels: attention_tkg's [B_attn, KVDP, d, S] HBM output
+    (this rank's rows, the group's heads) goes out by head (chunk r to rank r) and comes back by row, [KVDP, B_attn, d,
+    S], which is [B, 1, d, S]: this rank's head over every row, the layout of the non-KVDP path."""
+    q_attn = q_heads * KVDP
+    src = nl.ndarray((q_attn, B_attn, d_head, S), dtype=attn_hbm.dtype, buffer=nl.shared_hbm, name="mimo_kvdp_o_src")
+    nisa.dma_copy(src, attn_hbm.reshape((B_attn, q_attn, d_head, S)).permute((1, 0, 2, 3)))
+    dst = nl.ndarray((q_attn, B_attn, d_head, S), dtype=attn_hbm.dtype, buffer=nl.shared_hbm, name="mimo_kvdp_o_dst")
+    ncc.all_to_all(dsts=[dst], srcs=[src], replica_group=replica_group, collective_dim=0)
+    return dst.reshape((KVDP * B_attn, q_heads, d_head, S))
 
 
 def _cp_output_d_tiled(attn_hbm, stats, CP, B, q_heads_attn, q_heads, d_head, S_tkg, replica_group, sbm, mode):
