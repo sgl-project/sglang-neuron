@@ -34,49 +34,10 @@ from sglang_neuron.utils.weight_loader import SafetensorsWeightLoader, set_weigh
 
 # the scale key of a 128 x 128 FP8 weight; MXFP4 experts carry weight_scale (expert_scale_suffix)
 FP8_SCALE = "weight_scale_inv"
-# each decoder layer's decode in one kernel with its all-reduces inside (kernels/layer.py), the target's and the MTP
-# draft layers': 1 (the default: no XLA op between layers, the residual and collectives in SBUF, measured equal or faster
-# than the half kernels) or 0 for the attention and MoE halves as separate kernels with the all-reduces in the graph
-LAYER_KERNEL_ENV = "SGLANG_NEURON_MIMO_DECODE_LAYER_KERNEL"
-
-
-# the step's embedding and greedy LM head in NKI kernels (kernels/head.py): 1 (the default) or 0 for torch's
-HEAD_KERNEL_ENV = "SGLANG_NEURON_MIMO_HEAD_KERNEL"
-
-
-def head_kernel_enabled() -> bool:
-    import os
-
-    value = os.environ.get(HEAD_KERNEL_ENV, "1").strip()
-    if value not in ("0", "1"):
-        raise ValueError(f"{HEAD_KERNEL_ENV}={value!r}: set 1 (the embedding and greedy LM head as kernels) or 0")
-    return value == "1"
-
-
-# the decode experts' activations in FP8, per token (kernels/moe_half.py fp8_act): 1 (the default) or 0 for bf16
-MOE_W8A8_ENV = "SGLANG_NEURON_MIMO_MOE_W8A8"
-
-
-def moe_w8a8() -> bool:
-    import os
-
-    value = os.environ.get(MOE_W8A8_ENV, "1").strip()
-    if value not in ("0", "1"):
-        raise ValueError(f"{MOE_W8A8_ENV}={value!r}: set 1 (FP8 activations, double-row matmuls) or 0 (bf16)")
-    return value == "1"
-
-
 # the full layers' decode attention over KV data parallelism (MiMoV2Graph._kvdp): 1 (the default) or 0
 KVDP_ENV = "SGLANG_NEURON_MIMO_KVDP"
 
 
-def layer_kernel_enabled() -> bool:
-    import os
-
-    value = os.environ.get(LAYER_KERNEL_ENV, "1").strip()
-    if value not in ("0", "1"):
-        raise ValueError(f"{LAYER_KERNEL_ENV}={value!r}: set 1 (each MoE layer's decode in one kernel) or 0")
-    return value == "1"
 
 
 def expert_scale_suffix(hf_config) -> str:
@@ -221,8 +182,8 @@ class MiMoV2Graph(nn.Module):
 
     def embed(self, ids: torch.Tensor) -> torch.Tensor:
         """The embeddings [T, H] of ``ids`` [T] (T <= 128): the vocabulary-sharded lookup and its sum over the ranks in
-        one kernel (kernels/head.embed), or the torch embedding with SGLANG_NEURON_MIMO_HEAD_KERNEL=0."""
-        if not head_kernel_enabled() or ids.shape[0] > 128:
+        one kernel (kernels/head.embed); torch past 128 rows (a prefill chunk)."""
+        if ids.shape[0] > 128:
             return self.embed_tokens(ids.to(torch.int32), scatter_tokens=False,
                                      rank=self.lm_head_tp_group.rank_in_group_tensor)
         from sglang_neuron.backend.stack import wrap_nki
@@ -236,7 +197,7 @@ class MiMoV2Graph(nn.Module):
         """[T] int32 the greedy token of each of ``states`` [T, H] (T <= 128) before the final ``norm``: the norm, the
         sharded LM head and the argmax over the ranks in one kernel (kernels/head.greedy); with ``rows`` [T', 1] int32
         of states' rows at them, gathered in the kernel."""
-        if not head_kernel_enabled() or states.shape[0] > 128:
+        if states.shape[0] > 128:
             if rows is not None:
                 states = states.index_select(0, rows.reshape(-1).to(torch.int64))
             return self.greedy_token(self.lm_head(norm(states))).reshape(-1)
@@ -314,7 +275,7 @@ class MiMoV2Graph(nn.Module):
             for layer in self.layers:
                 cos, sin = tables[layer.is_swa]
                 attn = layer.self_attn
-                hidden = hidden + attn.prefill(layer.input_layernorm(hidden), cos, sin, attn_metadata[attn.name])
+                hidden = hidden + attn.prefill(hidden, cos, sin, attn_metadata[attn.name], norm=layer.input_layernorm)
                 hidden = hidden + layer.mlp(layer.post_attention_layernorm(hidden), real=real)
         else:
             attn0 = self.layers[0].self_attn
@@ -326,7 +287,7 @@ class MiMoV2Graph(nn.Module):
                 attn = layer.self_attn
                 md = attn_metadata[attn.name]
                 kind_inputs = inputs["swa" if layer.is_swa else "full"]
-                if kind_inputs.mask is not None and layer_kernel_enabled() and self._layer_kernel_serves(layer):
+                if kind_inputs.mask is not None and self._layer_kernel_serves(layer):
                     if step is None:
                         step = self._step_inputs(tables, attn_metadata, layer)
                     hidden = self._layer_kernel(layer, hidden, md, kind_inputs, step)
@@ -387,9 +348,11 @@ class MiMoV2Graph(nn.Module):
         """One MTP step (mtp_step.py): ``{"token_ids": [width, SPEC]}`` int32, each row's kept run, -1 after it, at the
         decode width. Every layer runs the rows' spans (attention.MiMoAttention.span_decode), each kind over its own
         span mask and slots, built once."""
+        from sglang_neuron import sampling
         from sglang_neuron.backend.stack import resolve_full_mesh
         from sglang_neuron.models.mimo_v2 import mtp_step
         from sglang_neuron.models.mimo_v2.attention import span_mask, span_slots
+        from sglang_neuron.utils.neuron_utils import can_run_kernel
 
         md = {True: attn_metadata[self._first_layer(True)], False: attn_metadata[self._first_layer(False)]}
         width, spec = md[False]["block_table_tensor"].shape[0], mtp_step.SPEC
@@ -397,9 +360,15 @@ class MiMoV2Graph(nn.Module):
         heads = self.layers[0].self_attn.num_heads
         windows = {True: self.config.swa.sliding_window, False: None}
         ebase = self._expert_base()
-        on_kernels = layer_kernel_enabled() and all(self._layer_kernel_serves(layer) for layer in self.decoder_layers())
+        on_device = can_run_kernel(row_slots)
+        if on_device and not all(self._layer_kernel_serves(layer) for layer in self.decoder_layers()):
+            raise ValueError("NEURON_MTP decodes on the one-kernel layers (kernels/layer.py), which do not take DCP: "
+                             "launch the MTP decode without --dcp-size")
+        if on_device and sampling.sampler_mode() not in ("greedy", "topk_topp"):
+            raise ValueError(f"NEURON_MTP samples in kernels/sample.py: SGLANG_NEURON_SAMPLER=topk_topp or greedy, "
+                             f"not {sampling.sampler_mode()}")
         kernel_step = None
-        if on_kernels and len(self.mtp) > 1 and head_kernel_enabled():
+        if on_device:
             # the step's inputs in one kernel (kernels/step.py): the span's tokens and positions, both kinds' slots,
             # position masks and RoPE tables in the layer kernels' layouts
             span, kernel_step = self._step_kernel(md, row_slots, ctrl, width, spec)
@@ -413,36 +382,15 @@ class MiMoV2Graph(nn.Module):
             tables = None
             hidden = self.embed(span["tokens"].reshape(-1))
         else:
+            # the CPU reference (torch): the same step, built from the carry in the graph
             span = mtp_step.span_inputs(self.mtp_carry.index_select(0, slots), self.mtp_len.index_select(0, slots),
                                         ctrl)
             positions = span["positions"]
             prior = span["base"].reshape(width, 1).expand(width, spec)
-            # the full layers' decode under the layer kernels masks by position (MiMoV2Graph._layer_call): no full
-            # mask; the sliding layers' too, but where the one-layer MTP draft runs its own passes on their span mask
-            by_position = {False: on_kernels, True: on_kernels and len(self.mtp) > 1}
-            masks = {k: (None if by_position[k] else
-                         span_mask(md[k], prior, positions, window=windows[k], num_heads=heads)) for k in md}
+            masks = {k: span_mask(md[k], prior, positions, window=windows[k], num_heads=heads) for k in md}
             kv_slots = {k: span_slots(md[k], positions, span["valid"], window=windows[k]) for k in md}
             tables = self._tables(positions.reshape(-1))
             hidden = self.embed(span["tokens"].reshape(-1))
-            # the one-kernel layer (kernels/layer.py) over the spans: its inputs in the kernel's layouts, built once
-            if on_kernels:
-                layout = lambda t: t.reshape(width, spec, -1).permute(2, 0, 1).contiguous()  # noqa: E731
-                kernel_step = {"mesh": tuple(tuple(int(r) for r in cell) for cell in
-                                             resolve_full_mesh(self.layers[0].self_attn.attn_tp_group)),
-                               "ebase": ebase,
-                               "kv_scales": self.layers[0].self_attn._scale_tensors(hidden.device)}
-                for k, (cos, sin) in tables.items():
-                    kernel_step[("cos", k)], kernel_step[("sin", k)] = layout(cos), layout(sin)
-                    kernel_step[("slots", k)] = kv_slots[k].reshape(-1, 1).to(torch.int32)
-                # each span token's prior length and a sliding layer's window start, the layers' position masks
-                # (the span masks' prior_end and start: span_mask), in each kind's table frame
-                kernel_step[("pos", False)] = prior.to(torch.float32).contiguous()
-                offset = md[True]["swa_kv_pos_offset"].to(torch.int64).reshape(width, 1)
-                end = (prior.to(torch.int64) - offset).clamp(min=0)
-                start = (positions.to(torch.int64) - offset - windows[True] + 1).clamp(min=0)
-                kernel_step[("pos", True)] = end.to(torch.float32).contiguous()
-                kernel_step[("start", True)] = torch.minimum(start, end).to(torch.float32).contiguous()
         for layer in self.layers:
             if kernel_step is not None:
                 k = layer.is_swa
@@ -461,15 +409,13 @@ class MiMoV2Graph(nn.Module):
                 hidden = hidden + layer.mlp.fused_decode(hidden, norm.weight, norm.eps, ebase)
             else:
                 hidden = hidden + layer.mlp(norm(hidden))
-        from sglang_neuron import sampling
-
         # the kernels' int32 draws stay int32 into the step's tail kernels ("raw")
         keep_i32 = "raw" in span
         if params[0] is None or sampling.sampler_mode() == "greedy":
             # the greedy target: the final norm, the LM head and the argmax in one kernel (kernels/head.greedy)
             sampled = self.greedy(hidden, self.norm)
             sampled = sampled if keep_i32 else sampled.reshape(width, spec).to(torch.int64)
-        elif head_kernel_enabled() and hidden.shape[0] <= 128 and sampling.sampler_mode() == "topk_topp":
+        elif on_device:
             # the drawing target: the final norm, the LM head and the tail rule in one kernel (kernels/sample.py)
             sampled = self._sample_kernel(hidden, span["raw"]["positions"] if keep_i32 else positions, params, width,
                                           spec)
@@ -517,43 +463,20 @@ class MiMoV2Graph(nn.Module):
                                       raw["base"], kept, out)
 
     def _mtp_drafts(self, span, sampled, hidden, kept, md, mask, kv_slots, table, rank, kernel=None):
-        """[W, NUM_STEPS] the MTP layer's drafts after each row's kept run (mtp.py): its pass over the span (the token
-        after each position is the target's sample there) writes its KV and gives the first draft at the row's last
-        kept position; each further draft is a one-token pass at the next position, from the previous draft and the
-        previous pass's state."""
-        from sglang_neuron.models.mimo_v2 import mtp_step
-        from sglang_neuron.models.mimo_v2.attention import span_mask, span_slots
-
+        """[W, NUM_STEPS] the MTP layers' drafts after each row's kept run (mtp.py), the CPU reference: each layer's
+        pass over the span writes its KV and gives its draft at the row's last kept position."""
         width, spec = sampled.shape
         size = hidden.shape[-1]
         at_kept = lambda state: state.view(width, spec, size).gather(  # noqa: E731
             1, kept.reshape(width, 1, 1).expand(width, 1, size)).reshape(width, size)
-        if len(self.mtp) > 1:
-            # one draft a layer, each layer's tokens one position further ahead (mtp.rotate)
-            tokens, drafts = sampled, []
-            for k, layer in enumerate(self.mtp):
-                state, _ = layer.decode(self, tokens.reshape(-1), hidden, *table, md, mask, kv_slots, spec, None, rank,
-                                        kernel)
-                drafts.append(layer.draft(self, at_kept(state)))
-                if k + 1 < len(self.mtp):
-                    tokens = mtp.rotate(tokens, kept, drafts[-1])
-            return torch.stack(drafts, dim=1)
-        layer = self.mtp[0]
-        window = self.config.swa.sliding_window
-        heads = layer.attn.num_heads
-        state, caches = layer.decode(self, sampled.reshape(-1), hidden, *table, md, mask, kv_slots, spec, None, rank)
-        prev = at_kept(state)
-        draft = layer.draft(self, prev)
-        drafts = [draft]
-        live = span["live"].reshape(width, 1)
-        for i in range(1, mtp_step.NUM_STEPS):
-            q = (span["base"] + kept + i).reshape(width, 1)
-            step_mask = span_mask(md, q, q, window=window, num_heads=heads)
-            step_slots = span_slots(md, q, live, window=window)
-            prev, caches = layer.decode(self, draft, prev, *self.swa_rope(q.reshape(-1)), md, step_mask, step_slots,
-                                        1, caches, rank)
-            draft = layer.draft(self, prev)
-            drafts.append(draft)
+        # one draft a layer, each layer's tokens one position further ahead (mtp.rotate)
+        tokens, drafts = sampled, []
+        for k, layer in enumerate(self.mtp):
+            state, _ = layer.decode(self, tokens.reshape(-1), hidden, *table, md, mask, kv_slots, spec, None, rank,
+                                    kernel)
+            drafts.append(layer.draft(self, at_kept(state)))
+            if k + 1 < len(self.mtp):
+                tokens = mtp.rotate(tokens, kept, drafts[-1])
         return torch.stack(drafts, dim=1)
 
     def _expert_base(self):
@@ -663,7 +586,7 @@ class MiMoV2Graph(nn.Module):
         return wrap_nki(moe_layer)[get_logical_nc_config()](
             *attn_args, gamma, mlp.router_wT, mlp.expert_bias.view(1, -1), step["ebase"], mlp.gate_up_weight,
             mlp.down_weight, mlp.gate_up_scale, mlp.down_scale, step["mesh"], route_scale=float(mlp.scaling),
-            top_k=mlp.top_k, fp8_act=moe_w8a8(), **common)
+            top_k=mlp.top_k, fp8_act=True, **common)
 
     def decoder_layers(self) -> list:
         """The target's decoder layers, then the MTP layers' under NEURON_MTP (the KV pool's layers after them)."""

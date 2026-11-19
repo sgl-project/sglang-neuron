@@ -12,10 +12,8 @@ the ranks, and with more ranks than KV heads each rank holds one KV head, replic
   and projects the heads' first ``v_head_dim`` channels itself. The step's masks are built once per layer kind
   (``decode_masks``).
 
-``SGLANG_NEURON_MIMO_FULL_DECODE=posid`` runs the full-attention layers' decode in the kernel's position mode instead
-of over a pre-built mask (no mask of the graph's context to build each step); ``mask`` (the default) is the path the
-sliding layers take and the one the layer kernels serve. Neither ends its loop early: nkilib's early exit
-(``max_context_len``) is wrong past an 8K prior (sgl-project/sglang-neuron#4).
+No decode ends its loop early: nkilib's early exit (``max_context_len``) is wrong past an 8K prior
+(sgl-project/sglang-neuron#4).
 
 **FP8 KV cache** (``--kv-cache-dtype fp8_e4m3``): K and V pages in Trn2's e4m3 (at most 240), each value times the
 layer's scale (``KV_SCALE_ENV``, 1.0 by default: the checkpoint carries no KV scales), both token-major
@@ -56,30 +54,9 @@ from sglang_neuron.parallel import groups
 from sglang_neuron.utils.neuron_utils import can_run_kernel
 from sglang_neuron.utils.weight_loader import set_weight_loader
 
-FULL_DECODE_ENV = "SGLANG_NEURON_MIMO_FULL_DECODE"
 # the FP8 KV cache's scale: the cache holds clip(x * scale) in e4m3 (module docstring)
 KV_SCALE_ENV = "SGLANG_NEURON_MIMO_KV_SCALE"
 FP8_KV_MAX = 240.0
-# the decode attention half in one kernel (kernels/attn_half.py: attention, K/V write, output projection): 1 (the
-# default) or 0 for nkilib's attention kernel with the write and the projection in the graph
-FUSED_ENV = "SGLANG_NEURON_MIMO_DECODE_ATTN_FUSED"
-
-
-def fused_enabled() -> bool:
-    value = os.environ.get(FUSED_ENV, "1").strip()
-    if value not in ("0", "1"):
-        raise ValueError(f"{FUSED_ENV}={value!r}: set 1 (the decode attention half in one kernel) or 0")
-    return value == "1"
-
-
-def full_decode_mode() -> str:
-    value = os.environ.get(FULL_DECODE_ENV, "mask").strip()
-    if value not in ("mask", "posid"):
-        raise ValueError(f"{FULL_DECODE_ENV}={value!r}: set mask (a pre-built mask, the default) or posid (the "
-                         "kernel's position mode)")
-    return value
-
-
 def fp8_kv_cache() -> bool:
     """Whether the launch's KV cache is FP8 (--kv-cache-dtype fp8_e4m3)."""
     from sglang.srt.runtime_context import get_server_args
@@ -143,12 +120,10 @@ def _group_sink_loader(heads_per_rank: int, size: int):
 
 @dataclass
 class DecodeInputs:
-    """A decode step's inputs shared by every layer of one kind: the layer kind's mask in the kernel's layout, or in
-    position mode the kernel's position inputs (ops/attention/attention_decode_paged.PagedDecodeInputs)."""
+    """A decode step's inputs shared by every layer of one kind: the layer kind's mask in the kernel's layout."""
 
     positions: Optional[torch.Tensor] = None
     mask: Optional[torch.Tensor] = None
-    paged: object = None
 
 
 class MiMoAttention(nn.Module):
@@ -234,10 +209,26 @@ class MiMoAttention(nn.Module):
 
     # -- prefill ------------------------------------------------------------------------------------------------------
 
-    def prefill(self, x: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor, md: dict) -> torch.Tensor:
-        """The chunk's attention output [T, H] for its normed hidden states ``x`` [T, H]."""
-        import sglang_neuron.ops as NF
+    def prefill(self, x: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor, md: dict, norm) -> torch.Tensor:
+        """The chunk's attention output [T, H] for its hidden states ``x`` [T, H] (before the layer's input RMSNorm
+        ``norm``). On a device the norm, projection, RoPE and K/V write are kernels/prefill.prefill_front; the torch
+        below is the CPU reference."""
+        if can_run_kernel(x):
+            from sglang_neuron.backend.stack import wrap_nki
+            from sglang_neuron.models.mimo_v2.kernels.prefill import prefill_front
+            from sglang_neuron.utils.hardware_config import get_logical_nc_config
 
+            if self.num_kv_heads != 1 or x.shape[0] % 128:
+                raise ValueError(f"the prefill front kernel takes one KV head a rank and whole 128-token tiles "
+                                 f"({self.num_kv_heads} KV heads, {x.shape[0]} tokens): raise the attention TP size")
+            slots = md["slot_mapping"].to(torch.int32).reshape(-1, 1)
+            heads, k, v, k_cache, v_cache = wrap_nki(prefill_front)[get_logical_nc_config()](
+                x, norm.weight.view(1, -1), self.qkv_weight, cos, sin, slots, self.k_cache, self.v_cache,
+                eps=norm.eps, num_heads=self.num_heads, kv_scale=float(self.kv_scale) if self.fp8_kv else 1.0)
+            if self.dcp_size > 1:
+                return self._prefill_dcp(heads.transpose(0, 1), k.unsqueeze(1), v.unsqueeze(1), k_cache, v_cache, md)
+            return self._prefill_attend(heads, k_cache, v_cache, md, x.shape[0])
+        x = norm(x)
         q, k, v = self._split(x @ self.qkv_weight)
         q, k = rotate(q, cos, sin), rotate(k, cos, sin)
         if self.fp8_kv:
@@ -246,9 +237,15 @@ class MiMoAttention(nn.Module):
                                              md["slot_mapping"])
         if self.dcp_size > 1:
             return self._prefill_dcp(q, k, v, k_cache, v_cache, md)
+        return self._prefill_attend(q.transpose(0, 1).contiguous(), k_cache, v_cache, md, x.shape[0])
+
+    def _prefill_attend(self, heads, k_cache, v_cache, md: dict, tokens: int) -> torch.Tensor:
+        """The chunk's attention over the written caches, ``heads`` [num_heads, T, d] its rotated queries."""
+        import sglang_neuron.ops as NF
+
         table, scale = md["block_table_tensor"], self.scaling
         if self.fp8_kv:
-            page, tokens = md["block_size"], x.shape[0]
+            page = md["block_size"]
             window = {}
             if self.sliding_window:
                 cached = md["cached_seq_len"].to(torch.int64).reshape(-1)
@@ -257,7 +254,7 @@ class MiMoAttention(nn.Module):
             k_cache, v_cache, table = pack_prior(k_cache, v_cache, table, **window)
             scale = scale / self.kv_scale
         out = NF.segmented_attention(
-            q.transpose(0, 1).contiguous(), k_cache=k_cache, v_cache=v_cache,
+            heads, k_cache=k_cache, v_cache=v_cache,
             block_tables=table, prior_tokens=md["cached_seq_len"], block_size=md["block_size"],
             kv_segment_size=md["kv_segment_size"], scale=scale, sliding_window=self.sliding_window,
             sink=self._sink_column(),
@@ -364,7 +361,7 @@ class MiMoAttention(nn.Module):
         rows = x.shape[0]
         if self.dcp_size > 1:
             return self._dcp_decode(x, norm, cos, sin, md, inputs.mask, md["slot_mapping"].reshape(-1))
-        if can_run_kernel(x) and inputs.mask is not None and fused_enabled():
+        if can_run_kernel(x) and inputs.mask is not None:
             return self._fused_decode(x, norm, cos, sin, md, inputs)
         if not can_run_kernel(x):
             heads, k_new, v_new = self._torch_decode(x, norm, cos, sin, md, inputs.positions)
@@ -445,16 +442,10 @@ class MiMoAttention(nn.Module):
         from sglang_neuron.utils.hardware_config import get_logical_nc_config
 
         if self.fp8_kv:
-            if inputs.paged is not None:
-                raise ValueError(f"{FULL_DECODE_ENV}=posid is not served with the FP8 KV cache")
             k_scale, v_scale = self._scale_tensors(x.device)
             out, k_new, v_new = wrap_nki(attention_block.decode_masked_fp8)[get_logical_nc_config()](
                 active_blocks_table=md["block_table_tensor"], attention_mask=inputs.mask, k_scale=k_scale,
                 v_scale=v_scale, **args)
-        elif inputs.paged is not None:
-            p = inputs.paged
-            out, k_new, v_new = wrap_nki(attention_block.decode_posid)[get_logical_nc_config()](
-                active_blocks_table=p.table, attention_mask=p.active_mask, pos_ids=p.pos_ids, **args)
         else:
             out, k_new, v_new = wrap_nki(attention_block.decode_masked)[get_logical_nc_config()](
                 active_blocks_table=md["block_table_tensor"], attention_mask=inputs.mask, **args)
@@ -522,13 +513,11 @@ def decode_masks(attn_metadata: dict, positions: torch.Tensor, config: MiMoV2Con
         return {"swa": DecodeInputs(positions=positions), "full": DecodeInputs(positions=positions)}
     from sglang_neuron.models.gpt_oss.attention_masks import decode_attention_masks
 
-    posid = full_decode_mode() == "posid" and full_layer is not None
-    masked_full = None if posid else full_layer
     swa_mask = full_mask = None
-    if swa_layer is not None or masked_full is not None:
+    if swa_layer is not None or full_layer is not None:
         swa_mask, full_mask = decode_attention_masks(
             attn_metadata, positions, sliding_window=config.swa.sliding_window or 0, q_heads=num_heads,
-            swa_layer=swa_layer, full_layer=masked_full)
+            swa_layer=swa_layer, full_layer=full_layer)
 
     def kernel_layout(mask):
         return qk_swap_layout(mask, d_head=KV_HEAD_DIM, fp8_kv=fp8_kv_cache(), fp8_packed=False)
@@ -536,14 +525,7 @@ def decode_masks(attn_metadata: dict, positions: torch.Tensor, config: MiMoV2Con
     out = {}
     if swa_mask is not None:
         out["swa"] = DecodeInputs(positions=positions, mask=kernel_layout(swa_mask))
-    if posid:
-        from sglang_neuron.ops.attention.attention_decode_paged import paged_decode_inputs
-
-        md = attn_metadata[full_layer]
-        paged = paged_decode_inputs(md["block_table_tensor"], md["slot_mapping"], positions, kv_heads=1,
-                                    q_heads=num_heads, page=md["block_size"])
-        out["full"] = DecodeInputs(positions=positions, paged=paged)
-    elif full_mask is not None:
+    if full_mask is not None:
         out["full"] = DecodeInputs(positions=positions, mask=kernel_layout(full_mask))
     return out
 

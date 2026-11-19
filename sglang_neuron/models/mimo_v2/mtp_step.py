@@ -138,7 +138,7 @@ class StepHost:
 
 
 # the PD prefill of an MTP decode writes the MTP layers' KV (mtp.PD_MTP_KV_ENV)
-PREFILL_SETTING = "SGLANG_NEURON_MIMO_PD_MTP_KV=1 (and the decode's SGLANG_NEURON_MIMO_MTP_LAYERS)"
+PREFILL_SETTING = "SGLANG_NEURON_MIMO_PD_MTP_KV=1"
 # an aggregated server: the target's prefill graph writes the MTP layer's KV (mtp.py)
 AGGREGATED = True
 

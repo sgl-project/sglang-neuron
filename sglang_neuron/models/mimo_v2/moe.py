@@ -9,8 +9,7 @@ route. At EP64 a rank holds 4 of the 256 experts; the decode runs nkilib's bf16 
 nkilib's hybrid I-sharded moe_cte (experts_cte.py, MiMo's own copy), which skips the blocks the routing leaves empty.
 
 The checkpoint's experts (MXFP4 on V2.6, 128 x 128 FP8 blocks on V2.5) load as Trn2 FP8 with a power-of-two scale per
-output row, exactly for MXFP4 (experts_fp8.py), or with ``SGLANG_NEURON_MIMO_EXPERTS=bf16`` dequantized to bf16
-(weights.dequantizing)."""
+output row, exactly for MXFP4 (experts_fp8.py); a bf16 checkpoint's experts load as they are."""
 
 import torch
 from torch import nn
@@ -20,21 +19,6 @@ from sglang_neuron.models.qwen3_moe.moe import SparseMoE
 from sglang_neuron.ops.moe.moe_tkg_bf16 import moe_experts
 from sglang_neuron.parallel import collectives as neuron_collectives
 from sglang_neuron.utils.weight_loader import SafetensorsWeightLoader, get_weight_loader, set_weight_loader
-
-# the decode MoE half in one kernel (kernels/moe_half.py) over the FP8 experts: 1 (the default) or 0 for the router in
-# torch and nkilib's moe_tkg
-FUSED_ENV = "SGLANG_NEURON_MIMO_DECODE_MOE_FUSED"
-
-
-def fused_enabled() -> bool:
-    import os
-
-    value = os.environ.get(FUSED_ENV, "1").strip()
-    if value not in ("0", "1"):
-        raise ValueError(f"{FUSED_ENV}={value!r}: set 1 (the decode MoE half in one kernel) or 0")
-    return value == "1"
-
-
 
 def route(x: torch.Tensor, router_weight: torch.Tensor, expert_bias: torch.Tensor, top_k: int, route_norm: bool,
           scaling: float) -> tuple:
@@ -77,14 +61,16 @@ class MiMoV2MoE(SparseMoE):
         self.fused = False
         if self.fp8_experts:
             experts_fp8.make_fp8(self, layer_key)
-            if fused_enabled() and self.top_k <= 8 and self.down_weight.shape[1] % 256 == 0:
-                # the kernel's router reads the router weight transposed, [H, E]; the prefill graph holds it too,
-                # unused, since an aggregated server's two graphs share one device copy of the weights
-                self.router_wT = nn.Parameter(torch.empty(hidden_size, num_experts, dtype=torch.bfloat16),
-                                              requires_grad=False)
-                set_weight_loader(self.router_wT, SafetensorsWeightLoader(
-                    transform=lambda slices, rank: slices[0][...].to(torch.bfloat16).t().contiguous()))
-                self.fused = not prefill
+            if not prefill and not (self.top_k <= 8 and self.down_weight.shape[1] % 256 == 0):
+                raise ValueError(f"the decode MoE kernel (kernels/moe_half.py) takes top_k <= 8 and an expert "
+                                 f"shard of a multiple of 256 rows (top_k {self.top_k}, {self.down_weight.shape[1]})")
+            # the kernel's router reads the router weight transposed, [H, E]; the prefill graph holds it too,
+            # unused, since an aggregated server's two graphs share one device copy of the weights
+            self.router_wT = nn.Parameter(torch.empty(hidden_size, num_experts, dtype=torch.bfloat16),
+                                          requires_grad=False)
+            set_weight_loader(self.router_wT, SafetensorsWeightLoader(
+                transform=lambda slices, rank: slices[0][...].to(torch.bfloat16).t().contiguous()))
+            self.fused = not prefill
         elif expert_scale_suffix:
             for p in (self.gate_up_weight, self.down_weight):
                 set_weight_loader(p, weights.dequantizing(get_weight_loader(p)))

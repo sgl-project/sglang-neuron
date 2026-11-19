@@ -44,8 +44,7 @@ two only shifts exponents and an e2m1 value has two significant bits, so every q
 all 36,096 expert matrices of the published checkpoint the quotients lie in [2^-6, 192] (2^-6 is e4m3's smallest
 normal) and every round trip is bit-equal (`tools/mimo_v2/check_fp8_experts.py`; a `rowmax / 240` scale, which is not a
 power of two, leaves about 7% of the values inexact, relative L2 8e-3 to 1e-2). A rank holds about 5 GB of weights (4.7 GB of experts) instead of 10 GB in bf16, and the full-attention
-KV pool grows from 1.02M to 1.53M tokens a rank. `SGLANG_NEURON_MIMO_EXPERTS=bf16` keeps the bf16 experts (also exact),
-the reference.
+KV pool grows from 1.02M to 1.53M tokens a rank. The experts are always served in FP8.
 
 ## Attention
 
@@ -66,13 +65,12 @@ MiMoV2 fused-QKV TP check through, since the graphs re-shard the fused QKV thems
 
 ## The decode
 
-Three forms, chosen by environment (the default is the fastest measured):
+The decode runs one form, with no switch back to XLA (the earlier per-layer-graph and half-kernel forms, measured
+below, are gone):
 
-| Form | Per layer | Switch |
-| --- | --- | --- |
-| per-layer graph | nkilib `attention_block_tkg` (`W_out=None, update_cache=False` above 128 channels), the K/V scatter, the output projection, the router and nkilib's `moe_tkg` in the graph | `SGLANG_NEURON_MIMO_DECODE_ATTN_FUSED=0 SGLANG_NEURON_MIMO_DECODE_MOE_FUSED=0` |
-| two half kernels | `kernels/attn_half.py`: the attention block, the K/V write and the output projection in one call; `kernels/moe_half.py`: the RMSNorm, the noaux router, the 4 local FP8 experts in one call; the two all-reduces in the graph | `SGLANG_NEURON_MIMO_DECODE_LAYER_KERNEL=0` |
-| **one kernel a layer** (default) | `kernels/layer.py`: both halves and both all-reduces in one call, no XLA op in a layer or between layers; the MoE layers keep the residual stream and both all-reduces in SBUF (SBUF-to-SBUF all-reduce, the program halves crossed by sendrecv); the dense layer 0 and the 3 MTP draft layers with nkilib's `mlp`; spans (NEURON_MTP) and the FP8 cache | the default |
+| Form | Per layer |
+| --- | --- |
+| **one kernel a layer** | `kernels/layer.py`: both halves and both all-reduces in one call, no XLA op in a layer or between layers; the MoE layers keep the residual stream and both all-reduces in SBUF (SBUF-to-SBUF all-reduce, the program halves crossed by sendrecv); the dense layer 0 and the 3 MTP draft layers with nkilib's `mlp`; spans (NEURON_MTP) and the FP8 cache |
 
 Measured on a trn2.48xlarge, TP64 / EP64, FP8 experts, `--context-length 8192 --chunked-prefill-size 2048
 --max-running-requests 8`, 1000 tokens in and 256 out (`examples/mimo_v2/bench_decode.py`, medians):
@@ -99,10 +97,6 @@ The table below is the older bf16-cache, no-MTP measurement. The one-kernel laye
 all-reduces: its 96 in-kernel all-reduces of 64 ranks, each with its fences, cost more than the graph's. Making them
 cheaper (SBUF-to-SBUF all-reduce and residual, as nkilib's `transformer_tkg` `sbuf_residual_and_cc`) and running every
 layer in one call are the next steps ([the design](../design/mimo-v2-decode-megakernel.md)).
-
-`SGLANG_NEURON_MIMO_FULL_DECODE=posid` runs the per-layer graph's full layers in the kernel's position mode (no early
-exit: nkilib's is wrong past 8K, sgl-project/sglang-neuron#4). `SGLANG_NEURON_MIMO_KV_WRITE_TORCH=1` writes the
-per-layer graph's K/V with `index_put_`, to rule the scatter kernel out.
 
 ## Accuracy
 
@@ -171,7 +165,7 @@ per-row control) and MiMo's graphs (`models/mimo_v2/mtp.py`, `mtp_step.py`, `mod
 - **Draft**: MTP layer k reads the target's state before its final norm and the token k + 1 ahead
   (`eh_proj(cat(enorm(embed), hnorm(h)))`, as SGLang's multi-layer EAGLE runs MiMo's MTP: not chain-style, every layer
   reads the target's state); its draft is its greedy pick at the row's last kept position, and its tokens past that
-  position are the drafts before it. `SGLANG_NEURON_MIMO_MTP_LAYERS=1` runs layer 0 alone, chained (EAGLE).
+  position are the drafts before it.
 - **KV**: the MTP layers' KV are the pool's layers 48-50, in the window pool (`sglang_patches/mimo_v2_launch`: an
   AROUND hook on `ModelConfig._derive_hybrid_model` lists them among the sliding layers; the host sizes the pool 3
   layers deeper). The prefill writes them over each chunk, the target's greedy pick and the layers' drafts after its
@@ -191,7 +185,6 @@ Measured at 8K (`CONTEXT=8192 MAX_RUNNING=16 MTP=1`), against the same server wi
 | | no MTP | NEURON_MTP, 3 layers |
 | --- | --- | --- |
 | GSM8K (5-shot, 1319, parallel 8) | 0.895 / 619 s | **0.895 / 287 s** (accepted length 3.39) |
-| GSM8K, layer 0 chained (`SGLANG_NEURON_MIMO_MTP_LAYERS=1`, 400, parallel 1) | | 0.892 (accepted length about 2.6) |
 | decode TPOT, c=1 (GSM8K prompts, 256 tokens) | 19.45 ms | **6.67 ms** (accepted 3.41) |
 | decode TPOT, c=8 | 21.32 ms | **9.18 ms** (accepted 3.24), 743 tok/s |
 | decode TPOT, c=16 | | **11.53 ms** (accepted 3.33), 1075 tok/s |
@@ -339,8 +332,7 @@ start with another `CACHE_DIR`.
 
 - DP attention but on a PD decode with `--ep-size` equal to `--tp-size`, `--pp-size`; `--dcp-size` above 8, or with the hybrid window pool or NEURON_MTP; a layout whose heads, KV heads, experts or intermediate sizes do not shard
   (every rank holds exactly one KV head: `--tp-size` a multiple of 8).
-- A `--kv-cache-dtype` other than bf16 or `fp8_e4m3`, a dtype other than bfloat16;
-  `SGLANG_NEURON_MIMO_FULL_DECODE=posid` with the FP8 cache.
+- A `--kv-cache-dtype` other than bf16 or `fp8_e4m3`, a dtype other than bfloat16.
 - The split q/k/v projection layout (MiMo-V2-Flash), a scaled RoPE, grouped routing, shared experts, attention biases.
 - `--enable-multimodal`, `--mm-enable-dp-encoder`.
 - `NEURON_MTP` on a PD role (the MTP step is served on an aggregated server), with other chain-shape flags than 3 / 1 / 4,

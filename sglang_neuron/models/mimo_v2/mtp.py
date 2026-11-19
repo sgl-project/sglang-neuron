@@ -12,13 +12,9 @@ with the target's embedding and LM head. Every layer reads the target's states (
 chain-style MTP models, whose layer k reads layer k - 1's). Each layer is a sliding-window attention layer (the sliding
 kind's heads, window, sinks and RoPE base) and a dense MLP, its norms ``input_layernorm`` and ``pre_mlp_layernorm``.
 
-``SGLANG_NEURON_MIMO_MTP_LAYERS`` sets the layers the draft runs (``LAYERS_ENV``):
-
-- ``3`` (the default, the checkpoint's): a step's three drafts are the three layers' at the row's last kept position,
-  each layer run over the step's span with the tokens one more position ahead than the layer before it; past the
-  row's kept run those tokens are the drafts before it (SGLang's ``rotate_input_ids``);
-- ``1``: the first layer alone, chained: each further draft is its pass at the next position from the previous draft
-  and its previous pass's state (the EAGLE chain).
+A step's three drafts are the checkpoint's three layers' at the row's last kept position, each layer run over the
+step's span with the tokens one more position ahead than the layer before it; past the row's kept run those tokens are
+the drafts before it (SGLang's ``rotate_input_ids``).
 
 Each layer's KV is one pool layer after the target's, in the window pool (the host sizes the pool deeper and
 sglang_patches/mimo_v2_launch lists the layers among the sliding ones), so it reads a target sliding layer's tables and
@@ -40,7 +36,6 @@ from sglang_neuron.models.transformer.model import RMSNorm
 from sglang_neuron.parallel import groups
 from sglang_neuron.utils.weight_loader import SafetensorsWeightLoader, set_weight_loader
 
-LAYERS_ENV = "SGLANG_NEURON_MIMO_MTP_LAYERS"
 # SGLANG_NEURON_MIMO_PD_MTP_KV=1 on a --disaggregation-mode prefill: build the MTP layers and write their KV over each
 # chunk, for a NEURON_MTP decode (whose pool holds the layers; the prefill itself runs no speculative step)
 PD_MTP_KV_ENV = "SGLANG_NEURON_MIMO_PD_MTP_KV"
@@ -64,13 +59,12 @@ def enabled() -> bool:
     return False
 
 
-def num_layers(environ=os.environ) -> int:
-    """The MTP layers the draft runs (module docstring): 3 or 1."""
-    value = environ.get(LAYERS_ENV, "3").strip()
-    if value not in ("1", "3"):
-        raise ValueError(f"{LAYERS_ENV}={value!r}: set 3 (the checkpoint's MTP layers, one a draft) or 1 (the first "
-                         "layer, chained)")
-    return int(value)
+NUM_LAYERS = 3
+
+
+def num_layers() -> int:
+    """The MTP layers the draft runs: the checkpoint's three (module docstring)."""
+    return NUM_LAYERS
 
 
 def rotate(tokens: torch.Tensor, at: torch.Tensor, token: torch.Tensor) -> torch.Tensor:
@@ -143,9 +137,7 @@ class MiMoMtp(nn.Module):
     def project_ids(self, graph, next_ids: torch.Tensor, prev: torch.Tensor) -> torch.Tensor:
         """``project`` of the embeddings of ``next_ids`` [T]: at most 128 rows in one kernel (kernels/mtp_head.py: the
         embedding, both norms, eh_proj and its all-gather), else in torch."""
-        from sglang_neuron.models.mimo_v2.model import head_kernel_enabled
-
-        if not head_kernel_enabled() or next_ids.shape[0] > 128:
+        if next_ids.shape[0] > 128:
             return self.project(graph.embed(next_ids), prev)
         from sglang_neuron.backend.stack import wrap_nki
         from sglang_neuron.models.mimo_v2.kernels.mtp_head import mtp_project
@@ -162,7 +154,7 @@ class MiMoMtp(nn.Module):
         before the final norm [T, H]."""
         layer = self.layer
         x = self.project(graph.embed_tokens(next_ids, scatter_tokens=False, rank=rank), hidden)
-        x = x + self.attn.prefill(layer.input_layernorm(x), cos, sin, md)
+        x = x + self.attn.prefill(x, cos, sin, md, norm=layer.input_layernorm)
         return x + layer.mlp(layer.post_attention_layernorm(x))
 
     def decode(self, graph, next_ids, prev, cos, sin, md, mask, slots, span: int, caches, rank, kernel=None) -> tuple:

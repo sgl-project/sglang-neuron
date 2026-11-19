@@ -43,7 +43,7 @@ if [ "$CONTEXT" -gt 262144 ]; then
 fi
 
 # NEURON_MTP (models/mimo_v2/mtp.py): one decode step verifies the previous step's 3 drafts and drafts 3 more with the
-# MTP layers (SGLANG_NEURON_MIMO_MTP_LAYERS: 3, the checkpoint's, or 1, the first one chained)
+# checkpoint's 3 MTP layers
 SPEC_ARGS=()
 if [ "${MTP:-0}" = 1 ]; then
     SPEC_ARGS=(--speculative-algorithm NEURON_MTP)

@@ -34,13 +34,6 @@ KNOBS: dict = {
     "SGLANG_NEURON_GLM52_ATTN_W8": CONFIG,
     # MiMo-V2 (models/mimo_v2): the routed experts' format (fp8, converted without loss, or bf16), the full layers'
     # decode attention (mask or posid) and the K/V write's torch path (kv_write.py)
-    "SGLANG_NEURON_MIMO_EXPERTS": CONFIG,
-    "SGLANG_NEURON_MIMO_FULL_DECODE": CONFIG,
-    "SGLANG_NEURON_MIMO_KV_WRITE_TORCH": CONFIG,
-    "SGLANG_NEURON_MIMO_DECODE_MOE_FUSED": CONFIG,
-    "SGLANG_NEURON_MIMO_DECODE_ATTN_FUSED": CONFIG,
-    "SGLANG_NEURON_MIMO_DECODE_LAYER_KERNEL": CONFIG,
-    "SGLANG_NEURON_MIMO_MTP_LAYERS": CONFIG,
     "SGLANG_NEURON_MIMO_KV_SCALE": CONFIG,
     "SGLANG_NEURON_HYBRID_SWA_HICACHE": CONFIG,
     "SGLANG_NEURON_MIMO_PD_MTP_KV": CONFIG,
@@ -50,8 +43,6 @@ KNOBS: dict = {
     # MiMo-V2: the converted FP8 experts kept on disk across launches (models/mimo_v2/experts_fp8._ExpertCache)
     "SGLANG_NEURON_MIMO_EXPERT_CACHE": CONFIG,
     # MiMo-V2: the decode MoE half kernel and the step's head kernels (models/mimo_v2/model.py)
-    "SGLANG_NEURON_MIMO_MOE_W8A8": CONFIG,
-    "SGLANG_NEURON_MIMO_HEAD_KERNEL": CONFIG,
     "SGLANG_NEURON_MIMO_KVDP": CONFIG,
     # MiMo-V2: the decode graphs' context rungs (models/mimo_v2/sglang_model.decode_context_ladder)
     "SGLANG_NEURON_MIMO_DECODE_CONTEXTS": CONFIG,

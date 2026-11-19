@@ -9,9 +9,7 @@ write as an output alias and the next reader is ordered after it. From the vllm-
 #67, ``kernels/kv_cache_write.py``): on the native route it wrote in place, 0.65 ms for two writes whatever the pool
 size, as long as no two layers share a buffer, which the Neuron pools never do (one tensor per layer).
 
-``SGLANG_NEURON_MIMO_KV_WRITE_TORCH=1`` writes with ``index_put_`` instead, to rule the kernel in or out."""
-
-import os
+The torch ``index_put_`` below is the CPU reference."""
 
 import nki
 import nki.isa as nisa
@@ -25,7 +23,6 @@ from sglang_neuron.backend.stack import wrap_nki
 from sglang_neuron.utils.hardware_config import get_logical_nc_config
 from sglang_neuron.utils.neuron_utils import can_run_kernel
 
-FORCE_TORCH_ENV = "SGLANG_NEURON_MIMO_KV_WRITE_TORCH"
 
 
 def _scatter_rows(cache_flat, new_rows, idx_tile, start, tile_n, d):
@@ -69,7 +66,7 @@ def write_kv(k_cache: Tensor, v_cache: Tensor, k: Tensor, v: Tensor, slots: Tens
     slots = torch.where((slots < 0) | (slots >= blocks * page), torch.zeros_like(slots), slots)
     k = k.reshape(heads * tokens, d).to(k_cache.dtype)
     v = v.reshape(heads * tokens, d).to(v_cache.dtype)
-    if not can_run_kernel(k) or os.environ.get(FORCE_TORCH_ENV) == "1":
+    if not can_run_kernel(k):
         block, offset = slots // page, slots % page
         head = torch.arange(heads, device=k.device).repeat_interleave(tokens)
         index = (block.repeat(heads), head, offset.repeat(heads))

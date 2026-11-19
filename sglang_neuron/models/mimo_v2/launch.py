@@ -7,7 +7,7 @@ reads this module first.
   text-only, and one that asks for the towers is refused.
 - The KV page is the platform's 128 tokens, which the sliding window (128) is a whole number of: nkilib's segmented
   prefill loads a window's pages only when the window divides by the page.
-- The routed experts run in Trn2's FP8 (experts_fp8.py) unless ``SGLANG_NEURON_MIMO_EXPERTS=bf16``: their kernels
+- The routed experts run in Trn2's FP8 (experts_fp8.py): their kernels
   compile ``float8_e4m3fn`` only as Trn2's own e4m3 (``UNSAFE_FP8FNCAST=1``), whose 240 bounds the converted values."""
 
 import os
@@ -18,13 +18,10 @@ FP8_FN_AS_E4M3 = "--experimental-unsafe-fp8e4m3fn-as-fp8e4m3"
 
 
 def fp8_experts(server_args, environ=os.environ) -> bool:
-    """Whether the launch's experts are FP8: a quantized checkpoint and SGLANG_NEURON_MIMO_EXPERTS not bf16."""
+    """Whether the launch's experts are FP8: a quantized checkpoint (always served in FP8)."""
     from sglang_neuron.models import catalog
 
-    if catalog.checkpoint_quantization(server_args) != "fp8":
-        return False
-    value = environ.get("SGLANG_NEURON_MIMO_EXPERTS", "fp8").strip()
-    return value == "fp8"
+    return catalog.checkpoint_quantization(server_args) == "fp8"
 
 
 def kv_page_size(server_args) -> int:
@@ -43,9 +40,6 @@ def launch_problems(server_args, checkpoint_config, environ=os.environ) -> list:
     from sglang_neuron.models.mimo_v2.config import config_problems
 
     problems = list(config_problems(checkpoint_config))
-    value = environ.get("SGLANG_NEURON_MIMO_EXPERTS", "fp8").strip()
-    if value not in ("fp8", "bf16"):
-        problems.append(f"SGLANG_NEURON_MIMO_EXPERTS={value!r}: set fp8 (the default) or bf16")
     if getattr(server_args, "enable_multimodal", None):
         problems.append("--enable-multimodal: the Neuron graphs serve MiMo-V2's text decoder only (no vision or audio "
                         "tower)")

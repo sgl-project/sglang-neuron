@@ -27,7 +27,7 @@ graph 22.17 and 25.36 ms). Its 96 in-kernel all-reduces a step are the cost to c
 | Stage | State |
 | --- | --- |
 | 1. layer kernel, the all-reduces outside | done: `kernels/attn_half.py`, `kernels/moe_half.py` (the default decode) |
-| 2. the all-reduces inside, no XLA in a layer | done: `kernels/layer.py` (`SGLANG_NEURON_MIMO_DECODE_LAYER_KERNEL=1`), slower than stage 1 so far |
+| 2. the all-reduces inside, no XLA in a layer | done: `kernels/layer.py`, the only decode form (the XLA forms and their switches are gone) |
 | 3. one call a step | not started |
 | 4. own attention, FP8 KV | not started |
 

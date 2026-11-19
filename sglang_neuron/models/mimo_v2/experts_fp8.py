@@ -16,8 +16,7 @@ activations, FP8 weights, the per-row scale applied after each matmul):
   kernels/moe_cte_fp8w.py), which takes per-channel scales.
 
 The tensors are ``float8_e4m3fn`` holding values of at most 240, which the graphs compile as Trn2's e4m3 (the same
-bytes; launch.py's UNSAFE_FP8FNCAST and the host's compiler option). ``SGLANG_NEURON_MIMO_EXPERTS=bf16`` keeps the
-bf16 experts, the accuracy reference."""
+bytes; launch.py's UNSAFE_FP8FNCAST and the host's compiler option)."""
 
 import os
 import threading
@@ -35,17 +34,13 @@ from sglang_neuron.utils.weight_loader import SafetensorsWeightLoader, set_weigh
 
 FP8 = torch.float8_e4m3fn
 FP8_MAX = 240.0
-EXPERTS_ENV = "SGLANG_NEURON_MIMO_EXPERTS"
 # moe_tkg's tokens a call
 MAX_TOKENS = 128
 
 
 def enabled(environ=os.environ) -> bool:
-    value = environ.get(EXPERTS_ENV, "fp8").strip()
-    if value not in ("fp8", "bf16"):
-        raise ValueError(f"{EXPERTS_ENV}={value!r}: set fp8 (the experts in Trn2's FP8, converted without loss) or "
-                         "bf16")
-    return value == "fp8"
+    """The routed experts run in Trn2's FP8 (converted without loss): always."""
+    return True
 
 
 def requant_rows(w: torch.Tensor) -> tuple:
