@@ -70,8 +70,9 @@ bucket whose table is not wider than the kept pages attends densely.
 `--speculative-algorithm NEURON_MTP` drafts with the checkpoint's MTP layer (`mtp.py`, `mtp_step.py`): each decode step
 verifies a row's 1 + 3 tokens, accepts on the device, then runs the MTP layer over the span and two more single-token
 drafts; the drafts, the accepted length and the next tokens stay on the device. The prefill writes the MTP layer's KV over
-each chunk. The step runs under DCP with the FP8 cache and samples on the device (`SGLANG_NEURON_SAMPLER=topk_topp`);
-requests with logprobs are refused.
+each chunk. The step runs under DCP with the FP8 cache and samples on the device (`SGLANG_NEURON_SAMPLER=temperature` or
+`topk_topp`); requests with logprobs are refused. A sparse decode folds each span's tokens into its pages' summaries from
+the span's K computed beside the attention kernel (`sparse.SparseState.fold_span`, `SGLANG_NEURON_HY3_SPAN_K`).
 
 ## Serving
 
@@ -79,14 +80,23 @@ Aggregated, on the 64 logical cores of a trn2.48xlarge (the configuration measur
 
 ```bash
 SGLANG_NEURON_HY3_KV_SCALES=/profiles/Hy3-FP8_mtp_neuron.safetensors \
-SGLANG_NEURON_HY3_SPARSE_DECODE=0.0625 SGLANG_NEURON_SAMPLER=topk_topp \
+SGLANG_NEURON_HY3_SPARSE_DECODE=0.0625 SGLANG_NEURON_SAMPLER=temperature \
+SGLANG_NEURON_HY3_PREFILL_SEG=2048 SGLANG_NEURON_HY3_SPARSE_PREFILL_KEEP=16384 \
 python3 -m sglang.launch_server --model-path /models/Hy3-FP8 --served-model-name hy3 \
   --tp-size 64 --ep-size 64 --context-length 262144 --max-total-tokens 262144 \
   --chunked-prefill-size 2048 --max-running-requests 16 --mem-fraction-static 0.85 \
   --kv-cache-dtype fp8_e4m3 --dcp-size 8 --speculative-algorithm NEURON_MTP \
-  --prefill-decode-interval 8 --prefill-decode-interval-min-bs 8 --cuda-graph-bs-decode 4 8 16 \
-  --host 0.0.0.0 --port 30000
+  --prefill-decode-interval 2 --prefill-decode-interval-min-bs 8 --cuda-graph-bs-decode 8 12 16 \
+  --enable-cache-report --host 0.0.0.0 --port 30000
 ```
+
+- `SGLANG_NEURON_HY3_PREFILL_SEG=2048`: the DCP prefill attends in 2048-token query segments over 1024-token prior
+  segments (the vendored `kernels/attention_kv_parallel_fp8.py` takes the two apart; the stock kernel is wrong past 1024).
+- `SGLANG_NEURON_HY3_SPARSE_PREFILL_KEEP=16384`: a DCP prefill chunk over a longer prior attends to 16384 of its prior
+  tokens, picked by the page summaries under the chunk's query-group envelopes (`sparse.prefill_select`).
+- `--prefill-decode-interval 2`: a waiting prefill runs after at most two decode steps.
+- `SGLANG_NEURON_PREFILL_YIELD=2048` (optional, `sglang_patches/prefill_yield.py`) lets a prompt of at most 2048 new tokens
+  prefill between two chunks of a long one: under AgentX it lowers TTFT and raises the decode's P90 ITL (below).
 
 Disaggregated over NIXL: a TP64 prefill without DCP in front of a TP64 DCP8 `NEURON_MTP` decode, both with the FP8 cache
 and the same KV scale profile. The prefill takes `SGLANG_NEURON_HY3_PD_MTP_KV=1` (it holds the MTP layer and writes its
@@ -111,19 +121,27 @@ tencent/Hy3-FP8 on one trn2.48xlarge (Neuron SDK 2.33), the aggregated configura
 
 | | |
 | --- | --- |
-| prefill | about 4.0k tokens/s (2048-token chunks) |
-| decode TPOT, 128-token prompts, 1024 out | 21.6 ms at concurrency 1, 20.5 ms at 8 (MTP accepted length 2.5 to 2.9) |
-| GSM8K (5-shot, 1319 problems, MTP on) | 0.933 |
-| InferenceX AgentX, concurrency 8, 1 h (`semianalysis_cc_traces_weka_062126_256k`, real acceptance) | 149.1 output tokens/s, TTFT p50 2.3 s, ITL p50 46.3 ms |
+| cold prefill, 98k-token prompt | 22.6 s |
+| decode TPOT, 128-token prompts, 1024 out, temperature 0.9, concurrency 8 | 14.9 ms (MTP accepted length 3.1) |
+| GSM8K (5-shot, 200 problems, MTP on) | 0.935 to 0.950 |
+| needle retrieval, 16k to 85k tokens, 3 depths | 12/12 |
+| InferenceX AgentX, concurrency 8, 1 h (`semianalysis_cc_traces_weka_062126_256k`, real acceptance) | 206.9 output tokens/s, 923 requests; TTFT p50/p90/p99 1.87/5.71/18.1 s; ITL p50/p90 30.1/53.4 ms |
+| the same with `SGLANG_NEURON_PREFILL_YIELD=2048` | 206.2 output tokens/s; TTFT 1.72/5.27/16.6 s; ITL 30.9/59.2 ms |
+
+How the AgentX point moved (same run each, one change at a time): 149.1 (the configuration before the prefill segments)
+-> 154.3 (query/prior segments) -> 171.8 (sparse DCP prefill) -> 185.0 (`temperature` sampler admitted under MTP) ->
+187.8 (drafts without the logprob path, decode bucket 12) -> 191.9 (direct submit of the decode graph) -> 202.2
+(span summaries from the computed K) -> 206.9 (`--prefill-decode-interval 2`).
 
 PD (one trn2.48xlarge each for the prefill and the decode): GSM8K (200 problems) 0.945 with the sparse decode, 80k-token
 needle retrieval correct, decode TPOT 19.0 ms at concurrency 8.
 
 ## Status and next steps
 
-- The aggregated AgentX run spends about 30% of its time in prefill chunks that stall the decode (about 0.6 s each at
-  80k context): the prefill's MoE all-reduce waits on the slowest expert rank, and the DCP prefill attention costs well
-  above its compute.
-- A sparse decode step still pays for its page summaries (the fold of each span token and the selection).
+- TTFT's tail is a long cold prompt's chunks: a Neuron prefill forward runs one request, so the turns behind a 170k-token
+  cold prompt wait for all of its chunks (`SGLANG_NEURON_PREFILL_YIELD` trades decode ITL for part of it).
+- A decode layer (bs 8, MTP span 4, 32k context) is about 0.43 ms, a quarter of it waiting on its three collectives (the
+  DCP merge and two 64-rank all-reduces of 256 KB, 27 us each, latency-bound; the runtime's default algorithms are the
+  fastest measured); the span fold and the selection still cost about 3.9 ms of a 43.6 ms step.
 - The PD prefill runs without DCP, so its attention over a long prior is not sharded; the DCP stripe transfer serves MLA
   pools only today.
