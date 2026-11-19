@@ -37,6 +37,7 @@ KNOBS: dict = {
     "SGLANG_NEURON_HY3_SPARSE_SELECT_EVERY": CONFIG,
     "SGLANG_NEURON_HY3_PREFILL_SEG": CONFIG,
     "SGLANG_NEURON_HY3_SPAN_K": CONFIG,
+    "SGLANG_NEURON_HY3_DECODE_NORM": CONFIG,
     # a short prompt's prefill between two chunks of a long one (sglang_patches/prefill_yield)
     "SGLANG_NEURON_PREFILL_YIELD": CONFIG,
     "SGLANG_NEURON_HY3_SPARSE_PREFILL_KEEP": CONFIG,
