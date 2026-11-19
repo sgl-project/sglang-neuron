@@ -107,6 +107,33 @@ DUMMY_LIVE_CTX = 1024
 # run the original GraphModule eagerly
 _NO_EAGER_FALLBACK = {"fallback_execution": False}
 
+
+def _deferrable(backend_name: str, runner):
+    """``backend_name``'s dynamo backend, whose compiled graphs return placeholders of their outputs' shapes instead of
+    executing while ``runner.defer_execution`` is set (GraphRunner._precompile)."""
+    from torch._dynamo.backends.registry import lookup_backend
+
+    backend = lookup_backend(backend_name)
+
+    def compile_fn(gm, example_inputs, **kwargs):
+        compiled = backend(gm, example_inputs, **kwargs)
+        outputs = next(n for n in gm.graph.nodes if n.op == "output").args[0]
+        flat = outputs if isinstance(outputs, (tuple, list)) else (outputs,)
+        specs = [getattr(n, "meta", {}).get("example_value") for n in flat]
+
+        def run(*args):
+            if not runner.defer_execution:
+                return compiled(*args)
+            device = next(a.device for a in args if isinstance(a, torch.Tensor))
+            out = [None if not isinstance(v, torch.Tensor) else
+                   torch.empty((), dtype=v.dtype, device=device).as_strided(tuple(v.shape), (0,) * v.dim())
+                   for v in specs]
+            return tuple(out) if isinstance(outputs, (tuple, list)) else out[0]
+
+        return run
+
+    return compile_fn
+
 # _check_boundary_in_slots' default: take this thread's writeback record itself
 _TAKE = object()
 
@@ -651,8 +678,14 @@ class NeuronModelRuntime:
         # every warmed bucket is its own static graph (dynamic=False): dynamo would otherwise mark a dim dynamic once
         # another family's call through the same code saw another size, and torch-neuronx's NKI wrapper refuses
         # symbolic shapes
-        self.compiled = torch.compile(self.execution_model, backend=stack.compile_backend_name(cpu_mode=cpu_mode),
-                                      fullgraph=True, dynamic=False, options=options)
+        backend = stack.compile_backend_name(cpu_mode=cpu_mode)
+        # warmup_all lowers every shape before it executes the first (_precompile)
+        self.defer_execution = False
+        self.precompiles = self._precompiles(cpu_mode, declared_direct)
+        if self.precompiles:
+            backend = _deferrable(backend, self)
+        self.compiled = torch.compile(self.execution_model, backend=backend, fullgraph=True, dynamic=False,
+                                      options=options)
         # the ranks meet before a model execution whose NEFF differs from the last one (program_fence), in place of the
         # runtime's per-execution barrier: on an aggregated server, and wherever this runtime has more than one shape
         from sglang_neuron.model_executor import program_fence
@@ -710,6 +743,12 @@ class NeuronModelRuntime:
         if self.sgl_model.segmented_prefill:
             check_prefill_tiles(tb for kind, tb, _ in shapes if kind == "prefill")
         tp_barrier()
+        # one compiler environment from the first submit to the last execution: torch-neuronx's compile workers read
+        # it when they run a queued compile, not when it is submitted
+        scope = contextlib.ExitStack()
+        scope.enter_context(stack.compile_scope(self.compiler_args))
+        if getattr(self, "precompiles", False):
+            self._precompile(shapes)
         # the ranks compare each executor's NEFF before its first submit (spmd_check.note_first_call)
         group = None
         if not backend_envs.SGLANG_NEURON_CPU_MODE:
@@ -741,6 +780,7 @@ class NeuronModelRuntime:
             if targets and armed:
                 # and the tensors the graph declares it writes (a model's KV caches beside its kernels' outputs)
                 check_in_place(written, targets, kind)
+        scope.close()
         if group is not None:
             # every shape warmed with a recorded NEFF on every rank, one program per shape on all of them
             spmd_check.check(group, self.tp_size)
@@ -755,6 +795,34 @@ class NeuronModelRuntime:
             world_barrier()
         self._warmed = True
         logger.info("[neuron] warmup done in %.1fs (%d shapes)", time.time() - t0, len(shapes))
+
+    def _precompiles(self, cpu_mode: bool, direct: bool) -> bool:
+        """Whether warmup_all lowers every shape before it executes the first (``SGLANG_NEURON_PRECOMPILE``, on by
+        default): a device process whose calls all go through the compiled graph (no direct submit, no PP seam)."""
+        from sglang_neuron.backend import envs as backend_envs
+
+        return (backend_envs.SGLANG_NEURON_PRECOMPILE and not cpu_mode and not direct
+                and not getattr(self, "pp_active", False))
+
+    def _precompile(self, shapes) -> None:
+        """Trace every shape, executing nothing, so their NEFFs compile side by side on torch-neuronx's compile workers
+        (``NEURON_PARALLEL_COMPILE_WORKERS``, 16 by default; its backend submits a compile and returns) instead of one
+        at a time under the warm-up's first call of each shape. The calls return placeholders (_deferrable); the
+        warm-up's calls then hit the same dynamo cache entries and execute, each waiting for its NEFF.
+
+        Each rank traces every shape (its calls need the cache entries) but starts at its own: the ranks' graphs are
+        one SPMD program, so the first rank to trace a shape submits the compile the others then find, and every
+        compile starts within the first rounds of tracing instead of after all the shapes before it."""
+        t0 = time.time()
+        compiled = getattr(self.compiled, "__wrapped__", self.compiled)
+        start = self.tp_rank % len(shapes) if shapes else 0
+        self.defer_execution = True
+        try:
+            for kind, bucket, context in shapes[start:] + shapes[:start]:
+                compiled(**self._synthetic_inputs(kind, bucket, context))
+        finally:
+            self.defer_execution = False
+        logger.info("[neuron] traced %d shapes in %.1fs, their compiles queued", len(shapes), time.time() - t0)
 
     def _synthetic_inputs(self, kind: str, bucket: int, context: Optional[int] = None) -> dict:
         """Warm-up and idle-rank dummy inputs. KV writes land only in SGLang's reserved page 0 (slot 0) and reads only

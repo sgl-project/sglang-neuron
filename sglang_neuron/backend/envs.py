@@ -15,6 +15,8 @@ os.environ.setdefault("NKI_DISABLE_TRACE_CACHE", "1")
 _BOOLEAN_DEFAULTS = {
     # no Neuron device: the CPU test suites run the torch paths
     "SGLANG_NEURON_CPU_MODE": False,
+    # the warm-up queues every graph's compile before it executes the first (model_executor/graph_runner._precompile)
+    "SGLANG_NEURON_PRECOMPILE": True,
 }
 
 
