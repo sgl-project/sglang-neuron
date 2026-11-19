@@ -134,7 +134,7 @@ def greedy(x, norm_w, lm_wT, rank, mesh, eps=1e-6):
         ps = nl.ndarray((P, COLS), dtype=nl.float32, buffer=nl.psum)
         for h1 in range(H1):
             w = nl.ndarray((P, COLS), dtype=lm_wT.dtype, buffer=nl.sbuf)
-            nisa.dma_copy(dst=w[0:P, 0:cs], src=lm_wT.ap(pattern=[[Vr, P], [1, cs]], offset=h1 * P * Vr + v0 + c0))
+            nisa.dma_copy(dst=w[0:P, 0:cs], src=lm_wT.ap(pattern=[[Vr, P], [1, cs]], offset=h1 * P * Vr + v0 + c0), dge_mode=nisa.dge_mode.hwdge)
             nisa.nc_matmul(dst=ps[0:T, 0:cs], stationary=nT[0:P, h1, 0:T], moving=w[0:P, 0:cs])
         nisa.tensor_copy(dst=lb[0:T, 0:cs], src=ps[0:T, 0:cs])
         nisa.tensor_copy(dst=logits[0:T, c0:c0 + cs], src=lb[0:T, 0:cs])

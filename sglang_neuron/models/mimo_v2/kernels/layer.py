@@ -29,7 +29,7 @@ from nkilib.core.mlp.mlp import mlp
 from nkilib.core.utils.common_types import ActFnType, NormType
 
 from sglang_neuron.models.mimo_v2.kernels.attn_half import attn_half
-from sglang_neuron.models.mimo_v2.kernels.moe_half import moe_half
+from sglang_neuron.models.mimo_v2.kernels.moe_half import moe_half, moe_prefetch
 
 P = 128
 
@@ -83,7 +83,7 @@ def _residual(x2d, add2d, B: int, H: int, name: str):
 def moe_layer(X, attn_gamma, W_qkv, cos, sin, active_blocks_table, K_cache, V_cache, attention_mask, sink, slots,
               W_o, moe_gamma, router_wT, expert_bias, ebase, gate_up_w, down_w, gate_up_scale, down_scale, mesh,
               k_scale=None, v_scale=None, eps=1e-6, softmax_scale=1.0, v_head_dim=128, route_scale=1.0, top_k=8,
-              fp8_act=True):
+              fp8_act=True, prefetch=6):
     """X [B, S, H] bf16, the layer's input (S tokens a row, a NEURON_MTP span or 1); the attention half's inputs as
     attn_half's (``k_scale`` / ``v_scale`` over an FP8 cache), the MoE half's as moe_half's. Returns the layer's
     output [B x S, H] bf16. The caches are written in place and not returned: returned beside the output, the
@@ -99,6 +99,9 @@ def moe_layer(X, attn_gamma, W_qkv, cos, sin, active_blocks_table, K_cache, V_ca
 
     pid = nl.program_id(axis=0)
     HH = H // n_prg
+    # the experts' first weight tiles, loading while the attention and its all-reduce run (the DMA queues are idle
+    # there: a decode profile showed ~100 us of each layer's ~405 waiting on the two all-reduces)
+    pre = moe_prefetch(gate_up_w, prefetch) if fp8_act and prefetch else None
     # the layer's rows in SBUF, the residual stream from here to the store
     x_sb = nl.ndarray((P, H), dtype=X.dtype, buffer=nl.sbuf)
     nisa.dma_copy(dst=x_sb[0:R, 0:H], src=X.reshape((R, H)).ap(pattern=[[H, R], [1, H]], offset=0))
@@ -110,7 +113,7 @@ def moe_layer(X, attn_gamma, W_qkv, cos, sin, active_blocks_table, K_cache, V_ca
     nisa.tensor_tensor(dst=h[0:R, 0:H], data1=x_sb[0:R, 0:H], data2=attn[0:R, 0:H], op=nl.add)
     moe = moe_half(X.reshape((R, H)), moe_gamma, router_wT, expert_bias, ebase, gate_up_w, down_w, gate_up_scale,
                    down_scale, eps=eps, route_scale=route_scale, top_k=top_k, hidden_sb=h, out_in_sbuf=True,
-                   fp8_act=fp8_act)
+                   fp8_act=fp8_act, pre=pre)
     moe = _sb_all_reduce(moe, R, H, rg, pid, n_prg, 3)
     o_sb = nl.ndarray((P, H), dtype=X.dtype, buffer=nl.sbuf)
     nisa.tensor_tensor(dst=o_sb[0:R, 0:H], data1=h[0:R, 0:H], data2=moe[0:R, 0:H], op=nl.add)

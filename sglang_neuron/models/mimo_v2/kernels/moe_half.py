@@ -41,6 +41,31 @@ DN_COLS = 1024
 FP8_MAX = 240.0
 
 
+def moe_prefetch(gate_up_w, n: int):
+    """The first ``n`` gate / up weight tiles moe_half's W8A8 loop reads (expert 0 first, two 128-row tiles of this
+    program's half of H a tile), DMA'd now into buffers of their own: a caller issues this before work the experts do
+    not depend on (layer.py: before the attention and its all-reduce, while the DMA queues are idle) and hands the
+    tiles to moe_half (``pre``). Splitting gate / up over I instead (no exchange between the programs) measured slower:
+    its weight rows load in 1 KB runs."""
+    E, H, _, I = gate_up_w.shape  # noqa: E741
+    n_prg = nl.num_programs(axes=0)
+    pid = nl.program_id(axis=0)
+    n_k = H // P // n_prg
+    h0 = pid * (H // n_prg)
+    tiles = []
+    for t in range(n):
+        e, k = t // (n_k // 2), t % (n_k // 2)
+        if e >= E:
+            break
+        buf = nl.ndarray((P, 2, 2 * I), dtype=gate_up_w.dtype, buffer=nl.sbuf)
+        row = h0 + 2 * k * P
+        nisa.dma_copy(dst=buf[0:P, 0:2, 0 : 2 * I],
+                      src=gate_up_w.ap(pattern=[[2 * I, P], [P * 2 * I, 2], [1, 2 * I]],
+                                       offset=e * (H * 2 * I) + row * 2 * I), dge_mode=nisa.dge_mode.hwdge)
+        tiles.append(buf)
+    return tiles
+
+
 def _token_scales(x, T: int, n: int):
     """(scale, 1 / scale) [128, 1] fp32 of each row 0 .. T - 1 of ``x`` [128, n]: 240 / its absolute max (a zero row
     gets a scale of 1)."""
@@ -62,7 +87,7 @@ def _token_scales(x, T: int, n: int):
 
 @nki.jit
 def moe_half(hidden, ln_w, router_wT, expert_bias, ebase, gate_up_w, down_w, gate_up_scale, down_scale, eps=1e-6,
-             route_scale=1.0, top_k=8, hidden_sb=None, out_in_sbuf=False, fp8_act=True):
+             route_scale=1.0, top_k=8, hidden_sb=None, out_in_sbuf=False, fp8_act=True, pre=None):
     """Inside another kernel (layer.py) ``hidden_sb`` holds the rows in SBUF (``hidden`` then gives the shape only),
     and ``out_in_sbuf`` returns this program's half of H of the partial in SBUF (rows 0 .. T - 1 of a [128, H /
     programs] tile) in place of the HBM output. ``fp8_act`` (the default) quantizes each token's activations to FP8
@@ -123,14 +148,14 @@ def moe_half(hidden, ln_w, router_wT, expert_bias, ebase, gate_up_w, down_w, gat
 
     # ---- router: logits [T, EA] = normed @ W^T (bf16 x bf16, fp32 accumulate) ----
     rw = nl.ndarray((P, H1, EA), dtype=router_wT.dtype, buffer=nl.sbuf)
-    nisa.dma_copy(dst=rw[0:P, 0:H1, 0:EA], src=router_wT.ap(pattern=[[EA, P], [P * EA, H1], [1, EA]], offset=0))
+    nisa.dma_copy(dst=rw[0:P, 0:H1, 0:EA], src=router_wT.ap(pattern=[[EA, P], [P * EA, H1], [1, EA]], offset=0), dge_mode=nisa.dge_mode.hwdge)
     lg = nl.ndarray((P, EA), dtype=nl.float32, buffer=nl.psum)
     for h1 in range(H1):
         nisa.nc_matmul(dst=lg[0:T, 0:EA], stationary=nT[0:P, h1, 0:T], moving=rw[0:P, h1, 0:EA])
     scr = nl.ndarray((P, EA), dtype=nl.float32, buffer=nl.sbuf)
     nisa.activation(dst=scr[0:T, 0:EA], op=nl.sigmoid, data=lg[0:T, 0:EA])
     bia = nl.ndarray((P, EA), dtype=nl.float32, buffer=nl.sbuf)
-    nisa.dma_copy(dst=bia[0:T, 0:EA], src=expert_bias.ap(pattern=[[0, T], [1, EA]], offset=0))
+    nisa.dma_copy(dst=bia[0:T, 0:EA], src=expert_bias.ap(pattern=[[0, T], [1, EA]], offset=0), dge_mode=nisa.dge_mode.hwdge)
     sb = nl.ndarray((P, EA), dtype=nl.float32, buffer=nl.sbuf)
     nisa.tensor_tensor(sb[0:T, 0:EA], scr[0:T, 0:EA], bia[0:T, 0:EA], nl.add)
     top8 = nl.ndarray((P, 8), dtype=nl.float32, buffer=nl.sbuf)
@@ -182,12 +207,16 @@ def moe_half(hidden, ln_w, router_wT, expert_bias, ebase, gate_up_w, down_w, gat
         if fp8_act:
             # two 128-row tiles of H a pass (double row)
             for k in range(n_k // 2):
-                buf = gu2_ring[slots[0] % RING]
-                slots[0] += 1
+                tile = e * (n_k // 2) + k
                 row = h0 + 2 * k * P
-                nisa.dma_copy(dst=buf[0:P, 0:2, 0 : 2 * I],
-                              src=gate_up_w.ap(pattern=[[2 * I, P], [P * 2 * I, 2], [1, 2 * I]],
-                                               offset=e * (H * 2 * I) + row * 2 * I))
+                if pre is not None and tile < len(pre):
+                    buf = pre[tile]  # loaded ahead (moe_prefetch)
+                else:
+                    buf = gu2_ring[slots[0] % RING]
+                    slots[0] += 1
+                    nisa.dma_copy(dst=buf[0:P, 0:2, 0 : 2 * I],
+                                  src=gate_up_w.ap(pattern=[[2 * I, P], [P * 2 * I, 2], [1, 2 * I]],
+                                                   offset=e * (H * 2 * I) + row * 2 * I), dge_mode=nisa.dge_mode.hwdge)
                 for ci, (g, c0, cs) in enumerate(chunks):
                     nisa.nc_matmul(dst=ps[ci][0:T, 0:cs], stationary=xq[0:P, pid * n_k + 2 * k:pid * n_k + 2 * k + 2, 0:T],
                                    moving=buf[0:P, 0:2, g * I + c0 : g * I + c0 + cs],
@@ -198,7 +227,7 @@ def moe_half(hidden, ln_w, router_wT, expert_bias, ebase, gate_up_w, down_w, gat
                 slots[0] += 1
                 row = h0 + k * P
                 nisa.dma_copy(dst=buf[0:P, 0 : 2 * I],
-                              src=gate_up_w.ap(pattern=[[2 * I, P], [1, 2 * I]], offset=e * (H * 2 * I) + row * 2 * I))
+                              src=gate_up_w.ap(pattern=[[2 * I, P], [1, 2 * I]], offset=e * (H * 2 * I) + row * 2 * I), dge_mode=nisa.dge_mode.hwdge)
                 for ci, (g, c0, cs) in enumerate(chunks):
                     nisa.nc_matmul(dst=ps[ci][0:T, 0:cs], stationary=nT[0:P, pid * n_k + k, 0:T],
                                    moving=buf[0:P, g * I + c0 : g * I + c0 + cs])
@@ -221,7 +250,7 @@ def moe_half(hidden, ln_w, router_wT, expert_bias, ebase, gate_up_w, down_w, gat
         # the per-row (output column) scales of this program's half of I
         gus = nl.ndarray((P, 2, ILe), dtype=nl.float32, buffer=nl.sbuf)
         nisa.dma_copy(dst=gus[0:T, 0:2, 0:ILe],
-                      src=gate_up_scale.ap(pattern=[[0, T], [I, 2], [1, ILe]], offset=e * 2 * I + pid * ILe))
+                      src=gate_up_scale.ap(pattern=[[0, T], [I, 2], [1, ILe]], offset=e * 2 * I + pid * ILe), dge_mode=nisa.dge_mode.hwdge)
         nisa.tensor_tensor(gu[0:T, 0:2, 0:ILe], gu[0:T, 0:2, 0:ILe], gus[0:T, 0:2, 0:ILe], nl.multiply)
 
         g_sb = nl.ndarray((P, ILe), dtype=nl.float32, buffer=nl.sbuf)
@@ -257,7 +286,7 @@ def moe_half(hidden, ln_w, router_wT, expert_bias, ebase, gate_up_w, down_w, gat
                     r0 = pid * ILe + 2 * j * P
                     nisa.dma_copy(dst=db[0:P, 0:2, 0:DN_COLS],
                                   src=down_w.ap(pattern=[[H, P], [P * H, 2], [1, DN_COLS]],
-                                                offset=base + r0 * H + hq * DN_COLS))
+                                                offset=base + r0 * H + hq * DN_COLS), dge_mode=nisa.dge_mode.hwdge)
                     for b in range(DN_COLS // 512):
                         nisa.nc_matmul(dst=pd[b][0:T, 0:512], stationary=itT[0:P, 2 * j:2 * j + 2, 0:T],
                                        moving=db[0:P, 0:2, b * 512 : (b + 1) * 512],
@@ -268,13 +297,13 @@ def moe_half(hidden, ln_w, router_wT, expert_bias, ebase, gate_up_w, down_w, gat
                     slots[1] += 1
                     r0 = pid * ILe + j * P
                     nisa.dma_copy(dst=db[0:P, 0:DN_COLS],
-                                  src=down_w.ap(pattern=[[H, P], [1, DN_COLS]], offset=base + r0 * H + hq * DN_COLS))
+                                  src=down_w.ap(pattern=[[H, P], [1, DN_COLS]], offset=base + r0 * H + hq * DN_COLS), dge_mode=nisa.dge_mode.hwdge)
                     for b in range(DN_COLS // 512):
                         nisa.nc_matmul(dst=pd[b][0:T, 0:512], stationary=itT[0:P, j, 0:T],
                                        moving=db[0:P, b * 512 : (b + 1) * 512])
             ds = nl.ndarray((P, DN_COLS), dtype=nl.float32, buffer=nl.sbuf)
             nisa.dma_copy(dst=ds[0:T, 0:DN_COLS],
-                          src=down_scale.ap(pattern=[[0, T], [1, DN_COLS]], offset=e * H + hq * DN_COLS))
+                          src=down_scale.ap(pattern=[[0, T], [1, DN_COLS]], offset=e * H + hq * DN_COLS), dge_mode=nisa.dge_mode.hwdge)
             for b in range(DN_COLS // 512):
                 c0 = hq * DN_COLS + b * 512
                 scaled = nl.ndarray((P, 512), dtype=nl.float32, buffer=nl.sbuf)

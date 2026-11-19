@@ -110,7 +110,7 @@ def attn_half(X, rmsnorm_X_gamma, W_qkv, cos, sin, active_blocks_table, K_cache,
         for h in range(heads):
             w = nl.ndarray((P, COLS), dtype=W_o.dtype, buffer=nl.sbuf)
             nisa.dma_copy(dst=w[0:v_head_dim, 0:COLS],
-                          src=W_o.ap(pattern=[[H, v_head_dim], [1, COLS]], offset=h * v_head_dim * H + h0 + c * COLS))
+                          src=W_o.ap(pattern=[[H, v_head_dim], [1, COLS]], offset=h * v_head_dim * H + h0 + c * COLS), dge_mode=nisa.dge_mode.hwdge)
             nisa.nc_matmul(dst=ps[0:R, 0:COLS], stationary=lhsT[0:v_head_dim, h, 0:R], moving=w[0:v_head_dim, 0:COLS])
         nisa.tensor_copy(dst=o_sb[0:R, c * COLS:(c + 1) * COLS], src=ps[0:R, 0:COLS])
     if out_in_sbuf:
