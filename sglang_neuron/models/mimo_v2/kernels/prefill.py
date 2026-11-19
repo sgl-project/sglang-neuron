@@ -312,15 +312,18 @@ def prefill_route(hn, router_wT, expert_bias, ep_rank, positions, top_k=8, route
     part_f = nl.ndarray((P, 1), dtype=nl.float32, buffer=nl.sbuf)
     nisa.iota(part_f[0:P, 0:1], pattern=[[0, 1]], offset=0, channel_multiplier=1)
 
-    sel_all = nl.ndarray((P, NT, E), dtype=nl.float32, buffer=nl.sbuf)
-    rank_all = nl.ndarray((P, NT, E), dtype=nl.float32, buffer=nl.sbuf)
+    # each tile's selected pairs and their ranks, for the second pass; the tiles run in runtime loops (one copy of the
+    # body), the first tile's own copy reading no position before it
+    sel_h = nl.ndarray((T, E), dtype=nl.float32, buffer=nl.shared_hbm, name="prefill_route_sel")
+    rank_h = nl.ndarray((T, E), dtype=nl.float32, buffer=nl.shared_hbm, name="prefill_route_rank")
+    aff2d = aff_out.reshape((T, E))
     carry = nl.ndarray((P, E), dtype=nl.float32, buffer=nl.sbuf)
     nisa.memset(dst=carry[0:P, 0:E], value=0.0)
-    for t in range(NT):
-        t0 = t * P
+
+    def tile(t0, first_tile: bool):
         # ---- the router over the tile (moe_half's) ----
         xt = nl.ndarray((P, H), dtype=hn.dtype, buffer=nl.sbuf)
-        nisa.dma_copy(dst=xt[0:P, 0:H], src=hn.ap(pattern=[[H, P], [1, H]], offset=t0 * H))
+        nisa.dma_copy(dst=xt[0:P, 0:H], src=hn[nl.ds(t0, P), 0:H])
         xT = nl.ndarray((P, H1, P), dtype=nl.bfloat16, buffer=nl.sbuf)
         for h1 in range(H1):
             tp = nl.ndarray((P, P), dtype=nl.bfloat16, buffer=nl.psum)
@@ -357,17 +360,16 @@ def prefill_route(hn, router_wT, expert_bias, ep_rank, positions, top_k=8, route
         aff_b = nl.ndarray((P, E), dtype=nl.bfloat16, buffer=nl.sbuf)
         nisa.tensor_copy(dst=aff_b[0:P, 0:E], src=aff[0:P, 0:E])
         if w0:
-            nisa.dma_copy(dst=aff_out.ap(pattern=[[E, P], [1, E]], offset=t0 * E), src=aff_b[0:P, 0:E])
+            nisa.dma_copy(dst=aff2d[nl.ds(t0, P), 0:E], src=aff_b[0:P, 0:E])
         # ---- a real token: the first, or one whose position differs from the token before it ----
         pc = nl.ndarray((P, 1), dtype=positions.dtype, buffer=nl.sbuf)
-        nisa.dma_copy(dst=pc[0:P, 0:1], src=positions.ap(pattern=[[1, P], [1, 1]], offset=t0))
+        nisa.dma_copy(dst=pc[0:P, 0:1], src=positions[nl.ds(t0, P), 0:1])
         pv = nl.ndarray((P, 1), dtype=positions.dtype, buffer=nl.sbuf)
-        if t0 == 0:
+        if first_tile:
             nisa.memset(dst=pv[0:1, 0:1], value=-1)
-            if P > 1:
-                nisa.dma_copy(dst=pv[1:P, 0:1], src=positions.ap(pattern=[[1, P - 1], [1, 1]], offset=0))
+            nisa.dma_copy(dst=pv[1:P, 0:1], src=positions[0:P - 1, 0:1])
         else:
-            nisa.dma_copy(dst=pv[0:P, 0:1], src=positions.ap(pattern=[[1, P], [1, 1]], offset=t0 - 1))
+            nisa.dma_copy(dst=pv[0:P, 0:1], src=positions[nl.ds(t0 - 1, P), 0:1])
         pcf = nl.ndarray((P, 1), dtype=nl.float32, buffer=nl.sbuf)
         nisa.tensor_copy(dst=pcf[0:P, 0:1], src=pc[0:P, 0:1])
         pvf = nl.ndarray((P, 1), dtype=nl.float32, buffer=nl.sbuf)
@@ -380,15 +382,24 @@ def prefill_route(hn, router_wT, expert_bias, ep_rank, positions, top_k=8, route
         s_f = nl.ndarray((P, E), dtype=nl.float32, buffer=nl.sbuf)
         nisa.tensor_scalar(dst=s_f[0:P, 0:E], data=ab[0:P, 0:E], op0=nl.not_equal, operand0=0.0,
                            op1=nl.multiply, operand1=real[0:P, 0:1])
-        nisa.tensor_copy(dst=sel_all[0:P, t, 0:E], src=s_f[0:P, 0:E])
+        if w0:
+            nisa.dma_copy(dst=sel_h[nl.ds(t0, P), 0:E], src=s_f[0:P, 0:E])
         s_b = nl.ndarray((P, E), dtype=nl.bfloat16, buffer=nl.sbuf)
         nisa.tensor_copy(dst=s_b[0:P, 0:E], src=s_f[0:P, 0:E])
         pre = nl.ndarray((P, E), dtype=nl.float32, buffer=nl.psum)
         nisa.nc_matmul(dst=pre[0:P, 0:E], stationary=tri[0:P, 0:P], moving=s_b[0:P, 0:E])
-        nisa.tensor_tensor(dst=rank_all[0:P, t, 0:E], data1=pre[0:P, 0:E], data2=carry[0:P, 0:E], op=nl.add)
+        rk = nl.ndarray((P, E), dtype=nl.float32, buffer=nl.sbuf)
+        nisa.tensor_tensor(dst=rk[0:P, 0:E], data1=pre[0:P, 0:E], data2=carry[0:P, 0:E], op=nl.add)
+        if w0:
+            nisa.dma_copy(dst=rank_h[nl.ds(t0, P), 0:E], src=rk[0:P, 0:E])
         tot = nl.ndarray((P, E), dtype=nl.float32, buffer=nl.psum)
         nisa.nc_matmul(dst=tot[0:P, 0:E], stationary=ones[0:P, 0:P], moving=s_b[0:P, 0:E])
         nisa.tensor_tensor(dst=carry[0:P, 0:E], data1=carry[0:P, 0:E], data2=tot[0:P, 0:E], op=nl.add)
+
+
+    tile(0, True)
+    for t in nl.sequential_range(1, NT):
+        tile(t * P, False)
 
     # ---- blocks per expert, their first block (every partition holds the same values) ----
     cnt_i = nl.ndarray((P, E), dtype=nl.int32, buffer=nl.sbuf)
@@ -416,23 +427,28 @@ def prefill_route(hn, router_wT, expert_bias, ep_rank, positions, top_k=8, route
                           src=neg[0:P, 0:full_rows])
         nisa.dma_copy(dst=scratch.ap(pattern=[[1, rest], [1, 1]], offset=full_rows * P), src=neg[0:rest, 0:1])
     sink = float(NB)
-    for t in range(NT):
+    if w0:
         tid_f = nl.ndarray((P, 1), dtype=nl.float32, buffer=nl.sbuf)
-        nisa.tensor_scalar(dst=tid_f[0:P, 0:1], data=part_f[0:P, 0:1], op0=nl.add, operand0=float(t * P))
-        tid = nl.ndarray((P, 1), dtype=nl.int32, buffer=nl.sbuf)
-        nisa.tensor_copy(dst=tid[0:P, 0:1], src=tid_f[0:P, 0:1])
-        # slot = sel x (base + rank - 1 - sink) + sink
-        sl = nl.ndarray((P, E), dtype=nl.float32, buffer=nl.sbuf)
-        nisa.tensor_tensor(dst=sl[0:P, 0:E], data1=rank_all[0:P, t, 0:E], data2=base[0:P, 0:E], op=nl.add)
-        nisa.tensor_scalar(dst=sl[0:P, 0:E], data=sl[0:P, 0:E], op0=nl.add, operand0=-1.0 - sink)
-        nisa.tensor_tensor(dst=sl[0:P, 0:E], data1=sl[0:P, 0:E], data2=sel_all[0:P, t, 0:E], op=nl.multiply)
-        nisa.tensor_scalar(dst=sl[0:P, 0:E], data=sl[0:P, 0:E], op0=nl.add, operand0=sink)
-        sl_i = nl.ndarray((P, E), dtype=nl.int32, buffer=nl.sbuf)
-        nisa.tensor_copy(dst=sl_i[0:P, 0:E], src=sl[0:P, 0:E])
-        if w0:
+        nisa.tensor_copy(dst=tid_f[0:P, 0:1], src=part_f[0:P, 0:1])
+        for t in nl.sequential_range(NT):
+            t0 = t * P
+            tid = nl.ndarray((P, 1), dtype=nl.int32, buffer=nl.sbuf)
+            nisa.tensor_copy(dst=tid[0:P, 0:1], src=tid_f[0:P, 0:1])
+            st_t = nl.ndarray((P, E), dtype=nl.float32, buffer=nl.sbuf)
+            nisa.dma_copy(dst=st_t[0:P, 0:E], src=sel_h[nl.ds(t0, P), 0:E])
+            # slot = sel x (base + rank - 1 - sink) + sink
+            sl = nl.ndarray((P, E), dtype=nl.float32, buffer=nl.sbuf)
+            nisa.dma_copy(dst=sl[0:P, 0:E], src=rank_h[nl.ds(t0, P), 0:E])
+            nisa.tensor_tensor(dst=sl[0:P, 0:E], data1=sl[0:P, 0:E], data2=base[0:P, 0:E], op=nl.add)
+            nisa.tensor_scalar(dst=sl[0:P, 0:E], data=sl[0:P, 0:E], op0=nl.add, operand0=-1.0 - sink)
+            nisa.tensor_tensor(dst=sl[0:P, 0:E], data1=sl[0:P, 0:E], data2=st_t[0:P, 0:E], op=nl.multiply)
+            nisa.tensor_scalar(dst=sl[0:P, 0:E], data=sl[0:P, 0:E], op0=nl.add, operand0=sink)
+            sl_i = nl.ndarray((P, E), dtype=nl.int32, buffer=nl.sbuf)
+            nisa.tensor_copy(dst=sl_i[0:P, 0:E], src=sl[0:P, 0:E])
             for e in range(E):
                 nisa.dma_copy(dst=scratch.ap(pattern=[[1, P], [1, 1]], offset=0, vector_offset=sl_i[0:P, e:e + 1],
                                              indirect_dim=0), src=tid[0:P, 0:1])
+            nisa.tensor_scalar(dst=tid_f[0:P, 0:1], data=tid_f[0:P, 0:1], op0=nl.add, operand0=float(P))
     if w0:
         nisa.dma_copy(dst=tok_out.reshape((NB, 1)), src=scratch.ap(pattern=[[1, NB], [1, 1]], offset=0))
 
@@ -747,23 +763,26 @@ def prefill_mtp_project(ids, at, token, prev, emb_w, enorm_w, hnorm_w, eh_wT, ra
     part_f = nl.ndarray((P, 1), dtype=nl.float32, buffer=nl.sbuf)
     nisa.iota(part_f[0:P, 0:1], pattern=[[0, 1]], offset=0, channel_multiplier=1)
 
-    # ---- the rotated ids and this program's half of their embedding rows ----
-    for t in range(NT):
-        t0 = t * P
+    # ---- the rotated ids and this program's half of their embedding rows (a runtime loop; the last tile, whose
+    # ahead token is its own last, its own copy) ----
+    jrun = nl.ndarray((P, 1), dtype=nl.float32, buffer=nl.sbuf)  # each row's place in the chunk
+    nisa.tensor_copy(dst=jrun[0:P, 0:1], src=part_f[0:P, 0:1])
+
+    def ids_tile(t0, last: bool):
         cur = nl.ndarray((P, 1), dtype=ids.dtype, buffer=nl.sbuf)
-        nisa.dma_copy(dst=cur[0:P, 0:1], src=ids.ap(pattern=[[1, P], [1, 1]], offset=t0))
+        nisa.dma_copy(dst=cur[0:P, 0:1], src=ids[nl.ds(t0, P), 0:1])
         ahead = nl.ndarray((P, 1), dtype=ids.dtype, buffer=nl.sbuf)
-        if t0 + P < T:
-            nisa.dma_copy(dst=ahead[0:P, 0:1], src=ids.ap(pattern=[[1, P], [1, 1]], offset=t0 + 1))
+        if not last:
+            nisa.dma_copy(dst=ahead[0:P, 0:1], src=ids[nl.ds(t0 + 1, P), 0:1])
         else:
-            nisa.dma_copy(dst=ahead[0:P - 1, 0:1], src=ids.ap(pattern=[[1, P - 1], [1, 1]], offset=t0 + 1))
-            nisa.dma_copy(dst=ahead[P - 1:P, 0:1], src=ids.ap(pattern=[[1, 1], [1, 1]], offset=T - 1))
+            nisa.dma_copy(dst=ahead[0:P - 1, 0:1], src=ids[T - P + 1:T, 0:1])
+            nisa.dma_copy(dst=ahead[P - 1:P, 0:1], src=ids[T - 1:T, 0:1])
         cf = nl.ndarray((P, 1), dtype=nl.float32, buffer=nl.sbuf)
         nisa.tensor_copy(dst=cf[0:P, 0:1], src=cur[0:P, 0:1])
         af = nl.ndarray((P, 1), dtype=nl.float32, buffer=nl.sbuf)
         nisa.tensor_copy(dst=af[0:P, 0:1], src=ahead[0:P, 0:1])
         j = nl.ndarray((P, 1), dtype=nl.float32, buffer=nl.sbuf)
-        nisa.tensor_scalar(dst=j[0:P, 0:1], data=part_f[0:P, 0:1], op0=nl.add, operand0=float(t0))
+        nisa.tensor_copy(dst=j[0:P, 0:1], src=jrun[0:P, 0:1])
         before = nl.ndarray((P, 1), dtype=nl.float32, buffer=nl.sbuf)
         nisa.tensor_tensor(dst=before[0:P, 0:1], data1=j[0:P, 0:1], data2=at_f[0:P, 0:1], op=nl.less)
         on = nl.ndarray((P, 1), dtype=nl.float32, buffer=nl.sbuf)
@@ -781,7 +800,7 @@ def prefill_mtp_project(ids, at, token, prev, emb_w, enorm_w, hnorm_w, eh_wT, ra
         ni = nl.ndarray((P, 1), dtype=nl.int32, buffer=nl.sbuf)
         nisa.tensor_copy(dst=ni[0:P, 0:1], src=nf[0:P, 0:1])
         if n_prg == 1 or pid == 0:
-            nisa.dma_copy(dst=next_out.ap(pattern=[[1, P], [1, 1]], offset=t0), src=ni[0:P, 0:1])
+            nisa.dma_copy(dst=next_out[nl.ds(t0, P), 0:1], src=ni[0:P, 0:1])
         local = nl.ndarray((P, 1), dtype=nl.float32, buffer=nl.sbuf)
         nisa.tensor_tensor(dst=local[0:P, 0:1], data1=nf[0:P, 0:1], data2=st[0:P, 0:1], op=nl.subtract)
         lo = nl.ndarray((P, 1), dtype=nl.float32, buffer=nl.sbuf)
@@ -800,7 +819,12 @@ def prefill_mtp_project(ids, at, token, prev, emb_w, enorm_w, hnorm_w, eh_wT, ra
         nisa.dma_copy(dst=rows[0:P, 0:HH], src=emb_w.ap(pattern=[[H, P], [1, HH]], offset=h0,
                                                          vector_offset=row[0:P, 0:1], indirect_dim=0),
                       oob_mode=oob_mode.skip)
-        nisa.dma_copy(dst=part.ap(pattern=[[H, P], [1, HH]], offset=t0 * H + h0), src=rows[0:P, 0:HH])
+        nisa.dma_copy(dst=part[nl.ds(t0, P), h0:h0 + HH], src=rows[0:P, 0:HH])
+        nisa.tensor_scalar(dst=jrun[0:P, 0:1], data=jrun[0:P, 0:1], op0=nl.add, operand0=float(P))
+
+    for t in nl.sequential_range(NT - 1):
+        ids_tile(t * P, False)
+    ids_tile((NT - 1) * P, True)
     emb = _hbm_all_reduce(part, rg, n_prg, "prefill_mtp_embed")
 
     # ---- both norms and this rank's eh_proj columns, the tiles alternating between the programs ----
@@ -812,14 +836,13 @@ def prefill_mtp_project(ids, at, token, prev, emb_w, enorm_w, hnorm_w, eh_wT, ra
     for k in range(2 * H1):
         nisa.dma_copy(dst=wt[0:P, k, 0:OR], src=eh_wT.ap(pattern=[[OR, P], [1, OR]], offset=k * P * OR),
                       dge_mode=nisa.dge_mode.hwdge)
-    for t in range(NT):
-        if n_prg > 1 and NT >= n_prg and t % n_prg != pid:
-            continue
-        t0 = t * P
+    split = n_prg > 1 and NT >= n_prg and NT % n_prg == 0
+    for i in nl.sequential_range(NT // n_prg if split else NT):
+        t0 = (i * n_prg + pid) * P if split else i * P
         et = nl.ndarray((P, H), dtype=nl.bfloat16, buffer=nl.sbuf)
-        nisa.dma_copy(dst=et[0:P, 0:H], src=emb.ap(pattern=[[H, P], [1, H]], offset=t0 * H))
+        nisa.dma_copy(dst=et[0:P, 0:H], src=emb[nl.ds(t0, P), 0:H])
         pv = nl.ndarray((P, H), dtype=prev.dtype, buffer=nl.sbuf)
-        nisa.dma_copy(dst=pv[0:P, 0:H], src=prev.ap(pattern=[[H, P], [1, H]], offset=t0 * H))
+        nisa.dma_copy(dst=pv[0:P, 0:H], src=prev[nl.ds(t0, P), 0:H])
         xT = nl.ndarray((P, 2 * H1, P), dtype=nl.bfloat16, buffer=nl.sbuf)
         for part_i, (src, w) in enumerate(((et, ew), (pv, hw))):
             nrm = _norm_rows(src, w, H, eps)
@@ -834,7 +857,7 @@ def prefill_mtp_project(ids, at, token, prev, emb_w, enorm_w, hnorm_w, eh_wT, ra
             for k in range(2 * H1):
                 nisa.nc_matmul(dst=ps[0:P, 0:cs], stationary=xT[0:P, k, 0:P], moving=wt[0:P, k, c0:c0 + cs])
             nisa.tensor_copy(dst=pb[0:P, c0:c0 + cs], src=ps[0:P, 0:cs])
-        nisa.dma_copy(dst=proj.ap(pattern=[[OR, P], [1, OR]], offset=t0 * OR), src=pb[0:P, 0:OR])
+        nisa.dma_copy(dst=proj[nl.ds(t0, P), 0:OR], src=pb[0:P, 0:OR])
     if n_prg > 1:
         nisa.core_barrier(data=proj, cores=(0, 1))
     # an HBM all-gather stacks along dim 0 only: [ranks x T, OR], then rank r's rows to columns r x OR of [T, H]
