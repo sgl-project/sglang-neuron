@@ -726,7 +726,9 @@ class NeuronPagedHostPool(HostKVCache):
 
 class NeuronHostKVPool(NeuronPagedHostPool):
     """The host copy of a Neuron MHA pool (NeuronMHATokenToKVPoolKind), for HiCache L2: every layer's K, then every
-    layer's V."""
+    layer's V, then the page side buffers a model keeps next to those K caches (memory_pool.PAGE_SIDE_BUFFERS: Hy3's
+    sparse page summaries), so a page loaded back carries its own side rows rather than whatever its device slot held
+    last."""
 
     remote_dram_tier = True
 
@@ -748,11 +750,22 @@ class NeuronHostKVPool(NeuronPagedHostPool):
             unit = int(unit_tokens)
         else:
             unit = k[0][0].numel() // max(1, int(self.head_num) * int(self.head_dim)) if len(k) else page_size
-        super().__init__(k + v, dtype=buffer_info.dtype, page_size=page_size, layer_num=len(k),
+        super().__init__(k + v + _side_buffers(k), dtype=buffer_info.dtype, page_size=page_size, layer_num=len(k),
                          device_capacity_tokens=device_capacity_tokens, start_layer=start_layer, end_layer=end_layer,
                          host_to_device_ratio=host_to_device_ratio, host_size=host_size, layout=layout,
                          allocator_type=allocator_type, pool_label=pool_label,
                          unit=unit if unit and page_size % unit == 0 and unit < page_size else None)
+
+
+def _side_buffers(k_buffers: list) -> list:
+    """The page side buffers (memory_pool.PAGE_SIDE_BUFFERS) of the K caches ``k_buffers``, in their providers' order:
+    each a page-first tensor of the pool's page count, which the host pool keeps as one more region."""
+    import types
+
+    from sglang_neuron.mem_cache import memory_pool
+
+    return [side for provider in memory_pool.PAGE_SIDE_BUFFERS for _, side in provider(types.SimpleNamespace(
+        k_buffer=k_buffers))]
 
 
 def _row_tokens(buffer_info) -> int:
