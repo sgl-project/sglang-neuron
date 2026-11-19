@@ -88,15 +88,16 @@ def prefill_front(x, norm_w, w_qkv, cos, sin, slots, k_cache, v_cache, eps=1e-6,
     q_out = nl.ndarray((nq, T, d), dtype=nl.bfloat16, buffer=nl.shared_hbm, name="prefill_front_q")
     k_out = nl.ndarray((T, d), dtype=k_cache.dtype, buffer=nl.shared_hbm, name="prefill_front_k")
     v_out = nl.ndarray((T, d), dtype=v_cache.dtype, buffer=nl.shared_hbm, name="prefill_front_v")
-    for t in range(T // P):
-        # the tiles alternate between the programs; with fewer tiles than programs each runs them all (the same
-        # values to the same places), since an idle program fails the compiler's allocation
-        if n_prg > 1 and T // P >= n_prg and t % n_prg != pid:
-            continue
-        t0 = t * P
+    # the tiles alternate between the programs (a runtime loop: one copy of the body, not one a tile); with fewer
+    # tiles than programs each runs them all (the same values to the same places), since an idle program fails the
+    # compiler's allocation
+    NT = T // P
+    split = n_prg > 1 and NT >= n_prg and NT % n_prg == 0
+    for i in nl.sequential_range(NT // n_prg if split else NT):
+        t0 = (i * n_prg + pid) * P if split else i * P
         # ---- RMSNorm ----
         xt = nl.ndarray((P, H), dtype=x.dtype, buffer=nl.sbuf)
-        nisa.dma_copy(dst=xt[0:P, 0:H], src=x.ap(pattern=[[H, P], [1, H]], offset=t0 * H))
+        nisa.dma_copy(dst=xt[0:P, 0:H], src=x[nl.ds(t0, P), 0:H])
         sq = nl.ndarray((P, H), dtype=nl.float32, buffer=nl.sbuf)
         ss = nl.ndarray((P, 1), dtype=nl.float32, buffer=nl.sbuf)
         nisa.activation(dst=sq[0:P, 0:H], op=nl.square, data=xt[0:P, 0:H], reduce_op=nl.add, reduce_res=ss[0:P, 0:1],
@@ -126,28 +127,28 @@ def prefill_front(x, norm_w, w_qkv, cos, sin, slots, k_cache, v_cache, eps=1e-6,
         c = nl.ndarray((P, half), dtype=nl.float32, buffer=nl.sbuf)
         s = nl.ndarray((P, half), dtype=nl.float32, buffer=nl.sbuf)
         cb = nl.ndarray((P, half), dtype=cos.dtype, buffer=nl.sbuf)
-        nisa.dma_copy(dst=cb[0:P, 0:half], src=cos.ap(pattern=[[half, P], [1, half]], offset=t0 * half))
+        nisa.dma_copy(dst=cb[0:P, 0:half], src=cos[nl.ds(t0, P), 0:half])
         nisa.tensor_copy(dst=c[0:P, 0:half], src=cb[0:P, 0:half])
         sb = nl.ndarray((P, half), dtype=sin.dtype, buffer=nl.sbuf)
-        nisa.dma_copy(dst=sb[0:P, 0:half], src=sin.ap(pattern=[[half, P], [1, half]], offset=t0 * half))
+        nisa.dma_copy(dst=sb[0:P, 0:half], src=sin[nl.ds(t0, P), 0:half])
         nisa.tensor_copy(dst=s[0:P, 0:half], src=sb[0:P, 0:half])
         for h in range(nq):
             qh = nl.ndarray((P, d), dtype=nl.bfloat16, buffer=nl.sbuf)
             _rope_half(qkv, c, s, h * d, half, qh, f"q{h}")
             if q_scale != 1.0:
                 nisa.tensor_scalar(dst=qh[0:P, 0:d], data=qh[0:P, 0:d], op0=nl.multiply, operand0=q_scale)
-            nisa.dma_copy(dst=q_out.ap(pattern=[[d, P], [1, d]], offset=h * T * d + t0 * d), src=qh[0:P, 0:d])
+            nisa.dma_copy(dst=q_out[h, nl.ds(t0, P), 0:d], src=qh[0:P, 0:d])
         kh = nl.ndarray((P, d), dtype=nl.bfloat16, buffer=nl.sbuf)
         _rope_half(qkv, c, s, nq * d, half, kh, "k")
         vh = nl.ndarray((P, d), dtype=nl.bfloat16, buffer=nl.sbuf)
         nisa.tensor_copy(dst=vh[0:P, 0:d], src=qkv[0:P, (nq + 1) * d:(nq + 2) * d])
         kc = _to_cache(kh, d, kv_scale, k_cache.dtype)
         vc = _to_cache(vh, d, kv_scale, v_cache.dtype)
-        nisa.dma_copy(dst=k_out.ap(pattern=[[d, P], [1, d]], offset=t0 * d), src=kc[0:P, 0:d])
-        nisa.dma_copy(dst=v_out.ap(pattern=[[d, P], [1, d]], offset=t0 * d), src=vc[0:P, 0:d])
+        nisa.dma_copy(dst=k_out[nl.ds(t0, P), 0:d], src=kc[0:P, 0:d])
+        nisa.dma_copy(dst=v_out[nl.ds(t0, P), 0:d], src=vc[0:P, 0:d])
         # ---- the slots: outside the pool -> 0 (the reserved padding page) ----
         sl = nl.ndarray((P, 1), dtype=slots.dtype, buffer=nl.sbuf)
-        nisa.dma_copy(dst=sl[0:P, 0:1], src=slots.ap(pattern=[[1, P], [1, 1]], offset=t0))
+        nisa.dma_copy(dst=sl[0:P, 0:1], src=slots[nl.ds(t0, P), 0:1])
         sf = nl.ndarray((P, 1), dtype=nl.float32, buffer=nl.sbuf)
         nisa.tensor_copy(dst=sf[0:P, 0:1], src=sl[0:P, 0:1])
         ok = nl.ndarray((P, 1), dtype=nl.float32, buffer=nl.sbuf)
@@ -202,13 +203,13 @@ def prefill_back(attn, o_w, x, norm_w, mesh, eps=1e-6, v_head_dim=128, kv_scale=
     h_out = nl.ndarray((T, H), dtype=x.dtype, buffer=nl.shared_hbm, name="prefill_back_h")
     hn_out = nl.ndarray((T, H), dtype=x.dtype, buffer=nl.shared_hbm, name="prefill_back_hn")
     part = nl.ndarray((T, H), dtype=nl.bfloat16, buffer=nl.shared_hbm, name="prefill_back_part")
-    for t in range(n_tiles):
+    for t in nl.sequential_range(n_tiles):
         t0 = t * P
         # the heads' first vd channels times 1 / the FP8 scale, transposed: [vd, tokens]
         aT = nl.ndarray((P, K1, P), dtype=nl.bfloat16, buffer=nl.sbuf)
         for h in range(nq):
             a = nl.ndarray((P, vd), dtype=attn.dtype, buffer=nl.sbuf)
-            nisa.dma_copy(dst=a[0:P, 0:vd], src=attn.ap(pattern=[[d, P], [1, vd]], offset=h * T * d + t0 * d))
+            nisa.dma_copy(dst=a[0:P, 0:vd], src=attn[h, nl.ds(t0, P), 0:vd])
             ab = nl.ndarray((P, vd), dtype=nl.bfloat16, buffer=nl.sbuf)
             if kv_scale != 1.0:
                 nisa.tensor_scalar(dst=ab[0:P, 0:vd], data=a[0:P, 0:vd], op0=nl.multiply, operand0=1.0 / kv_scale)
@@ -225,9 +226,9 @@ def prefill_back(attn, o_w, x, norm_w, mesh, eps=1e-6, v_head_dim=128, kv_scale=
             for k in range(K1):
                 nisa.nc_matmul(dst=ps[0:P, 0:cs], stationary=aT[0:P, k, 0:P], moving=w[0:P, k, c0:c0 + cs])
             nisa.tensor_copy(dst=pt[0:P, c0:c0 + cs], src=ps[0:P, 0:cs])
-        nisa.dma_copy(dst=part.ap(pattern=[[H, P], [1, HH]], offset=t0 * H + h0), src=pt[0:P, 0:HH])
+        nisa.dma_copy(dst=part[nl.ds(t0, P), h0:h0 + HH], src=pt[0:P, 0:HH])
     red = _hbm_all_reduce(part, rg, n_prg, "prefill_back_reduced")
-    for t in range(n_tiles):
+    for t in nl.sequential_range(n_tiles):
         t0 = t * P
         ht = _add_rows(x, red, h_out, t0, HH, H, h0)
         sq = nl.ndarray((P, HH), dtype=nl.float32, buffer=nl.sbuf)
@@ -245,7 +246,7 @@ def prefill_back(attn, o_w, x, norm_w, mesh, eps=1e-6, v_head_dim=128, kv_scale=
         nisa.tensor_scalar(dst=nb[0:P, 0:HH], data=ht[0:P, 0:HH], op0=nl.multiply, operand0=rr[0:P, 0:1])
         hn = nl.ndarray((P, HH), dtype=nl.bfloat16, buffer=nl.sbuf)
         nisa.tensor_tensor(dst=hn[0:P, 0:HH], data1=nb[0:P, 0:HH], data2=gam[0:P, 0:HH], op=nl.multiply)
-        nisa.dma_copy(dst=hn_out.ap(pattern=[[H, P], [1, HH]], offset=t0 * H + h0), src=hn[0:P, 0:HH])
+        nisa.dma_copy(dst=hn_out[nl.ds(t0, P), h0:h0 + HH], src=hn[0:P, 0:HH])
     return h_out, hn_out
 
 
@@ -478,12 +479,12 @@ def _hbm_all_reduce(part, rg, n_prg: int, name: str):
 def _add_rows(x, red, h_out, t0: int, HH: int, H: int, h0: int):
     """h_out[t0 .. t0 + 128, h0 .. h0 + HH] = x + red there; returns the tile [128, HH] bf16 in SBUF."""
     xt = nl.ndarray((P, HH), dtype=x.dtype, buffer=nl.sbuf)
-    nisa.dma_copy(dst=xt[0:P, 0:HH], src=x.ap(pattern=[[H, P], [1, HH]], offset=t0 * H + h0))
+    nisa.dma_copy(dst=xt[0:P, 0:HH], src=x[nl.ds(t0, P), h0:h0 + HH])
     rt = nl.ndarray((P, HH), dtype=red.dtype, buffer=nl.sbuf)
-    nisa.dma_copy(dst=rt[0:P, 0:HH], src=red.ap(pattern=[[H, P], [1, HH]], offset=t0 * H + h0))
+    nisa.dma_copy(dst=rt[0:P, 0:HH], src=red[nl.ds(t0, P), h0:h0 + HH])
     ht = nl.ndarray((P, HH), dtype=nl.bfloat16, buffer=nl.sbuf)
     nisa.tensor_tensor(dst=ht[0:P, 0:HH], data1=xt[0:P, 0:HH], data2=rt[0:P, 0:HH], op=nl.add)
-    nisa.dma_copy(dst=h_out.ap(pattern=[[H, P], [1, HH]], offset=t0 * H + h0), src=ht[0:P, 0:HH])
+    nisa.dma_copy(dst=h_out[nl.ds(t0, P), h0:h0 + HH], src=ht[0:P, 0:HH])
     return ht
 
 
@@ -502,7 +503,7 @@ def prefill_residual(x, partial, mesh):
     rg = _replica_group(mesh)
     h_out = nl.ndarray((T, H), dtype=x.dtype, buffer=nl.shared_hbm, name="prefill_residual_h")
     red = _hbm_all_reduce(partial, rg, n_prg, "prefill_residual_reduced")
-    for t in range(T // P):
+    for t in nl.sequential_range(T // P):
         _add_rows(x, red, h_out, t * P, HH, H, h0)
     return h_out
 
@@ -538,10 +539,10 @@ def prefill_mlp(hn, x, gate_w, up_w, down_w, mesh):
                       dge_mode=nisa.dge_mode.hwdge)
     h_out = nl.ndarray((T, H), dtype=x.dtype, buffer=nl.shared_hbm, name="prefill_mlp_h")
     part = nl.ndarray((T, H), dtype=nl.bfloat16, buffer=nl.shared_hbm, name="prefill_mlp_part")
-    for t in range(T // P):
+    for t in nl.sequential_range(T // P):
         t0 = t * P
         xt = nl.ndarray((P, H), dtype=hn.dtype, buffer=nl.sbuf)
-        nisa.dma_copy(dst=xt[0:P, 0:H], src=hn.ap(pattern=[[H, P], [1, H]], offset=t0 * H))
+        nisa.dma_copy(dst=xt[0:P, 0:H], src=hn[nl.ds(t0, P), 0:H])
         xT = nl.ndarray((P, H1, P), dtype=nl.bfloat16, buffer=nl.sbuf)
         for h1 in range(H1):
             tp = nl.ndarray((P, P), dtype=nl.bfloat16, buffer=nl.psum)
@@ -574,8 +575,279 @@ def prefill_mlp(hn, x, gate_w, up_w, down_w, mesh):
             for i1 in range(I1):
                 nisa.nc_matmul(dst=ps[0:P, 0:cs], stationary=aT[0:P, i1, 0:P], moving=dw[0:P, i1, c0:c0 + cs])
             nisa.tensor_copy(dst=pt[0:P, c0:c0 + cs], src=ps[0:P, 0:cs])
-        nisa.dma_copy(dst=part.ap(pattern=[[H, P], [1, HH]], offset=t0 * H + h0), src=pt[0:P, 0:HH])
+        nisa.dma_copy(dst=part[nl.ds(t0, P), h0:h0 + HH], src=pt[0:P, 0:HH])
     red = _hbm_all_reduce(part, rg, n_prg, "prefill_mlp_reduced")
-    for t in range(T // P):
+    for t in nl.sequential_range(T // P):
         _add_rows(x, red, h_out, t * P, HH, H, h0)
     return h_out
+
+
+TWO_PI = 6.283185307179586
+TWO_PI_HI = 6.25
+TWO_PI_LO = TWO_PI - TWO_PI_HI
+HALF_PI = 1.5707963267948966
+PI = 3.141592653589793
+
+
+def _rope_rows(pos_f, inv, F: int, half: int, cos_out, sin_out, t0: int):
+    """cos / sin [128, half] bf16 of the tile's positions ``pos_f`` [128, 1] fp32 into rows t0 .. t0 + 128 of the
+    [T, half] tables: rope.RotaryTables' channels (its F frequencies ``inv`` [128, F] fp32, then cos 1 and sin 0), the
+    angle reduced Cody-Waite style and cos = sin(x + pi / 2) folded back into [-pi, pi] (kernels/step._rope)."""
+    ang = nl.ndarray((P, F), dtype=nl.float32, buffer=nl.sbuf)
+    nisa.tensor_scalar(dst=ang[0:P, 0:F], data=inv[0:P, 0:F], op0=nl.multiply, operand0=pos_f[0:P, 0:1])
+    k_f = nl.ndarray((P, F), dtype=nl.float32, buffer=nl.sbuf)
+    nisa.tensor_scalar(dst=k_f[0:P, 0:F], data=ang[0:P, 0:F], op0=nl.multiply, operand0=1.0 / TWO_PI)
+    k_i = nl.ndarray((P, F), dtype=nl.int32, buffer=nl.sbuf)
+    nisa.tensor_copy(dst=k_i[0:P, 0:F], src=k_f[0:P, 0:F])
+    nisa.tensor_copy(dst=k_f[0:P, 0:F], src=k_i[0:P, 0:F])
+    red = nl.ndarray((P, F), dtype=nl.float32, buffer=nl.sbuf)
+    nisa.scalar_tensor_tensor(dst=red[0:P, 0:F], data=k_f[0:P, 0:F], op0=nl.multiply, operand0=-TWO_PI_HI, op1=nl.add,
+                              operand1=ang[0:P, 0:F])
+    nisa.scalar_tensor_tensor(dst=red[0:P, 0:F], data=k_f[0:P, 0:F], op0=nl.multiply, operand0=-TWO_PI_LO, op1=nl.add,
+                              operand1=red[0:P, 0:F])
+    for out, shift, rest in ((cos_out, HALF_PI, 1.0), (sin_out, 0.0, 0.0)):
+        full = nl.ndarray((P, half), dtype=nl.bfloat16, buffer=nl.sbuf)
+        nisa.memset(dst=full[0:P, 0:half], value=rest)
+        arg = nl.ndarray((P, F), dtype=nl.float32, buffer=nl.sbuf)
+        nisa.tensor_scalar(dst=arg[0:P, 0:F], data=red[0:P, 0:F], op0=nl.add, operand0=shift)
+        if shift:
+            over = nl.ndarray((P, F), dtype=nl.float32, buffer=nl.sbuf)
+            nisa.tensor_scalar(dst=over[0:P, 0:F], data=arg[0:P, 0:F], op0=nl.greater, operand0=PI)
+            nisa.scalar_tensor_tensor(dst=arg[0:P, 0:F], data=over[0:P, 0:F], op0=nl.multiply, operand0=-TWO_PI,
+                                      op1=nl.add, operand1=arg[0:P, 0:F])
+        val = nl.ndarray((P, F), dtype=nl.float32, buffer=nl.sbuf)
+        nisa.activation(dst=val[0:P, 0:F], op=nl.sin, data=arg[0:P, 0:F])
+        nisa.tensor_copy(dst=full[0:P, 0:F], src=val[0:P, 0:F])
+        nisa.dma_copy(dst=out.ap(pattern=[[half, P], [1, half]], offset=t0 * half), src=full[0:P, 0:half])
+
+
+@nki.jit
+def prefill_inputs(ids, positions, weight, rank, mesh, full_inv_freq, swa_inv_freq, half=128):
+    """A prefill chunk's inputs in one kernel: what embed_tokens (the vocabulary-sharded lookup summed over the ranks)
+    and rope.RotaryTables (both kinds' cos / sin) did in XLA.
+
+    ids / positions [T, 1] int32 (T a multiple of 128); weight [Vr, H] bf16 this rank's vocabulary rows; rank [1] int32
+    its place in ``mesh``; the inverse frequencies [1, F] fp32. Returns (the embeddings [T, H] bf16, full cos, full sin,
+    sliding cos, sliding sin [T, half] bf16). The embedding rows are gathered into the chunk's partial in shared HBM
+    (zero where another rank holds the id) and all-reduced once (_hbm_all_reduce); the two programs of LNC2 take one
+    half of H each, and the first writes the tables."""
+    from sglang_neuron.models.mimo_v2.kernels.head import _replica_group, _start
+
+    T = ids.shape[0]
+    Vr, H = weight.shape
+    n_prg = nl.num_programs(axes=0)
+    pid = nl.program_id(axis=0)
+    HH = H // n_prg
+    h0 = pid * HH
+    rg = _replica_group(mesh)
+    st = _start(rank, P, Vr)
+    part = nl.ndarray((T, H), dtype=weight.dtype, buffer=nl.shared_hbm, name="prefill_inputs_part")
+    tables = []
+    for n in ("full_cos", "full_sin", "swa_cos", "swa_sin"):  # NKI's tracer takes no list comprehension
+        tables.append(nl.ndarray((T, half), dtype=nl.bfloat16, buffer=nl.shared_hbm, name=f"prefill_inputs_{n}"))
+    invs = []
+    for src in (full_inv_freq, swa_inv_freq):
+        F = src.shape[1]
+        inv = nl.ndarray((P, F), dtype=nl.float32, buffer=nl.sbuf)
+        nisa.dma_copy(dst=inv[0:P, 0:F], src=src.ap(pattern=[[0, P], [1, F]], offset=0))
+        invs.append((inv, F))
+    for t in range(T // P):
+        t0 = t * P
+        ids_i = nl.ndarray((P, 1), dtype=ids.dtype, buffer=nl.sbuf)
+        nisa.dma_copy(dst=ids_i[0:P, 0:1], src=ids.ap(pattern=[[1, P], [1, 1]], offset=t0))
+        ids_f = nl.ndarray((P, 1), dtype=nl.float32, buffer=nl.sbuf)
+        nisa.tensor_copy(dst=ids_f[0:P, 0:1], src=ids_i[0:P, 0:1])
+        local = nl.ndarray((P, 1), dtype=nl.float32, buffer=nl.sbuf)
+        nisa.tensor_tensor(dst=local[0:P, 0:1], data1=ids_f[0:P, 0:1], data2=st[0:P, 0:1], op=nl.subtract)
+        lo = nl.ndarray((P, 1), dtype=nl.float32, buffer=nl.sbuf)
+        nisa.tensor_scalar(dst=lo[0:P, 0:1], data=local[0:P, 0:1], op0=nl.greater_equal, operand0=0.0)
+        hi = nl.ndarray((P, 1), dtype=nl.float32, buffer=nl.sbuf)
+        nisa.tensor_scalar(dst=hi[0:P, 0:1], data=local[0:P, 0:1], op0=nl.less, operand0=float(Vr))
+        ok = nl.ndarray((P, 1), dtype=nl.float32, buffer=nl.sbuf)
+        nisa.tensor_tensor(dst=ok[0:P, 0:1], data1=lo[0:P, 0:1], data2=hi[0:P, 0:1], op=nl.multiply)
+        # (local - Vr) x ok + Vr: the local row where the shard holds the id, Vr (skipped) elsewhere
+        row_f = nl.ndarray((P, 1), dtype=nl.float32, buffer=nl.sbuf)
+        nisa.tensor_scalar(dst=row_f[0:P, 0:1], data=local[0:P, 0:1], op0=nl.subtract, operand0=float(Vr))
+        nisa.tensor_tensor(dst=row_f[0:P, 0:1], data1=row_f[0:P, 0:1], data2=ok[0:P, 0:1], op=nl.multiply)
+        nisa.tensor_scalar(dst=row_f[0:P, 0:1], data=row_f[0:P, 0:1], op0=nl.add, operand0=float(Vr))
+        row = nl.ndarray((P, 1), dtype=nl.int32, buffer=nl.sbuf)
+        nisa.tensor_copy(dst=row[0:P, 0:1], src=row_f[0:P, 0:1])
+        rows = nl.ndarray((P, HH), dtype=weight.dtype, buffer=nl.sbuf)
+        nisa.memset(dst=rows[0:P, 0:HH], value=0.0)
+        nisa.dma_copy(dst=rows[0:P, 0:HH], src=weight.ap(pattern=[[H, P], [1, HH]], offset=h0,
+                                                          vector_offset=row[0:P, 0:1], indirect_dim=0),
+                      oob_mode=oob_mode.skip)
+        nisa.dma_copy(dst=part.ap(pattern=[[H, P], [1, HH]], offset=t0 * H + h0), src=rows[0:P, 0:HH])
+        if n_prg == 1 or pid == 0:
+            pc = nl.ndarray((P, 1), dtype=positions.dtype, buffer=nl.sbuf)
+            nisa.dma_copy(dst=pc[0:P, 0:1], src=positions.ap(pattern=[[1, P], [1, 1]], offset=t0))
+            pos_f = nl.ndarray((P, 1), dtype=nl.float32, buffer=nl.sbuf)
+            nisa.tensor_copy(dst=pos_f[0:P, 0:1], src=pc[0:P, 0:1])
+            for k, (inv, F) in enumerate(invs):
+                _rope_rows(pos_f, inv, F, half, tables[2 * k], tables[2 * k + 1], t0)
+    emb = _hbm_all_reduce(part, rg, n_prg, "prefill_inputs_embed")
+    return emb, tables[0], tables[1], tables[2], tables[3]
+
+
+def _norm_rows(src, w, H: int, eps):
+    """RMSNorm of a [128, H] bf16 tile with the weight tile ``w`` [128, H] (fp32 math, bf16 result, times the
+    weight)."""
+    sq = nl.ndarray((P, H), dtype=nl.float32, buffer=nl.sbuf)
+    ss = nl.ndarray((P, 1), dtype=nl.float32, buffer=nl.sbuf)
+    nisa.activation(dst=sq[0:P, 0:H], op=nl.square, data=src[0:P, 0:H], reduce_op=nl.add, reduce_res=ss[0:P, 0:1],
+                    reduce_cmd=nisa.reduce_cmd.reset_reduce)
+    rr = nl.ndarray((P, 1), dtype=nl.float32, buffer=nl.sbuf)
+    nisa.activation(dst=rr[0:P, 0:1], op=nl.rsqrt, data=ss[0:P, 0:1], scale=1.0 / H, bias=eps)
+    nb = nl.ndarray((P, H), dtype=nl.bfloat16, buffer=nl.sbuf)
+    nisa.tensor_scalar(dst=nb[0:P, 0:H], data=src[0:P, 0:H], op0=nl.multiply, operand0=rr[0:P, 0:1])
+    out = nl.ndarray((P, H), dtype=nl.bfloat16, buffer=nl.sbuf)
+    nisa.tensor_tensor(dst=out[0:P, 0:H], data1=nb[0:P, 0:H], data2=w[0:P, 0:H], op=nl.multiply)
+    return out
+
+
+@nki.jit
+def prefill_mtp_project(ids, at, token, prev, emb_w, enorm_w, hnorm_w, eh_wT, rank, mesh, eps=1e-6):
+    """An MTP layer's prefill input in one kernel (model.MiMoV2Graph._mtp_prefill's mtp.rotate and mtp.MiMoMtp.project
+    over a chunk):
+
+        next  = rotate(ids, at, token)          ids one position ahead before ``at``, ``token`` at it, kept after
+        x     = eh_proj([enorm(embed(next)) | hnorm(prev)])
+
+    ids [T, 1] int32 (T a multiple of 128) the tokens the layer before read; at / token [1, 1] int32 the chunk's last
+    real row and the token drafted there; prev [T, H] bf16 the target's states before the final norm; emb_w [Vr, H]
+    bf16 this rank's vocabulary rows; enorm_w / hnorm_w [1, H] bf16; eh_wT [2H, H / ranks] bf16 this rank's eh_proj
+    columns; rank [1] int32. Returns (x [T, H] bf16, next [T, 1] int32). The embedding rows are all-reduced and the
+    output columns all-gathered once each, through shared HBM between core barriers."""
+    from nki import collectives as nccl
+
+    from sglang_neuron.models.mimo_v2.kernels.head import _replica_group, _start
+
+    T = ids.shape[0]
+    Vr, H = emb_w.shape
+    OR = eh_wT.shape[1]
+    H1 = H // P
+    NT = T // P
+    n_prg = nl.num_programs(axes=0)
+    pid = nl.program_id(axis=0)
+    HH = H // n_prg
+    h0 = pid * HH
+    rg = _replica_group(mesh)
+    st = _start(rank, P, Vr)
+    next_out = nl.ndarray((T, 1), dtype=nl.int32, buffer=nl.shared_hbm, name="prefill_mtp_next")
+    part = nl.ndarray((T, H), dtype=emb_w.dtype, buffer=nl.shared_hbm, name="prefill_mtp_part")
+    proj = nl.ndarray((T, OR), dtype=nl.bfloat16, buffer=nl.shared_hbm, name="prefill_mtp_proj")
+    at_i = nl.ndarray((P, 1), dtype=at.dtype, buffer=nl.sbuf)
+    nisa.dma_copy(dst=at_i[0:P, 0:1], src=at.reshape((1, 1)).ap(pattern=[[0, P], [1, 1]], offset=0))
+    at_f = nl.ndarray((P, 1), dtype=nl.float32, buffer=nl.sbuf)
+    nisa.tensor_copy(dst=at_f[0:P, 0:1], src=at_i[0:P, 0:1])
+    tk_i = nl.ndarray((P, 1), dtype=token.dtype, buffer=nl.sbuf)
+    nisa.dma_copy(dst=tk_i[0:P, 0:1], src=token.reshape((1, 1)).ap(pattern=[[0, P], [1, 1]], offset=0))
+    tk_f = nl.ndarray((P, 1), dtype=nl.float32, buffer=nl.sbuf)
+    nisa.tensor_copy(dst=tk_f[0:P, 0:1], src=tk_i[0:P, 0:1])
+    part_f = nl.ndarray((P, 1), dtype=nl.float32, buffer=nl.sbuf)
+    nisa.iota(part_f[0:P, 0:1], pattern=[[0, 1]], offset=0, channel_multiplier=1)
+
+    # ---- the rotated ids and this program's half of their embedding rows ----
+    for t in range(NT):
+        t0 = t * P
+        cur = nl.ndarray((P, 1), dtype=ids.dtype, buffer=nl.sbuf)
+        nisa.dma_copy(dst=cur[0:P, 0:1], src=ids.ap(pattern=[[1, P], [1, 1]], offset=t0))
+        ahead = nl.ndarray((P, 1), dtype=ids.dtype, buffer=nl.sbuf)
+        if t0 + P < T:
+            nisa.dma_copy(dst=ahead[0:P, 0:1], src=ids.ap(pattern=[[1, P], [1, 1]], offset=t0 + 1))
+        else:
+            nisa.dma_copy(dst=ahead[0:P - 1, 0:1], src=ids.ap(pattern=[[1, P - 1], [1, 1]], offset=t0 + 1))
+            nisa.dma_copy(dst=ahead[P - 1:P, 0:1], src=ids.ap(pattern=[[1, 1], [1, 1]], offset=T - 1))
+        cf = nl.ndarray((P, 1), dtype=nl.float32, buffer=nl.sbuf)
+        nisa.tensor_copy(dst=cf[0:P, 0:1], src=cur[0:P, 0:1])
+        af = nl.ndarray((P, 1), dtype=nl.float32, buffer=nl.sbuf)
+        nisa.tensor_copy(dst=af[0:P, 0:1], src=ahead[0:P, 0:1])
+        j = nl.ndarray((P, 1), dtype=nl.float32, buffer=nl.sbuf)
+        nisa.tensor_scalar(dst=j[0:P, 0:1], data=part_f[0:P, 0:1], op0=nl.add, operand0=float(t0))
+        before = nl.ndarray((P, 1), dtype=nl.float32, buffer=nl.sbuf)
+        nisa.tensor_tensor(dst=before[0:P, 0:1], data1=j[0:P, 0:1], data2=at_f[0:P, 0:1], op=nl.less)
+        on = nl.ndarray((P, 1), dtype=nl.float32, buffer=nl.sbuf)
+        nisa.tensor_tensor(dst=on[0:P, 0:1], data1=j[0:P, 0:1], data2=at_f[0:P, 0:1], op=nl.equal)
+        # next = cur + before x (ahead - cur) + on x (token - cur)
+        d = nl.ndarray((P, 1), dtype=nl.float32, buffer=nl.sbuf)
+        nisa.tensor_tensor(dst=d[0:P, 0:1], data1=af[0:P, 0:1], data2=cf[0:P, 0:1], op=nl.subtract)
+        nisa.tensor_tensor(dst=d[0:P, 0:1], data1=d[0:P, 0:1], data2=before[0:P, 0:1], op=nl.multiply)
+        e = nl.ndarray((P, 1), dtype=nl.float32, buffer=nl.sbuf)
+        nisa.tensor_tensor(dst=e[0:P, 0:1], data1=tk_f[0:P, 0:1], data2=cf[0:P, 0:1], op=nl.subtract)
+        nisa.tensor_tensor(dst=e[0:P, 0:1], data1=e[0:P, 0:1], data2=on[0:P, 0:1], op=nl.multiply)
+        nf = nl.ndarray((P, 1), dtype=nl.float32, buffer=nl.sbuf)
+        nisa.tensor_tensor(dst=nf[0:P, 0:1], data1=cf[0:P, 0:1], data2=d[0:P, 0:1], op=nl.add)
+        nisa.tensor_tensor(dst=nf[0:P, 0:1], data1=nf[0:P, 0:1], data2=e[0:P, 0:1], op=nl.add)
+        ni = nl.ndarray((P, 1), dtype=nl.int32, buffer=nl.sbuf)
+        nisa.tensor_copy(dst=ni[0:P, 0:1], src=nf[0:P, 0:1])
+        if n_prg == 1 or pid == 0:
+            nisa.dma_copy(dst=next_out.ap(pattern=[[1, P], [1, 1]], offset=t0), src=ni[0:P, 0:1])
+        local = nl.ndarray((P, 1), dtype=nl.float32, buffer=nl.sbuf)
+        nisa.tensor_tensor(dst=local[0:P, 0:1], data1=nf[0:P, 0:1], data2=st[0:P, 0:1], op=nl.subtract)
+        lo = nl.ndarray((P, 1), dtype=nl.float32, buffer=nl.sbuf)
+        nisa.tensor_scalar(dst=lo[0:P, 0:1], data=local[0:P, 0:1], op0=nl.greater_equal, operand0=0.0)
+        hi = nl.ndarray((P, 1), dtype=nl.float32, buffer=nl.sbuf)
+        nisa.tensor_scalar(dst=hi[0:P, 0:1], data=local[0:P, 0:1], op0=nl.less, operand0=float(Vr))
+        nisa.tensor_tensor(dst=lo[0:P, 0:1], data1=lo[0:P, 0:1], data2=hi[0:P, 0:1], op=nl.multiply)
+        row_f = nl.ndarray((P, 1), dtype=nl.float32, buffer=nl.sbuf)
+        nisa.tensor_scalar(dst=row_f[0:P, 0:1], data=local[0:P, 0:1], op0=nl.subtract, operand0=float(Vr))
+        nisa.tensor_tensor(dst=row_f[0:P, 0:1], data1=row_f[0:P, 0:1], data2=lo[0:P, 0:1], op=nl.multiply)
+        nisa.tensor_scalar(dst=row_f[0:P, 0:1], data=row_f[0:P, 0:1], op0=nl.add, operand0=float(Vr))
+        row = nl.ndarray((P, 1), dtype=nl.int32, buffer=nl.sbuf)
+        nisa.tensor_copy(dst=row[0:P, 0:1], src=row_f[0:P, 0:1])
+        rows = nl.ndarray((P, HH), dtype=emb_w.dtype, buffer=nl.sbuf)
+        nisa.memset(dst=rows[0:P, 0:HH], value=0.0)
+        nisa.dma_copy(dst=rows[0:P, 0:HH], src=emb_w.ap(pattern=[[H, P], [1, HH]], offset=h0,
+                                                         vector_offset=row[0:P, 0:1], indirect_dim=0),
+                      oob_mode=oob_mode.skip)
+        nisa.dma_copy(dst=part.ap(pattern=[[H, P], [1, HH]], offset=t0 * H + h0), src=rows[0:P, 0:HH])
+    emb = _hbm_all_reduce(part, rg, n_prg, "prefill_mtp_embed")
+
+    # ---- both norms and this rank's eh_proj columns, the tiles alternating between the programs ----
+    ew = nl.ndarray((P, H), dtype=enorm_w.dtype, buffer=nl.sbuf)
+    nisa.dma_copy(dst=ew[0:P, 0:H], src=enorm_w.ap(pattern=[[0, P], [1, H]], offset=0))
+    hw = nl.ndarray((P, H), dtype=hnorm_w.dtype, buffer=nl.sbuf)
+    nisa.dma_copy(dst=hw[0:P, 0:H], src=hnorm_w.ap(pattern=[[0, P], [1, H]], offset=0))
+    wt = nl.ndarray((P, 2 * H1, OR), dtype=eh_wT.dtype, buffer=nl.sbuf)
+    for k in range(2 * H1):
+        nisa.dma_copy(dst=wt[0:P, k, 0:OR], src=eh_wT.ap(pattern=[[OR, P], [1, OR]], offset=k * P * OR),
+                      dge_mode=nisa.dge_mode.hwdge)
+    for t in range(NT):
+        if n_prg > 1 and NT >= n_prg and t % n_prg != pid:
+            continue
+        t0 = t * P
+        et = nl.ndarray((P, H), dtype=nl.bfloat16, buffer=nl.sbuf)
+        nisa.dma_copy(dst=et[0:P, 0:H], src=emb.ap(pattern=[[H, P], [1, H]], offset=t0 * H))
+        pv = nl.ndarray((P, H), dtype=prev.dtype, buffer=nl.sbuf)
+        nisa.dma_copy(dst=pv[0:P, 0:H], src=prev.ap(pattern=[[H, P], [1, H]], offset=t0 * H))
+        xT = nl.ndarray((P, 2 * H1, P), dtype=nl.bfloat16, buffer=nl.sbuf)
+        for part_i, (src, w) in enumerate(((et, ew), (pv, hw))):
+            nrm = _norm_rows(src, w, H, eps)
+            for h1 in range(H1):
+                tp = nl.ndarray((P, P), dtype=nl.bfloat16, buffer=nl.psum)
+                nisa.nc_transpose(dst=tp[0:P, 0:P], data=nrm[0:P, h1 * P:(h1 + 1) * P])
+                nisa.tensor_copy(dst=xT[0:P, part_i * H1 + h1, 0:P], src=tp[0:P, 0:P])
+        pb = nl.ndarray((P, OR), dtype=nl.bfloat16, buffer=nl.sbuf)
+        for c0 in range(0, OR, COLS):
+            cs = min(COLS, OR - c0)
+            ps = nl.ndarray((P, COLS), dtype=nl.float32, buffer=nl.psum)
+            for k in range(2 * H1):
+                nisa.nc_matmul(dst=ps[0:P, 0:cs], stationary=xT[0:P, k, 0:P], moving=wt[0:P, k, c0:c0 + cs])
+            nisa.tensor_copy(dst=pb[0:P, c0:c0 + cs], src=ps[0:P, 0:cs])
+        nisa.dma_copy(dst=proj.ap(pattern=[[OR, P], [1, OR]], offset=t0 * OR), src=pb[0:P, 0:OR])
+    if n_prg > 1:
+        nisa.core_barrier(data=proj, cores=(0, 1))
+    # an HBM all-gather stacks along dim 0 only: [ranks x T, OR], then rank r's rows to columns r x OR of [T, H]
+    ranks = H // OR
+    stacked = nl.ndarray((ranks * T, OR), dtype=nl.bfloat16, buffer=nl.shared_hbm, name="prefill_mtp_stacked")
+    nccl.all_gather(srcs=[proj], dsts=[stacked], replica_group=rg, collective_dim=0)
+    if n_prg > 1:
+        nisa.core_barrier(data=stacked, cores=(0, 1))
+    out = nl.ndarray((T, H), dtype=nl.bfloat16, buffer=nl.shared_hbm, name="prefill_mtp_x")
+    for r in range(ranks):
+        if n_prg > 1 and r % n_prg != pid:
+            continue
+        nisa.dma_copy(dst=out[0:T, r * OR:(r + 1) * OR], src=stacked[r * T:(r + 1) * T, 0:OR])
+    if n_prg > 1:
+        nisa.core_barrier(data=out, cores=(0, 1))
+    return out, next_out

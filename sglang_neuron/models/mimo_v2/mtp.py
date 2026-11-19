@@ -148,12 +148,27 @@ class MiMoMtp(nn.Module):
             graph.embed_tokens.weight, self.enorm.weight.view(1, -1), self.hnorm.weight.view(1, -1), self.eh_wT,
             graph.lm_head_tp_group.rank_in_group_tensor, graph._head_mesh(), eps=self.enorm.eps)
 
-    def prefill(self, graph, hidden: torch.Tensor, next_ids: torch.Tensor, md: dict, cos, sin, rank) -> torch.Tensor:
+    def project_chunk(self, graph, ids, at, token, prev, rank) -> tuple:
+        """A prefill chunk's input to this layer and the tokens it reads, in one kernel
+        (kernels/prefill.prefill_mtp_project): ids [T, 1] int32 the tokens the layer before read, rotated one place
+        ahead with ``token`` [1, 1] at ``at`` [1, 1]; prev [T, H] the target's states. Returns (x [T, H], next
+        [T, 1])."""
+        from sglang_neuron.backend.stack import wrap_nki
+        from sglang_neuron.models.mimo_v2.kernels.prefill import prefill_mtp_project
+        from sglang_neuron.utils.hardware_config import get_logical_nc_config
+
+        return wrap_nki(prefill_mtp_project)[get_logical_nc_config()](
+            ids, at, token.to(torch.int32), prev.to(graph.embed_tokens.weight.dtype), graph.embed_tokens.weight,
+            self.enorm.weight.view(1, -1), self.hnorm.weight.view(1, -1), self.eh_wT,
+            graph.lm_head_tp_group.rank_in_group_tensor, graph._head_mesh(), eps=self.enorm.eps)
+
+    def prefill(self, graph, hidden: torch.Tensor, next_ids, md: dict, cos, sin, rank, x=None) -> torch.Tensor:
         """Write this layer's KV over a prefill chunk from the target's states ``hidden`` [T, H] and the tokens
-        ``next_ids`` [T] it reads at each position (``md``: a target sliding layer's metadata); returns its states
-        before the final norm [T, H]."""
+        ``next_ids`` [T] it reads at each position (``md``: a target sliding layer's metadata), or from its input ``x``
+        [T, H] already projected (project_chunk); returns its states before the final norm [T, H]."""
         layer = self.layer
-        x = self.project(graph.embed_tokens(next_ids, scatter_tokens=False, rank=rank), hidden)
+        if x is None:
+            x = self.project(graph.embed_tokens(next_ids, scatter_tokens=False, rank=rank), hidden)
         x, normed = self.attn.prefill(x, cos, sin, md, layer.input_layernorm, layer.post_attention_layernorm)
         return layer.mlp.prefill_residual(x, normed)
 

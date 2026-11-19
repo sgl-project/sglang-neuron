@@ -211,7 +211,7 @@ class MiMoV2Graph(nn.Module):
         """[T] int32 the greedy token of each of ``states`` [T, H] (T <= 128) before the final ``norm``: the norm, the
         sharded LM head and the argmax over the ranks in one kernel (kernels/head.greedy); with ``rows`` [T', 1] int32
         of states' rows at them, gathered in the kernel."""
-        if states.shape[0] > 128:
+        if (states.shape[0] if rows is None else rows.shape[0]) > 128 or not can_run_kernel(states):
             if rows is not None:
                 states = states.index_select(0, rows.reshape(-1).to(torch.int64))
             return self.greedy_token(self.lm_head(norm(states))).reshape(-1)
@@ -271,6 +271,18 @@ class MiMoV2Graph(nn.Module):
             span=spec)
         return out
 
+    def _prefill_inputs(self, input_ids, positions) -> tuple:
+        """A prefill chunk's embeddings and both kinds' RoPE tables in one kernel (kernels/prefill.prefill_inputs)."""
+        from sglang_neuron.backend.stack import wrap_nki
+        from sglang_neuron.models.mimo_v2.kernels.prefill import prefill_inputs
+        from sglang_neuron.utils.hardware_config import get_logical_nc_config
+
+        hidden, fc, fs, sc, ss = wrap_nki(prefill_inputs)[get_logical_nc_config()](
+            input_ids.reshape(-1, 1).to(torch.int32), positions.reshape(-1, 1).to(torch.int32),
+            self.embed_tokens.weight, self.lm_head_tp_group.rank_in_group_tensor, self._head_mesh(),
+            self.full_rope.inv_freq.view(1, -1), self.swa_rope.inv_freq.view(1, -1))
+        return hidden, {True: (sc, ss), False: (fc, fs)}
+
     def _first_layer(self, swa: bool) -> str:
         return next(self.config.layer_name(i) for i, s in enumerate(self.config.swa_layers) if s == swa)
 
@@ -280,8 +292,11 @@ class MiMoV2Graph(nn.Module):
         if self.mtp is not None and self.phase == "decode":
             return self._mtp_decode(attn_metadata, rank, mtp_row_slots, mtp_ctrl,
                                     (sampling_temperatures, sampling_seeds, sampling_filters))
-        hidden = self.embed_tokens(input_ids, scatter_tokens=False, rank=rank)
-        tables = self._tables(positions)
+        if self.phase == "prefill" and can_run_kernel(positions) and positions.shape[0] % 128 == 0:
+            hidden, tables = self._prefill_inputs(input_ids, positions)
+        else:
+            hidden = self.embed_tokens(input_ids, scatter_tokens=False, rank=rank)
+            tables = self._tables(positions)
         if self.phase == "prefill":
             # the chunk's real tokens, which the MoE maps alone (models/qwen3_moe/sglang_model.Qwen3MoeGraph.forward):
             # the runtime pads a chunk with its last real position
@@ -330,6 +345,19 @@ class MiMoV2Graph(nn.Module):
     def _mtp_prefill(self, hidden, input_ids, logits, sampling_positions, md, table, rank) -> None:
         """Every MTP layer's KV over the chunk (mtp.py), from the target's states before its final norm: layer k reads
         the chunk's tokens k + 1 ahead, the target's greedy pick and the layers' drafts after its last token."""
+        if can_run_kernel(hidden) and hidden.shape[0] % 128 == 0:
+            # on a device: the target's pick at the chunk's last real row (head.greedy gathering it), then per layer
+            # the rotation and projection (kernels/prefill.prefill_mtp_project), its attention and MLP kernels and its
+            # draft (head.greedy)
+            at32 = sampling_positions.reshape(-1)[-1:].reshape(1, 1).to(torch.int32)
+            token = self.greedy(hidden, self.norm, at32).reshape(1, 1)
+            ids = input_ids.reshape(-1, 1).to(torch.int32)
+            for k, layer in enumerate(self.mtp):
+                x, ids = layer.project_chunk(self, ids, at32, token, hidden, rank)
+                states = layer.prefill(self, hidden, None, md, *table, rank, x=x)
+                if k + 1 < len(self.mtp):
+                    token = self.greedy(states, layer.final_layernorm, at32).reshape(1, 1)
+            return
         at = sampling_positions.reshape(-1)[-1:].to(torch.int64)
         ids = input_ids.reshape(1, -1)
         token = self.greedy_token(logits).reshape(-1)[-1:]
