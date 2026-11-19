@@ -85,15 +85,19 @@ class HyV3Mtp(nn.Module):
         return self.eh_proj(torch.cat([self.enorm(embeds), self.hnorm(target.to(embeds.dtype))], dim=-1))
 
     def prefill(self, graph, hidden: torch.Tensor, input_ids: torch.Tensor, positions: torch.Tensor, logits,
-                attn_metadata: dict, cos, sin, rank) -> None:
+                attn_metadata: dict, cos, sin, rank, real: torch.Tensor) -> None:
         """Write this layer's KV over a prefill chunk: ``hidden`` [T, H] the target's last layer output, ``logits`` the
-        target's at the sampling positions (its greedy pick follows the chunk's last token)."""
+        target's at the sampling positions, ``real`` [T] the chunk's real rows. The target's greedy pick follows the
+        chunk's last real token, which a padded chunk has before its last row."""
+        from sglang_neuron.models.hy_v3.sglang_model import prefill_layer
+
         # the layer reads the target's tables and slots (the runtime builds metadata for the target's layers)
         md = attn_metadata[graph.layers[0].self_attn.name]
         pick = graph.greedy_token(logits).reshape(1).to(input_ids.dtype)
-        next_ids = torch.cat([input_ids[1:], pick])
+        last = torch.argmax(positions).reshape(1)
+        next_ids = torch.cat([input_ids[1:], input_ids[-1:]]).index_copy(0, last, pick)
         x = self.project(graph.embed_tokens(next_ids, scatter_tokens=False, rank=rank), graph.norm(hidden), positions)
-        self.layer(x, lambda h: self.attn.prefill(h, cos, sin, md))
+        prefill_layer(self.layer, x, lambda h: self.attn.prefill(h, cos, sin, md), real)
 
     def decode(self, graph, next_ids: torch.Tensor, prev: torch.Tensor, positions: torch.Tensor, inputs, cos, sin,
                rank) -> torch.Tensor:

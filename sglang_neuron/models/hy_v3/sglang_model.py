@@ -113,6 +113,37 @@ def fp8_kv_cache() -> bool:
     return str(getattr(get_server_args(), "kv_cache_dtype", "auto")).startswith("fp8")
 
 
+# SGLANG_NEURON_HY3_DECODE_NORM=nki (default) runs the decode's input and final RMSNorms in one NKI kernel
+# (kernels/rmsnorm_rows.py); torch keeps the model's RMSNorm module
+DECODE_NORM = os.environ.get("SGLANG_NEURON_HY3_DECODE_NORM", "nki")
+if DECODE_NORM not in ("nki", "torch"):
+    raise ValueError(f"SGLANG_NEURON_HY3_DECODE_NORM={DECODE_NORM!r}: nki or torch")
+
+
+def decode_norm(norm, x: torch.Tensor) -> torch.Tensor:
+    """``norm(x)`` of a decode's rows [T, H]: the NKI kernel up to 128 rows."""
+    if DECODE_NORM == "torch" or x.shape[0] > 128:
+        return norm(x)
+    from sglang_neuron.backend.stack import wrap_nki
+    from sglang_neuron.models.hy_v3.kernels.rmsnorm_rows import rmsnorm_rows
+    from sglang_neuron.utils.hardware_config import get_logical_nc_config
+
+    return wrap_nki(rmsnorm_rows)[get_logical_nc_config()](x.to(torch.bfloat16), norm.weight.view(1, -1),
+                                                          eps=float(norm.eps)).to(x.dtype)
+
+
+def prefill_layer(layer, x, attention, real):
+    """DecoderLayer.forward for a prefill chunk, its MLP told the chunk's ``real`` rows [T]."""
+    h = attention(layer.input_layernorm(x))
+    if layer.post_self_attn_layernorm is not None:
+        h = layer.post_self_attn_layernorm(h)
+    x = x + h
+    h = layer.mlp(layer.post_attention_layernorm(x), real=real)
+    if layer.post_mlp_layernorm is not None:
+        h = layer.post_mlp_layernorm(h)
+    return x + h
+
+
 class HyV3Graph(Qwen3MoeGraph):
     def __init__(self, config: TransformerConfig, moe: HyV3MoEConfig, fp8: bool, phase: str):
         self.fp8 = fp8
@@ -171,7 +202,7 @@ class HyV3Graph(Qwen3MoeGraph):
         residual stream before the norm."""
         if not getattr(layer.mlp, "fused", False):
             return layer(x, attention)
-        x = x + attention(layer.input_layernorm(x))
+        x = x + attention(decode_norm(layer.input_layernorm, x))
         norm = layer.post_attention_layernorm
         return x + layer.mlp.fused_decode(x, norm.weight, norm.eps)
 
@@ -279,13 +310,16 @@ class HyV3Graph(Qwen3MoeGraph):
         if getattr(self.layers[0].self_attn, "sparse", None) is not None:
             end = (positions.max() + 1).reshape(1)
             attn_metadata = {k: dict(v, positions_end=end) for k, v in attn_metadata.items()}
+        # the chunk's real rows (the runtime pads it with its last real position), so the padding routes to no expert
+        # (Qwen3MoeGraph.forward)
+        real = torch.arange(positions.shape[0], device=positions.device) <= torch.argmax(positions)
         hidden = self.embed_tokens(input_ids, scatter_tokens=False, rank=rank)
         cos, sin = self.rotary_emb(positions)
         for layer in self.layers:
             md = attn_metadata[layer.self_attn.name]
-            hidden = layer(hidden, lambda x, a=layer.self_attn, md=md: a.prefill(x, cos, sin, md))
+            hidden = prefill_layer(layer, hidden, lambda x, a=layer.self_attn, md=md: a.prefill(x, cos, sin, md), real)
         logits = self.lm_head(self.norm(hidden.index_select(0, sampling_positions)))
-        self.mtp.prefill(self, hidden, input_ids, positions, logits, attn_metadata, cos, sin, rank)
+        self.mtp.prefill(self, hidden, input_ids, positions, logits, attn_metadata, cos, sin, rank, real)
         return logits
 
     def _span_sample(self, logits, positions, params, width: int, spec: int) -> torch.Tensor:
@@ -340,13 +374,15 @@ class HyV3Graph(Qwen3MoeGraph):
         cos, sin = self.rotary_emb(positions)
         for layer in self.layers:
             hidden = self.decode_layer(layer, hidden, lambda x, a=layer.self_attn: a.decode(x, cos, sin, inputs))
-        normed = self.norm(hidden)
+        normed = decode_norm(self.norm, hidden)
         sampled = self._span_sample(self.lm_head(normed), span["positions"], params, width, spec)
         out, kept = mtp_step.accept(span["tokens"], sampled, span)
         bonus = sampled.gather(1, kept.reshape(-1, 1))
         drafts = self._mtp_drafts(span, share, sampled, normed, kept, table, page, mask, inputs, cos, sin, rank)
         self.mtp_carry.index_copy_(0, slots, torch.cat([bonus, drafts], dim=1).to(torch.int32))
-        self.mtp_len.index_copy_(0, slots, (span["base"] + kept + 1).to(torch.int32))
+        # a row that is not live this step (a padding row) keeps its length: it advanced no token
+        old = self.mtp_len.index_select(0, slots)
+        self.mtp_len.index_copy_(0, slots, torch.where(span["live"], span["base"] + kept + 1, old).to(torch.int32))
         if self.mtp_width > width:
             out = torch.cat([out, torch.full((self.mtp_width - width, spec), -1, dtype=out.dtype, device=out.device)])
         return {"token_ids": out.to(torch.int32)}
