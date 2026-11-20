@@ -20,7 +20,13 @@ CONTEXT=${CONTEXT:-262144}
 # the segmented prefill tiles go up to 8192 tokens (utils/bucket_utils.SUPPORTED_KV_SEGMENT_SIZES)
 CHUNK=${CHUNK:-8192}
 MAX_RUNNING=${MAX_RUNNING:-16}
-MEM_FRACTION=${MEM_FRACTION:-0.85}
+# the weights and the KV pools' share of each core's HBM; the rest holds the graphs and their DMA rings. Under DCP the
+# prefill graphs' rings take more: at 0.85 a DCP server cannot load its prefill graphs ("Failed to allocate DEVICE
+# memory" for the spill rings), at 0.75 it loads all four (8K chunk) and a rank's 1/D share of the KV still fits
+case " $* " in
+    *" --dcp-size "*) MEM_FRACTION=${MEM_FRACTION:-0.75} ;;
+    *) MEM_FRACTION=${MEM_FRACTION:-0.85} ;;
+esac
 # the window pool's tokens per full-pool token. SGLang's default, 0.8, spends most of the KV on the 39 sliding layers'
 # window pool (a full-pool token is 9 layers x 1 KiB a rank, a window token 39 x 1 KiB): at 0.8 a rank's 8 GB holds
 # about 195K tokens of context, at 0.06 about 700K. The running requests need their windows and a prefill chunk in it;
@@ -48,10 +54,17 @@ SPEC_ARGS=()
 if [ "${MTP:-0}" = 1 ]; then
     SPEC_ARGS=(--speculative-algorithm NEURON_MTP)
 fi
+# the KV pool's block count is a dimension of every compiled graph: without a stated pool it is read from the free
+# device memory, which moves with the launch (--mem-fraction-static, DCP, MTP) and the box, and a different count
+# compiles every graph again; MAX_TOTAL_TOKENS pins it, so restarts restore the cache
+POOL_ARGS=()
+if [ -n "${MAX_TOTAL_TOKENS:-}" ]; then
+    POOL_ARGS=(--max-total-tokens "$MAX_TOTAL_TOKENS")
+fi
 
 exec python3 -m sglang.launch_server --model-path "$MODEL_PATH" --served-model-name "$SERVED_NAME" \
     --trust-remote-code --tp-size 64 --ep-size 64 \
     --context-length "$CONTEXT" --chunked-prefill-size "$CHUNK" --max-running-requests "$MAX_RUNNING" \
     --mem-fraction-static "$MEM_FRACTION" --swa-full-tokens-ratio "$SWA_RATIO" \
     --reasoning-parser mimo --tool-call-parser mimo \
-    --host "$HOST" --port "$PORT" "${SPEC_ARGS[@]}" "$@"
+    --host "$HOST" --port "$PORT" "${SPEC_ARGS[@]}" "${POOL_ARGS[@]}" "$@"
