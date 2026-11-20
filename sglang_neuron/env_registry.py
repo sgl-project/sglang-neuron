@@ -32,6 +32,20 @@ KNOBS: dict = {
     "SGLANG_NEURON_GLM52_POINT": CONFIG,
     "SGLANG_NEURON_GLM52_MTP_SYNTHETIC_AL": BENCHMARK,
     "SGLANG_NEURON_GLM52_ATTN_W8": CONFIG,
+    # MiMo-V2 (models/mimo_v2): the routed experts' format (fp8, converted without loss, or bf16), the full layers'
+    # decode attention (mask or posid) and the K/V write's torch path (kv_write.py)
+    "SGLANG_NEURON_MIMO_KV_SCALE": CONFIG,
+    "SGLANG_NEURON_HYBRID_SWA_HICACHE": CONFIG,
+    "SGLANG_NEURON_MIMO_PD_MTP_KV": CONFIG,
+    "SGLANG_NEURON_PD_HYBRID_SWA": CONFIG,
+    "SGLANG_NEURON_COMPILE_SPEEDUPS": CONFIG,
+    "SGLANG_NEURON_COMPILE_SPEEDUPS_DEBUG": CONFIG,
+    # MiMo-V2: the converted FP8 experts kept on disk across launches (models/mimo_v2/experts_fp8._ExpertCache)
+    "SGLANG_NEURON_MIMO_EXPERT_CACHE": CONFIG,
+    # MiMo-V2: the decode MoE half kernel and the step's head kernels (models/mimo_v2/model.py)
+    "SGLANG_NEURON_MIMO_KVDP": CONFIG,
+    # MiMo-V2: the decode graphs' context rungs (models/mimo_v2/sglang_model.decode_context_ladder)
+    "SGLANG_NEURON_MIMO_DECODE_CONTEXTS": CONFIG,
     # the Kimi-K3 prompt cache on the PD prefill (--radix-cache-backend kimi-prompt, mem_cache/kimi_prompt_backend):
     # its host tier, keep_previous, the chunk ends and the read-back of each page copy of a hit
     "SGLANG_NEURON_KIMI_PROMPT_HOST_SLOTS": CONFIG,
@@ -104,7 +118,7 @@ KNOBS: dict = {
     "SGLANG_NEURON_PROFILE_DIR": DEBUG,
     "SGLANG_NEURON_PROFILE_RANKS": DEBUG,
     "SGLANG_NEURON_PROFILE_DEVICE_MODE": DEBUG,
-    **{f"SGLANG_NEURON_PROFILE_SERVE_{field}": DEBUG for field in ("RANKS", "START", "STEPS")},
+    **{f"SGLANG_NEURON_PROFILE_SERVE_{field}": DEBUG for field in ("RANKS", "START", "STEPS", "PHASE")},
     # the SGLang Diffusion platform (sglang_neuron/diffusion/envs.py; docs/model-recipes/flux1-dev.md)
     "SGLANG_NEURON_REQUIRE_NKI_KERNELS": DEBUG,
     "SGLANG_NEURON_DISABLE_NKI_KERNELS": DEBUG,

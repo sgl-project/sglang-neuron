@@ -111,6 +111,7 @@ class NeuronMHATokenToKVPool(KVCache):
         self.k_buffer: List[torch.Tensor] = []
         self.v_buffer: List[torch.Tensor] = []
         self.paired_layers = layout.paired_layers
+        self.fp8_k_layout_packed = layout.fp8_k_packed
         # the model that declares the pairing refuses an odd layer count first (GptOssModel)
         assert not (self.paired_layers and self.layer_num % 2), self.layer_num
         if self.paired_layers and self.kv_cp_size > 1:
@@ -133,24 +134,34 @@ class NeuronMHATokenToKVPool(KVCache):
     def fp8_packed_k(self) -> bool:
         """fp8 caches use the kernels' packed K layout [nb, kv_heads, block//2, d, 2] (two consecutive
         tokens per bf16-sized slot; V stays [nb, kv_heads, block, d]). The nkilib qkv / segmented /
-        decode kernels only support fp8 KV in this layout."""
-        return self.store_dtype in (torch.float8_e4m3fn, torch.float8_e5m2)
+        decode kernels only support fp8 KV in this layout up to 128 channels; a model can declare token-major
+        fp8 K (model_executor.kv_layout.KVLayout.fp8_k_packed)."""
+        return (self.store_dtype in (torch.float8_e4m3fn, torch.float8_e5m2)
+                and getattr(self, "fp8_k_layout_packed", True))
+
+    def _zeros(self, shape) -> torch.Tensor:
+        """A zeroed device buffer, zeroed on the host and copied over. torch.zeros on the device runs an eager
+        program that carries the zeros from the host anyway, a fresh compile in each process and about 2 GB/s: a
+        64-rank MiMo-V2 launch spent 85 s in its 12 GB FP8 pool (the host copy is 2-4x faster there, and 15x on one
+        rank). FP8 buffers go over as bytes (no CPU FP8 fill needed; zero bytes are +0.0)."""
+        fp8 = self.store_dtype in (torch.float8_e4m3fn, torch.float8_e5m2)
+        host = torch.zeros(tuple(shape), dtype=torch.uint8 if fp8 else self.store_dtype)
+        out = host.to(self.kv_device)
+        return out.view(self.store_dtype) if fp8 else out
 
     def _create_buffers(self):
         k_shape, shape = self.get_kv_buffer_shape()
         if self.paired_layers:
             nb = self.num_blocks
-            k_pairs = [torch.zeros((2 * nb, *k_shape[1:]), dtype=self.store_dtype, device=self.kv_device)
-                       for _ in range(self.layer_num // 2)]
-            v_pairs = [torch.zeros((2 * nb, *shape[1:]), dtype=self.store_dtype, device=self.kv_device)
-                       for _ in range(self.layer_num // 2)]
+            k_pairs = [self._zeros((2 * nb, *k_shape[1:])) for _ in range(self.layer_num // 2)]
+            v_pairs = [self._zeros((2 * nb, *shape[1:])) for _ in range(self.layer_num // 2)]
             self.k_buffer = [half for pair in k_pairs for half in (pair[:nb], pair[nb:])]
             self.v_buffer = [half for pair in v_pairs for half in (pair[:nb], pair[nb:])]
             self.layer_pairs = (k_pairs, v_pairs)
             return
         for _ in range(self.layer_num):
-            self.k_buffer.append(torch.zeros(k_shape, dtype=self.store_dtype, device=self.kv_device))
-            self.v_buffer.append(torch.zeros(shape, dtype=self.store_dtype, device=self.kv_device))
+            self.k_buffer.append(self._zeros(k_shape))
+            self.v_buffer.append(self._zeros(shape))
 
     def _clear_buffers(self):
         del self.k_buffer, self.v_buffer
@@ -218,7 +229,16 @@ class NeuronMHATokenToKVPoolKind(NeuronMHATokenToKVPool, MHATokenToKVPool):
     doesn't override raises (``_refuse_mha_methods``), since those address SGLang's token-major buffers. Pool options
     this pool doesn't implement are refused."""
 
+    # the page layout SGLang's PD transfer reads off an MHA pool (kv_cache_layout; MHATokenToKVPool's constructor,
+    # which sets it, never runs here): head-major, [kv_heads, page, head_dim]. SGLang moves a hybrid SWA pool's window
+    # pages whole between equal attention-TP sizes and refuses its per-token head slice of an "hnd" pool otherwise
+    kv_cache_layout = "hnd"
+
     def __init__(self, *args, **kwargs):
+        if kwargs.get("enable_kv_cache_copy") and _neuron_mtp():
+            # SGLang asks for KV copies under any speculative algorithm, for the verify of a draft tree; a NEURON_MTP
+            # step writes each token's KV at its final slot and copies none (speculative/neuron_mtp.py)
+            kwargs = dict(kwargs, enable_kv_cache_copy=False)
         _refuse_unsupported_pool_options(kwargs)
         NeuronMHATokenToKVPool.__init__(self, *args, **kwargs)
 
@@ -269,6 +289,14 @@ def _refuse_other_head_dims(head_dim: int, kwargs: dict) -> None:
     if other:
         raise ValueError(f"the Neuron KV pool holds K and V of one head dim ({head_dim}) on every layer, not "
                          f"{', '.join(f'{k}={v}' for k, v in other.items())}")
+
+
+def _neuron_mtp() -> bool:
+    from sglang.srt.runtime_context import get_server_args
+
+    from sglang_neuron.speculative.neuron_mtp import is_neuron_mtp
+
+    return is_neuron_mtp(getattr(get_server_args(), "speculative_algorithm", None))
 
 
 def _refuse_unsupported_pool_options(kwargs: dict, options_off=None) -> None:

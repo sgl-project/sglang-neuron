@@ -174,14 +174,21 @@ class BucketConfig:
         whose prefill takes the chunk alone (``prefill_ladder`` false) runs the chunk's graph only. A decode runs one
         graph per batch size SGLang resolved (--cuda-graph-bs-decode, else the platform's default) up to the per-DP
         batch, and one of the per-DP batch itself, each over the whole context (--context-length), and with
-        ``decode_context_ladder`` also over its quarter and its half. A disaggregated decode (``prefill`` false) has no
+        ``decode_context_ladder`` also over its quarter and its half, or over the contexts a callable of the context
+        gives (a model's own rungs, ModelHost.decode_context_ladder). A disaggregated decode (``prefill`` false) has no
         prefill bucket. Under DCP (``kv_shards`` above 1) each context becomes its DCP decode context, by the decode
         kernel's rule (``dcp_context_rule``, default decode_context_parallel.decode_context)."""
         from sglang_neuron.utils.bucket_utils import SUPPORTED_KV_SEGMENT_SIZES
 
         tile = _lnc_degree() * P_MAX
         max_model_len = _round_up(max_model_len, tile)
-        contexts = sorted({_round_up(max_model_len // q, tile) for q in ((4, 2, 1) if decode_context_ladder else (1,))})
+        # True: the quarter and the half too; a model may give its own rungs as the contexts themselves (a callable of
+        # the context, ModelHost.decode_context_ladder)
+        if callable(decode_context_ladder):
+            rungs = [int(c) for c in decode_context_ladder(max_model_len) if 0 < int(c) <= max_model_len]
+        else:
+            rungs = [max_model_len // q for q in ((4, 2, 1) if decode_context_ladder else (1,))]
+        contexts = sorted({_round_up(c, tile) for c in rungs + [max_model_len]})
         if kv_shards > 1:
             from sglang_neuron.distributed.decode_context_parallel import decode_context
 
@@ -193,6 +200,11 @@ class BucketConfig:
             # whole P_MAX attention tiles that split evenly over the attention TP ranks, at least two tokens a rank
             return tokens > attn_tp_size and tokens % attn_tp_size == 0 and tokens % P_MAX == 0
 
+        def ladder_fits(tokens):
+            # under DCP a prefill starts at a whole virtual page (kv_shards blocks), and so ends at one unless it is a
+            # prompt's last piece: a smaller bucket is a whole number of virtual pages
+            return fits(tokens) and tokens % (kv_shards * block_size) == 0
+
         if not prefill:
             prefill_buckets = []
         elif not fits(chunked_prefill_size):
@@ -200,7 +212,7 @@ class BucketConfig:
                              f"multiple of {P_MAX} and of the attention TP size ({attn_tp_size}), and above it")
         elif prefill_token_counts is None:
             prefill_buckets = sorted(t for t in SUPPORTED_KV_SEGMENT_SIZES
-                                     if prefill_ladder and t < chunked_prefill_size and fits(t))
+                                     if prefill_ladder and t < chunked_prefill_size and ladder_fits(t))
             prefill_buckets.append(chunked_prefill_size)
         else:
             # counts above the chunk never run: every forward is at most one chunk
@@ -405,7 +417,7 @@ class NeuronModelRuntime:
             prefill_token_counts=resolution_result(sa, "cuda_graph_bs_prefill", None),
             prefill_ladder=sgl_model.prefill_ladder,
             # the DP ranks of a lockstep decode share no row lengths, so they could not agree on a context rung
-            decode_context_ladder=sgl_model.decode_context_ladder and not self.dp_lockstep,
+            decode_context_ladder=False if self.dp_lockstep else sgl_model.decode_context_ladder,
             kv_shards=1 if self.dcp is None else self.dcp.size,
             dcp_context_rule=None if self.dcp is None else self.dcp_decode_context,
         )
@@ -1221,7 +1233,9 @@ class NeuronModelRuntime:
         """The serving device-profile window (SGLANG_NEURON_PROFILE_SERVE_*) a decode dispatch counts against, or None.
         Every decode dispatch counts, an idle DP rank's dummy and a non-last PP stage's too: the window's entry and exit
         are barriers every rank of the (stage's) TP group must reach on the same step."""
-        if phase != "decode" or not self._profile_serve:
+        # SGLANG_NEURON_PROFILE_SERVE_PHASE=prefill counts the prefill dispatches instead (an aggregated server's
+        # chunks, which every rank of the TP group runs)
+        if not self._profile_serve or phase != os.environ.get("SGLANG_NEURON_PROFILE_SERVE_PHASE", "decode"):
             return None
         if not hasattr(self, "_serving_capture"):
             from sglang_neuron.model_executor.profiling import ServingCapture, serve_label

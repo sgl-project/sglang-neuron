@@ -31,6 +31,10 @@ def init_stack() -> None:
     from sglang_neuron.distributed import gloo_device
 
     init_backend()
+    # two no-op tracing passes skipped (backend/compile_speedups.py)
+    from sglang_neuron.backend import compile_speedups
+
+    compile_speedups.apply()
     if os.environ.get("SGLANG_NEURON_DEBUG_MESH") == "1":
         for name in stack.mesh_logger_names():
             logging.getLogger(name).setLevel(logging.DEBUG)

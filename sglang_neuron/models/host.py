@@ -28,7 +28,8 @@ class ModelHost(NeuronModel):
     # (graph_runner.BucketConfig)
     prefill_ladder = True
     # whether the decode also compiles graphs over a quarter and a half of the context, for batches whose rows are
-    # short (graph_runner.BucketConfig); a model opts in once its decode attention reads only its graph's context
+    # short (graph_runner.BucketConfig); a model opts in once its decode attention reads only its graph's context. A
+    # callable of the context instead gives the model's own rungs
     decode_context_ladder = False
     # the prefill attention is the segmented kernel, whose KV segment tile is the prefill token bucket
     # (graph_runner.check_prefill_tiles); a model with a prefill attention of its own sets it False

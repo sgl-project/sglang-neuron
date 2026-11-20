@@ -283,6 +283,11 @@ def _register_launch_hooks() -> None:
 
     dspark_server_args.register(HookRegistry, HookType.REPLACE)
     gpt_oss_backend_check.register(HookRegistry, HookType.AROUND)
+    # MiMo-V2: SGLang's fused-QKV TP check (the graphs re-shard it) and the KV pool's head dims (the graphs' padded
+    # heads), in every process: the launching one resolves the arguments, the schedulers build the pools
+    from sglang_neuron.sglang_patches import mimo_v2_launch
+
+    mimo_v2_launch.register(HookRegistry, HookType.AROUND, HookType.REPLACE)
     # a prefill without a decode peer (bring-up, timing): argument resolution and the tokenizer manager
     pd_fake_prefill.register(HookRegistry, HookType.AROUND)
     neuron_system_profile.register_tokenizer(HookRegistry, HookType.AROUND)
