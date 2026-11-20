@@ -245,7 +245,11 @@ class Fp8Attention(Attention):
     def _prefill_weights(self) -> tuple:
         """(qkv, o) bf16 projection weights of a prefill: the FP8 ones dequantized in the graph."""
         if not self.fp8_weights:
-            return self.qkv_weight, self.o_weight
+            # the bf16 o_weight holds the V scale (set_kv_scales); the prefill's output is dequantized already
+            o = self.o_weight
+            if self.v_scale_float != 1.0:
+                o = (o.to(torch.float32) * (1.0 / self.v_scale_float)).to(torch.bfloat16)
+            return self.qkv_weight, o
         q, kv = self.num_heads * self.head_dim, self.num_kv_heads * self.head_dim
         s = self.qkv_w_scale[0]
         cols = torch.cat([s[0:1].expand(q), s[1:2].expand(kv), s[2:3].expand(kv)])
@@ -259,7 +263,7 @@ class Fp8Attention(Attention):
         """The decode kernel's projection arguments; the kernel reads V undequantized, so the output projection takes
         the V scale (in its bf16 weight, or folded into its FP8 scales by set_kv_scales)."""
         if not self.fp8_weights:
-            return {"W_qkv": self.qkv_weight, "W_out": self.o_weight * self.v_scale_float}
+            return {"W_qkv": self.qkv_weight, "W_out": self.o_weight}
         return {"W_qkv": self.qkv_weight, "W_out": self.o_weight, "qkv_w_scale": self.qkv_w_scale,
                 "qkv_in_scale": self.qkv_in_scale, "o_w_scale": self.o_w_scale, "o_in_scale": self.o_in_scale}
 
@@ -272,6 +276,11 @@ class Fp8Attention(Attention):
             # phase's graph these tensors); the prefill divides it out of its weight scale (_prefill_weights).
             for param, factor in ((self.o_w_scale, self.v_scale_float), (self.o_in_scale, 1.0 / self.v_scale_float)):
                 param.data = (param.data.cpu() * factor).to(param.device)
+        else:
+            # bf16: the V scale folds into the output projection's weight once, here, rather than in every decode
+            # pass's graph (a read and a write of the weight a layer); the prefill divides it out (_prefill_weights)
+            w = self.o_weight
+            w.data = (w.data.cpu().to(torch.float32) * self.v_scale_float).to(w.dtype).to(w.device)
 
     def _scale_tensor(self, value: float, rows: int, device) -> torch.Tensor:
         return torch.full((rows, 1), value, dtype=torch.float32, device=device)
