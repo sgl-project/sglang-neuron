@@ -21,9 +21,13 @@ The model supplies the step through its catalog entry (``catalog.ModelSpec.mtp_h
   launch is not served, and what a served launch should know;
 - ``StepHost(target_worker)``, with ``slot(req_pool_idx) -> int`` (a request row's kernel slot) and
   ``step(batch, slots, fresh) -> logits_output``, which launches one step for the batch's requests (their slots, and
-  whether each is fresh) without reading it back.
+  whether each is fresh) without reading it back;
+- optionally ``AGGREGATED = True``: the model also serves an aggregated server, whose prefill writes the MTP layer's
+  KV in the target's own prefill graph, so an extend batch runs the target alone and the request's first decode step
+  is fresh.
 
-Served on a PD decode, without logprobs: greedy requests, and sampled ones under ``SGLANG_NEURON_SAMPLER=topk_topp``.
+Served on a PD decode (or an aggregated server where the host declares it), without logprobs: greedy requests, and
+sampled ones under ``SGLANG_NEURON_SAMPLER=topk_topp``.
 """
 
 from __future__ import annotations
@@ -77,7 +81,7 @@ def server_args_problems(server_args, host=None) -> list:
     if mode == "prefill":
         problems.append("a --disaggregation-mode prefill (launch the prefill of an MTP decode without a speculative "
                         f"algorithm, with {host.PREFILL_SETTING})")
-    elif mode != "decode":
+    elif mode != "decode" and not getattr(host, "AGGREGATED", False):
         problems.append("a server that is not a --disaggregation-mode decode (the step is the decode kernel's)")
     if getattr(server_args, "speculative_draft_model_path", None):
         problems.append("--speculative-draft-model-path (the draft is the checkpoint's own MTP layer)")
@@ -142,12 +146,19 @@ def placeholder_draft_input():
 
 
 def validate_request(obj, preferred, server_args) -> None:
-    """Refuse a sampled request unless the decode samples on the device (``SGLANG_NEURON_SAMPLER=topk_topp``)."""
+    """Refuse a sampled request unless the decode samples on the device (``SGLANG_NEURON_SAMPLER=topk_topp``, or
+    ``temperature``, whose own admission refuses the top-k / top-p / min-p filters it does not apply), and any logprob
+    request: the decode commits its accepted tokens on the device, and no logprobs leave it."""
     if not is_neuron_mtp(getattr(server_args, "speculative_algorithm", None)):
         return
+    returns = getattr(obj, "return_logprob", False)
+    if any(returns) if isinstance(returns, (list, tuple)) else bool(returns):
+        raise ValueError(f"--speculative-algorithm {ALGORITHM} returns no logprobs (return_logprob): send the "
+                         "request without them, or serve it from a decode without MTP")
     from sglang_neuron import sampling
 
-    if sampling.sampler_mode() != "topk_topp" and not sampling.request_is_greedy(obj, preferred):
+    sampled = sampling.sampler_mode() in ("topk_topp", "temperature")
+    if not sampled and not sampling.request_is_greedy(obj, preferred):
         raise ValueError(f"--speculative-algorithm {ALGORITHM} verifies greedy requests only (temperature 0 or "
                          "top_k 1): send the request greedy, or serve it from a decode without MTP")
 
@@ -182,6 +193,7 @@ def worker_class():
             self._target_worker = target_worker
             self._draft_worker = None
             host = model_host(server_args)
+            self.aggregated = bool(getattr(host, "AGGREGATED", False))
             self.speculative_num_draft_tokens = chain_shape(host)[2]
             self.req_to_token_pool, self.token_to_kv_pool_allocator = target_worker.get_memory_pool()
             self.host = host.StepHost(target_worker)
@@ -207,7 +219,20 @@ def worker_class():
 
             mode = batch.forward_mode
             if mode.is_extend() or batch.is_extend_in_batch:
-                raise RuntimeError(f"{ALGORITHM} serves a PD decode, which runs no extend batch ({mode})")
+                if not self.aggregated:
+                    raise RuntimeError(f"{ALGORITHM} serves a PD decode, which runs no extend batch ({mode})")
+                # an aggregated server's prefill: the target's prefill graph writes the MTP layer's KV too, and the
+                # request's first decode step takes its token from the host (fresh). Spec v2: the extend's lengths
+                # are the batch's, before this iteration's tokens.
+                result = self.target_worker.forward_batch_generation(batch)
+                result.new_seq_lens = batch.seq_lens
+                if on_publish is not None:
+                    on_publish(result.new_seq_lens)
+                # the prefill's sampled tokens ride the token relay: under the overlap schedule a request's first
+                # step can launch before the host has its token (StepHost reads it from the relay)
+                result.next_draft_input = placeholder_draft_input()
+                result.next_draft_input.bonus_tokens = result.next_token_ids
+                return result
             if pp_proxy_tensors is not None:
                 raise RuntimeError(f"{ALGORITHM} runs without pipeline stages")
             reqs = batch.reqs

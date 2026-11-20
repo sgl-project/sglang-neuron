@@ -98,6 +98,40 @@ flowchart LR
 
 `--stream-interval 4` streams each answer four tokens at a time, so one benchmark client keeps up with every stream.
 
+## Qwen3-235B-A22B
+
+Qwen3-235B-A22B (94 layers, 64 query and 4 KV heads, 128 experts, top 8, expert intermediate 1536) runs on trn2 on one
+trn2.48xlarge with an expert intermediate shard of 768, i.e. two ranks per expert:
+
+- `--tp-size 64 --ep-size 32`: the whole instance (64 NeuronCores at LNC2); each pair of ranks holds 4 experts, each
+  rank half of every expert's intermediate;
+- `--tp-size 32 --ep-size 16`: half the instance (each pair of ranks holds 8 experts), so a prefill and a decode
+  server fit on one instance, or two instances hold one each.
+
+`--tp-size 32 --ep-size 32` gives a shard of 1536, which the bf16 `moe_cte` kernel computes wrong on trn2 (one prompt
+of 800 tokens comes back as repeated tokens and every later request on that server does too); its prefill graphs are
+refused at warm-up. With TP above the 4 KV heads, each KV head replicates over TP / 4 ranks.
+
+```bash
+python3 -m sglang.launch_server --model-path /models/Qwen3-235B-A22B \
+  --tp-size 64 --ep-size 32 --context-length 8192 --chunked-prefill-size 2048 --max-running-requests 64 \
+  --mem-fraction-static 0.7 --host 0.0.0.0 --port 30000
+```
+
+Measured on trn2.48xlarge (few-shot GSM8K, 200 questions, 64 in parallel, greedy), with probes of short prompts before
+and after each run to check the server stays right:
+
+| Layout | Serving | GSM8K | Duration |
+|---|---|---|---|
+| TP64 EP32 | aggregated | 0.965 | 89 s |
+| TP32 EP16 | aggregated | 0.955 | 140 s |
+| TP32 EP16 | prefill and decode on one instance (cores 0-31 and 32-63), Mooncake over EFA | 0.970 | |
+| TP32 EP16 | prefill and decode on one instance, NIXL | 0.965 | |
+| TP32 EP32 | aggregated, before the refusal | 0.000 | |
+
+A PD transfer of this model is small: at attention TP32 each rank sends its replica's pages, about 80 KB per RDMA write
+on GSM8K and 130 KB on 4K-token prompts, and the 8 replicas of each KV head each send the same pages.
+
 ## Compiled shapes
 
 As Qwen3's: a prefill graph of the chunk and of each smaller KV segment tile that splits over the attention TP ranks,
@@ -118,9 +152,11 @@ A launch the graphs can't serve fails at startup, naming the setting at fault:
 - experts that do not split over the EP size, an EP size that does not divide the attention TP size, and an expert
   intermediate size that does not split over the ranks of its row;
 - a prefill chunk the bf16 `moe_cte` kernel is not validated for, refused when the prefill graphs compile at warm-up.
-  The limit depends on the expert intermediate shard (the expert intermediate size over the ranks of its row): a chunk
-  of up to 8192 tokens with a shard of at most 768, up to 2048 with a shard of at most 1536, and none above that (more
-  ranks per expert, a smaller `--ep-size` or a larger `--tp-size`, shrink the shard). Qwen3-30B-A3B's shard is 768 at
+  The limit depends on the expert intermediate shard (the expert intermediate size over the ranks of its row) and on
+  the target: on trn3 a chunk of up to 8192 tokens with a shard of at most 768, up to 2048 with a shard of at most
+  1536, and none above that; on trn2 a chunk of up to 4096 tokens with a shard of at most 768 and none above that (a
+  shard of 1536 answers garbage on trn2 at every prefill tile, see [Qwen3-235B-A22B](#qwen3-235b-a22b)). More ranks per
+  expert, a smaller `--ep-size` or a larger `--tp-size`, shrink the shard. Qwen3-30B-A3B's shard is 768 at
   `--ep-size 4`, so every chunk is served;
 - DP attention (`--enable-dp-attention`), on any role;
 - a KV cache dtype other than `auto`, `bf16` or `bfloat16`, a page size other than 128, and the features every model

@@ -34,11 +34,34 @@ BLOCK_SIZE = 128
 # torch path on a NeuronCore (trn3, LNC2): I 768 up to 8192 tokens; I 1408 and 1536 up to 2048, past which (4096
 # tokens) it returns NaN rows from about token 2600 on and garbage in others
 VALIDATED_SHAPES = ((768, 8192), (1536, 2048))
+# the same on trn2 (LNC2): I 768 up to 4096 tokens (Qwen3-30B-A3B at TP8 EP8 and Qwen3-235B-A22B at TP32 EP16 serve
+# right). I 1536 is wrong at every prefill tile: Qwen3-235B-A22B at TP32 EP32 answers garbage for one prompt of 800
+# tokens in the 1024 tile and of 512 in the 512 tile, and every later request on that server is garbage too.
+VALIDATED_SHAPES_TRN2 = ((768, 4096),)
+# the same with every block's weights reloaded (reload_weights): I 1536 matched up to 8192 tokens (trn2, LNC2), under
+# one hot expert, a 60/40 or 30/70 split and sparse random routing; the 4096-token NaN rows above come from the skipped
+# weight loads, which the reload replaces
+VALIDATED_RELOAD_SHAPES = ((1536, 8192),)
 
 
-@nki.jit(mode="trace")
-def _moe_cte_bf16(hidden_states, expert_affinities_masked, gate_up_proj_weight, down_proj_weight,
-                  token_position_to_id, block_to_expert):
+def _moe_cte_bf16_kernel(skip_weight: bool):
+    """The kernel with or without skipping a block's weight load when its expert's are loaded already.
+
+    The skip (``SkipMode.skip_weight``) is wrong when one expert's blocks land on both cores: with a hot expert (512
+    tokens of 512 routed to one of three local experts, on trn2 at LNC2) one core's blocks come out as garbage, and as
+    NaN at 1024 tokens and more. Every block then loads its expert's weights instead."""
+
+    @nki.jit(mode="trace")
+    def kernel(hidden_states, expert_affinities_masked, gate_up_proj_weight, down_proj_weight, token_position_to_id,
+               block_to_expert):
+        return _moe_cte_bf16_body(hidden_states, expert_affinities_masked, gate_up_proj_weight, down_proj_weight,
+                                  token_position_to_id, block_to_expert, skip_weight)
+
+    return kernel
+
+
+def _moe_cte_bf16_body(hidden_states, expert_affinities_masked, gate_up_proj_weight, down_proj_weight,
+                       token_position_to_id, block_to_expert, skip_weight):
     return _nki_moe_cte(
         hidden_states=hidden_states,
         expert_affinities_masked=expert_affinities_masked,
@@ -50,15 +73,19 @@ def _moe_cte_bf16(hidden_states, expert_affinities_masked, gate_up_proj_weight, 
         spec=MoECTESpec(implementation=MoECTEImplementation.shard_on_block, shard_on_block=ShardOnBlockConfig()),
         activation_function=ActFnType.SiLU,
         # an empty slot (token -1) loads nothing; a padding block names the last local expert and holds only empty slots
-        skip_dma=SkipMode(skip_token=True, skip_weight=True),
+        skip_dma=SkipMode(skip_token=True, skip_weight=skip_weight),
         compute_dtype=nl.bfloat16,
         is_tensor_update_accumulating=True,
         expert_affinities_scaling_mode=ExpertAffinityScaleMode.POST_SCALE,
     )
 
 
+_moe_cte_bf16 = _moe_cte_bf16_kernel(skip_weight=True)
+_moe_cte_bf16_reload = _moe_cte_bf16_kernel(skip_weight=False)
+
+
 def moe_experts_blockwise(hidden: Tensor, *, gate_up: Tensor, down: Tensor, affinities: Tensor, top_k: int,
-                          padding_mask: Optional[Tensor] = None) -> Tensor:
+                          padding_mask: Optional[Tensor] = None, reload_weights: bool = False) -> Tensor:
     """This rank's experts on hidden [T, H]: sum over the local experts of affinity * down(silu(gate) * up), [T, H].
 
     gate_up is [E_local, H, 2, I] (gate at 0, up at 1), down [E_local, I, H]; affinities [T, E_local] fp32 hold each
@@ -66,7 +93,9 @@ def moe_experts_blockwise(hidden: Tensor, *, gate_up: Tensor, down: Tensor, affi
     the blocks the routing can fill. padding_mask [T] bool marks the real tokens, and the mapping leaves the other
     rows out. A prefill passes it: the hidden state of a chunk's padding row changes from run to run, so its routing
     would change the block fill, the split of the blocks over the two cores and the order of the kernel's
-    accumulating writes, and so the bf16 sums of the real tokens. Without it, every row is routed."""
+    accumulating writes, and so the bf16 sums of the real tokens. Without it, every row is routed. ``reload_weights``
+    loads every block's expert weights (_moe_cte_bf16_kernel): a model whose routing can send many of a chunk's tokens to
+    one of few local experts needs it."""
     tokens = hidden.shape[0]
     token_position_to_id, block_to_expert, _ = build_blockwise_mapping(
         affinities, num_local_experts=gate_up.shape[0], num_experts_per_token=top_k, block_size=BLOCK_SIZE,
@@ -75,19 +104,40 @@ def moe_experts_blockwise(hidden: Tensor, *, gate_up: Tensor, down: Tensor, affi
                       else padding_mask))
     if not can_run_kernel(hidden):
         return _torch_moe_experts_blockwise(hidden, gate_up, down, affinities, token_position_to_id, block_to_expert)
-    _check_validated(tokens, gate_up.shape[-1])
-    out = wrap_nki(_moe_cte_bf16)[get_logical_nc_config()](
+    _check_validated(tokens, gate_up.shape[-1], reload_weights)
+    out = wrap_nki(_moe_cte_bf16_reload if reload_weights else _moe_cte_bf16)[get_logical_nc_config()](
         hidden, affinities.to(hidden.dtype).reshape(-1, 1), gate_up, down, token_position_to_id,
         block_to_expert.reshape(-1, 1))
     # [T, 2, H]: the two cores' partial sums, which the kernel reduces into the first
     return out[:, 0]
 
 
-def _check_validated(tokens: int, intermediate: int) -> None:
-    if not any(intermediate <= i and tokens <= t for i, t in VALIDATED_SHAPES):
+def _resolve_validated_shapes():
+    """The shapes validated on this launch's target: trn2's where it reports trn2, else trn3's (a CPU run included,
+    which takes the torch path)."""
+    from sglang_neuron.backend.stack import get_platform_target
+
+    try:
+        target = get_platform_target()
+    except (RuntimeError, ImportError):  # no runtime to ask: a CPU run
+        return VALIDATED_SHAPES
+    return VALIDATED_SHAPES_TRN2 if target.startswith("trn2") else VALIDATED_SHAPES
+
+
+# resolved once at import, as dtype_utils.FP8_CLAMP_MAX: the check runs while the prefill graph traces, where the
+# runtime's target query cannot be called
+_VALIDATED_ON_TARGET = _resolve_validated_shapes()
+
+
+def _check_validated(tokens: int, intermediate: int, reload_weights: bool = False) -> None:
+    shapes = _VALIDATED_ON_TARGET + (VALIDATED_RELOAD_SHAPES if reload_weights else ())
+    if not any(intermediate <= i and tokens <= t for i, t in shapes):
+        smaller_shard = ("launch with more ranks per expert (a smaller --ep-size or a larger --tp-size) for a smaller "
+                         "shard")
+        fix = (smaller_shard if not any(intermediate <= i for i, _ in shapes)
+               else f"launch with a smaller --chunked-prefill-size, or {smaller_shard}")
         raise ValueError(f"the bf16 moe_cte kernel is not validated for {tokens} tokens of an expert intermediate "
-                         f"shard of {intermediate} (validated: {VALIDATED_SHAPES}); launch with a smaller "
-                         "--chunked-prefill-size")
+                         f"shard of {intermediate} (validated on this target: {shapes}); {fix}")
 
 
 @nki.jit(mode="trace")

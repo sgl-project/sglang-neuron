@@ -260,10 +260,15 @@ def init_kv_manager(original_fn, self, *args, **kwargs):
 
 
 def pairs_by_stripes(kv_manager) -> bool:
-    """A DCP decode pairs by stripes when its model's PD prefill stores DCP KV (ModelSpec.prefill_context_parallel)."""
+    """A DCP decode pairs by stripes when its model's PD prefill stores DCP KV (ModelSpec.prefill_context_parallel) in
+    an MLA pool, the only pool the stripe map serves (disaggregation/dcp_stripes.py). An MHA DCP decode pairs by
+    pages with a prefill without DCP (check_page_peer), at any prefill attention TP (nixl_head_major): Hy3 declares
+    prefill_context_parallel for its aggregated DCP prefill, and its PD prefill runs without DCP."""
     from sglang_neuron.models import catalog
 
     if int(getattr(kv_manager, "dcp_size", 1)) <= 1:
+        return False
+    if not (getattr(kv_manager, "is_mla_backend", False) or getattr(kv_manager, "is_hybrid_mla_backend", False)):
         return False
     return bool(catalog.model_spec(kv_manager.server_args)[1].prefill_context_parallel)
 
@@ -404,7 +409,12 @@ def check_page_peer(mgr, peer_info) -> None:
         getattr(mgr.kv_args, "kv_head_num", 0) or 0) * prefill_tp
     replication = decode_tp // total_heads if total_heads else 0
     n = decode_tp // prefill_tp if decode_tp % prefill_tp == 0 else 0
-    heads_ratio = n // max(1, replication) if n else 0
+    # KV heads a rank holds on each side (a head replicated over several ranks counts as one): a decode page is the
+    # prefill page's slice of heads_ratio heads, the whole page when both sides hold one head (Hy3's 8 heads at
+    # prefill TP32, decode TP64)
+    prefill_heads = max(1, total_heads // prefill_tp) if total_heads else 0
+    decode_heads = max(1, total_heads // decode_tp) if total_heads else 0
+    heads_ratio = prefill_heads // decode_heads if decode_heads and prefill_heads % decode_heads == 0 else 0
     if not (n and replication >= 1 and replication % dcp == 0 and heads_ratio >= 1
             and all(src == dst * heads_ratio for src, dst in ratios)):
         raise RuntimeError(
@@ -533,11 +543,24 @@ def prepare_payload_xfer(original_fn, self, peer_info, *args, **kwargs):
         return None
     if not _page_peer(self, peer_info):
         return original_fn(self, peer_info, *args, **kwargs)
-    plain = dataclasses.replace(peer_info, requires_dcp_relayout=False)
+    whole = _whole_pages(self, peer_info)
+    # a decode rank that holds its prefill rank's page whole (both sides one KV head a rank: Hy3's 8 heads at prefill
+    # TP32, decode TP64) takes the equal-TP dlists, which carry every entry the pool registers (the MTP layer, the
+    # sparse summaries' side buffers); upstream's head-slice dlists assume every entry is a K or V page of one size
+    plain = dataclasses.replace(peer_info, requires_dcp_relayout=False,
+                                **({"decode_tp_size": int(self.attn_tp_size)} if whole else {}))
     out = original_fn(self, plain, *args, **kwargs)
     peer_info.dst_homogeneous_mem_kind = plain.dst_homogeneous_mem_kind
-    peer_info.dcp_page_slices = int(peer_info.decode_tp_size) != int(self.attn_tp_size)
+    peer_info.dcp_page_slices = not whole and int(peer_info.decode_tp_size) != int(self.attn_tp_size)
     return out
+
+
+def _whole_pages(mgr, peer_info) -> bool:
+    """Whether each of this prefill's KV entries goes whole into its paired decode entry (equal item bytes)."""
+    n_src, n_dst = len(mgr.kv_args.kv_item_lens), len(peer_info.dst_kv_item_lens)
+    dst_indices = mgr._build_transfer_dst_indices(peer_info=peer_info, n_src=n_src, n_dst=n_dst)
+    return all(int(mgr.kv_args.kv_item_lens[i]) == int(peer_info.dst_kv_item_lens[j])
+               for i, j in enumerate(dst_indices))
 
 
 def build_dcp_token_transfer_plan(original_fn, src_page_indices, dst_page_indices, *, physical_page_size: int,

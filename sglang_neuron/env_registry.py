@@ -25,6 +25,24 @@ KNOBS: dict = {
     "SGLANG_NEURON_MAX_TOP_LOGPROBS": CONFIG,
     # GPT-OSS's expert numeric format (models/gpt_oss/config.expert_format)
     "SGLANG_NEURON_GPT_OSS_EXPERTS": CONFIG,
+    # Hy3's FP8 KV scale profile (models/hy_v3/kv_scales.py)
+    "SGLANG_NEURON_HY3_KV_SCALES": CONFIG,
+    # Hy3's routed expert format: fp8 (the checkpoint's) or bf16 (models/hy_v3/experts_fp8.py)
+    "SGLANG_NEURON_HY3_EXPERTS": CONFIG,
+    # Hy3's block-sparse decode under DCP: the fraction of a decode table's pages a step attends to (models/hy_v3/sparse.py)
+    "SGLANG_NEURON_HY3_SPARSE_DECODE": CONFIG,
+    # Hy3's decode MoE block in one kernel (models/hy_v3/moe_fused.py)
+    "SGLANG_NEURON_HY3_DECODE_MOE_FUSED": CONFIG,
+    "SGLANG_NEURON_HY3_ATTN_FP8": CONFIG,
+    "SGLANG_NEURON_HY3_SPARSE_SELECT_EVERY": CONFIG,
+    "SGLANG_NEURON_HY3_PREFILL_SEG": CONFIG,
+    "SGLANG_NEURON_HY3_SPAN_K": CONFIG,
+    "SGLANG_NEURON_HY3_DECODE_NORM": CONFIG,
+    # a short prompt's prefill between two chunks of a long one (sglang_patches/prefill_yield)
+    "SGLANG_NEURON_PREFILL_YIELD": CONFIG,
+    "SGLANG_NEURON_HY3_SPARSE_PREFILL_KEEP": CONFIG,
+    "SGLANG_NEURON_HY3_DIRECT_SUBMIT": CONFIG,
+    "SGLANG_NEURON_HY3_PD_MTP_KV": CONFIG,
     # GLM-5.2 (models/glm52): the decode's weight store, the prefill's MTP rows for a drafting decode, the decode
     # point, the benchmark's pinned MTP acceptance and the decode's FP8 attention weights
     "SGLANG_NEURON_GLM52_WEIGHT_STORE": CONFIG,
@@ -81,12 +99,14 @@ KNOBS: dict = {
     "SGLANG_NEURON_HICACHE_ASYNC_LOAD": CONFIG,
     "SGLANG_NEURON_HICACHE_STATS": DEBUG,
     "SGLANG_NEURON_HICACHE_VERIFY": DEBUG,
+    "SGLANG_NEURON_HICACHE_MAX_BATCH_OPS": CONFIG,
     # the HBM the recurrent-state radix checkpoint store leaves free (mem_cache/state_checkpoint_pool.RESERVE_ENV)
     "SGLANG_NEURON_STATE_CKPT_RESERVE_GB": CONFIG,
     # the in-flight bound (backend.device_io), which the giga-kernel decode's result lag takes as its lag
     "SGLANG_NEURON_MAX_INFLIGHT_LAUNCHES": CONFIG,
     # no Neuron device: the CPU tests run the torch paths
     "SGLANG_NEURON_CPU_MODE": DEBUG,
+    "SGLANG_NEURON_PRECOMPILE": CONFIG,
     # diagnostics and profiling
     "SGLANG_NEURON_DEBUG_MESH": DEBUG,
     # GLM-5.2's logit test: teacher forcing and raw logits (models/glm52/logit_probe)
@@ -104,7 +124,7 @@ KNOBS: dict = {
     "SGLANG_NEURON_PROFILE_DIR": DEBUG,
     "SGLANG_NEURON_PROFILE_RANKS": DEBUG,
     "SGLANG_NEURON_PROFILE_DEVICE_MODE": DEBUG,
-    **{f"SGLANG_NEURON_PROFILE_SERVE_{field}": DEBUG for field in ("RANKS", "START", "STEPS")},
+    **{f"SGLANG_NEURON_PROFILE_SERVE_{field}": DEBUG for field in ("RANKS", "START", "STEPS", "PHASE")},
     # the SGLang Diffusion platform (sglang_neuron/diffusion/envs.py; docs/model-recipes/flux1-dev.md)
     "SGLANG_NEURON_REQUIRE_NKI_KERNELS": DEBUG,
     "SGLANG_NEURON_DISABLE_NKI_KERNELS": DEBUG,

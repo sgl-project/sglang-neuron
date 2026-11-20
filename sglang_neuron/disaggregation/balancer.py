@@ -2,7 +2,10 @@
 """The PD load balancer: one endpoint in front of a disaggregated deployment's prefill and decode servers, the one
 users run and the one the disaggregated e2e tests put in front of their servers.
 
-Routing. Each request goes to the prefill DP replica with the fewest outstanding prefills (a prefill server dispatches
+Routing. A request with a session header (SESSION_HEADERS) goes to the prefill server of its session's first turn, so
+the session's turns share that server's prefix cache; a session's first turn goes to the server with the fewest request
+bytes still prefilling. Each request goes to the prefill DP replica with the fewest
+outstanding prefills (a prefill server dispatches
 to replica ``bootstrap_room % dp_size``, so the balancer picks the replica by choosing the room) and to the decode
 server with the fewest requests in flight. A client's ``routed_dp_rank`` names a decode DP rank over every decode
 server in order, which the determinism check uses to reach every rank.
@@ -48,6 +51,9 @@ import ipaddress
 import json
 import logging
 import random
+import time
+import zlib
+from collections import OrderedDict
 from dataclasses import dataclass, field
 from time import perf_counter, time_ns
 from typing import Dict, List, Optional, Tuple
@@ -67,6 +73,11 @@ except ImportError:  # SGLang depends on it, so the image has it
     orjson = None
 
 ROOM_LIMIT = 2**63
+# how long a prefill server that refused a connection gets no new turns, and the failures that mean it is unreachable
+DOWN_S = 60.0
+_UNREACHABLE = ("Cannot connect to host", "Connect call failed", "Server disconnected", "Connection reset by peer")
+# the sessions whose prefill server the balancer remembers (Backends.homes)
+_MAX_SESSIONS = 100_000
 SESSION_HEADERS = ("x-session-id", "x-correlation-id", "x-dynamo-session-id")
 # the pauses before a half's second and third connection attempts (_post)
 CONNECT_PAUSES_S = (0.05, 0.15)
@@ -89,12 +100,22 @@ else:
 @dataclass
 class Backends:
     prefill: List[str]
-    bootstrap_port: int
+    bootstrap_port: List[int]
     decode: List[str]
     timeout_s: float
     prefill_dp: List[int] = field(default_factory=list)
     decode_dp: List[int] = field(default_factory=list)
     outstanding: Dict[Tuple[int, int], int] = field(default_factory=dict)
+    # each session's prefill server (pick_prefill), least recently used first; and each server's request bytes still
+    # prefilling, the load a new session is placed by
+    homes: "OrderedDict[str, int]" = field(default_factory=OrderedDict)
+    # "load": a session's first turn goes to the least-loaded server; "hash": every turn to the server its session
+    # hashes to (--prefill-routing)
+    routing: str = "load"
+    pending_bytes: Dict[int, int] = field(default_factory=dict)
+    # prefill servers that refused a connection, until when (monotonic seconds): placement skips them, so a dead
+    # server's sessions move to the others instead of retrying into it (mark_down)
+    down: Dict[int, float] = field(default_factory=dict)
     in_flight: Dict[int, int] = field(default_factory=dict)
     retry: bool = True           # False under --no-retry
     retries: int = 0
@@ -117,19 +138,47 @@ class Backends:
                     sizes.append(max(1, len(_json(f"{url}/server_info", body, 503).get("internal_states") or [None])))
             self.prefill_dp, self.decode_dp = sizes[:len(self.prefill)], sizes[len(self.prefill):]
 
-    def pick_prefill(self) -> Tuple[int, int, Tuple[int, int]]:
-        """(prefill server, bootstrap room, target) for the least-loaded (server, replica) target."""
-        targets = [(p, r) for p, dp in enumerate(self.prefill_dp) for r in range(dp)]
+    def pick_prefill(self, session: Optional[str] = None, size: int = 0) -> Tuple[int, int, Tuple[int, int]]:
+        """(prefill server, bootstrap room, target) for the least-loaded (server, replica) target. A session's turns go
+        to the prefill server of its first turn, which holds the previous turns in its prefix cache; a session's first
+        turn (a cold prompt) goes to the server with the fewest request bytes still prefilling, so long cold prompts
+        spread over the servers instead of piling on the one a hash picks. ``size`` is the request's body bytes."""
+        now = time.monotonic()
+        servers = [p for p in range(len(self.prefill_dp)) if self.down.get(p, 0.0) <= now] or list(
+            range(len(self.prefill_dp)))
+        if session is not None and len(servers) > 1:
+            home = self.homes.get(session)
+            if home is not None and home not in servers:
+                home = None  # its server is down: place the session again
+            if home is None and self.routing == "hash":
+                home = servers[zlib.crc32(session.encode()) % len(servers)]
+            elif home is None:
+                home = min(servers, key=lambda p: (self.pending_bytes.get(p, 0), random.random()))
+                if len(self.homes) >= _MAX_SESSIONS:
+                    self.homes.popitem(last=False)
+            self.homes[session] = home
+            self.homes.move_to_end(session)
+            servers = [home]
+        targets = [(p, r) for p in servers for r in range(self.prefill_dp[p])]
         low = min(self.outstanding.get(t, 0) for t in targets)
         target = random.choice([t for t in targets if self.outstanding.get(t, 0) == low])
         self.outstanding[target] = self.outstanding.get(target, 0) + 1
         server, replica = target
+        self.pending_bytes[server] = self.pending_bytes.get(server, 0) + size
         dp = self.prefill_dp[server]
         room = random.randrange(0, ROOM_LIMIT - dp) // dp * dp + replica
         return server, room, target
 
-    def release(self, target: Tuple[int, int]) -> None:
+    def mark_down(self, server: int) -> None:
+        """Keep new turns off prefill ``server`` for DOWN_S seconds (it refused a connection)."""
+        if self.down.get(server, 0.0) <= time.monotonic():
+            log.warning("prefill server %s refused a connection: placing its sessions elsewhere for %.0f s",
+                        self.prefill[server], DOWN_S)
+        self.down[server] = time.monotonic() + DOWN_S
+
+    def release(self, target: Tuple[int, int], size: int = 0) -> None:
         self.outstanding[target] = max(0, self.outstanding.get(target, 0) - 1)
+        self.pending_bytes[target[0]] = max(0, self.pending_bytes.get(target[0], 0) - size)
 
     def pick_decode(self, routed_dp_rank) -> Tuple[int, Optional[int]]:
         """(decode server, its DP rank or None) for a request: the server and rank a global ``routed_dp_rank`` names,
@@ -160,7 +209,8 @@ class Backends:
         prefill_rank = room % self.prefill_dp[server]
         host = urlparse(self.prefill[server]).hostname
         common = dict(request, bootstrap_host=f"[{host}]" if ":" in host else host,
-                      bootstrap_port=self.bootstrap_port, bootstrap_room=room, disagg_prefill_dp_rank=prefill_rank)
+                      bootstrap_port=self.bootstrap_port[server], bootstrap_room=room,
+                      disagg_prefill_dp_rank=prefill_rank)
         prefill_half = dict(common, routed_dp_rank=prefill_rank)
         decode_half = dict(common)
         decode_half.pop("routed_dp_rank", None)
@@ -228,6 +278,8 @@ class _Request:
         self.body, self.endpoint, self.streamed = body, endpoint, bool(body.get("stream"))
         self.auth = _authorization(headers)
         self.headers = {"Content-Type": "application/json", **session, **self.auth}
+        self.session = next(iter(session.values()), None)
+        self.size = len(raw)
         self.retried = False
         self.origin = origin
 
@@ -239,6 +291,8 @@ class _Request:
         """Drop ``attempt``, which ``failure``d before the client got a byte, and run the request again."""
         self.retried = True
         backends.retries += 1
+        if failure.source == "prefill" and any(m in failure.error for m in _UNREACHABLE):
+            backends.mark_down(attempt.server)
         log.warning("%s failed before the client got a byte (%s: %s); running it again", self.endpoint,
                     failure.source, failure.error[:300])
         await attempt.end("retried", failure)
@@ -255,7 +309,7 @@ class _Attempt:
         self.decode, self.decode_rank = backends.pick_decode(request.body.get("routed_dp_rank"))
         self.released = self.finished = self.ended = False
         try:
-            self.server, self.room, self.target = backends.pick_prefill()
+            self.server, self.room, self.target = backends.pick_prefill(request.session, request.size)
         except BaseException:
             self.finish()
             raise
@@ -280,7 +334,7 @@ class _Attempt:
         """Stop counting against the prefill target: its prefill is done, or the attempt is over."""
         if not self.released:
             self.released = True
-            backends.release(self.target)
+            backends.release(self.target, self.request.size)
 
     def finish(self) -> None:
         if not self.finished:
@@ -812,20 +866,30 @@ def main(argv=None) -> None:
         "sends each request to a prefill server and a decode server at once."))
     parser.add_argument("--prefill", action="append", required=True, type=_server_url,
                         help="prefill server URL (repeatable)")
-    parser.add_argument("--bootstrap-port", type=int, default=8998,
-                        help="the prefill servers' bootstrap port (default: %(default)s)")
+    parser.add_argument("--bootstrap-port", type=int, action="append",
+                        help="the prefill servers' bootstrap port (default: 8998); repeat it once per --prefill, in "
+                             "order, for prefill servers on different ports")
     parser.add_argument("--decode", action="append", required=True, type=_server_url,
                         help="decode server URL (repeatable)")
     parser.add_argument("--host", default="127.0.0.1",
                         help="the address to listen on (default: %(default)s, this host only; give an address for "
                              "clients on other hosts)")
     parser.add_argument("--port", type=int, default=8000, help="the port to listen on (default: %(default)s)")
+    parser.add_argument("--prefill-routing", choices=("load", "hash"), default="load",
+                        help="where a session's first turn prefills: the server with the fewest request bytes "
+                             "prefilling (load), or the one its session id hashes to (hash); its later turns follow "
+                             "it either way (default: %(default)s)")
     parser.add_argument("--timeout-s", type=float, default=3600.0,
                         help="the time limit of each half of a request, in seconds (default: %(default)s)")
     parser.add_argument("--trace-file", help="append one JSON line for each run of each request here (Trace)")
     parser.add_argument("--no-retry", action="store_true",
                         help="run each request once, so a server failure reaches the client (the e2e tests' setting)")
     args = parser.parse_args(argv)
+    ports = args.bootstrap_port or [8998]
+    if len(ports) == 1:
+        ports = ports * len(args.prefill)
+    if len(ports) != len(args.prefill):
+        parser.error(f"give one --bootstrap-port, or one per --prefill ({len(args.prefill)}), not {len(ports)}")
     logging.basicConfig(level=logging.WARNING, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
     # the decode halves bootstrap from the --prefill URL's host (fork): a loopback one is the decode's own host
     loopback = [url for url in args.prefill if _is_loopback(urlparse(url).hostname)]
@@ -833,7 +897,8 @@ def main(argv=None) -> None:
         log.warning("--prefill %s is a loopback address, which the decode servers are told to bootstrap from: a decode "
                     "server on another host fails at its bootstrap timeout; give the prefill server's own address",
                     ", ".join(loopback))
-    backends = Backends(args.prefill, args.bootstrap_port, args.decode, args.timeout_s, retry=not args.no_retry)
+    backends = Backends(args.prefill, ports, args.decode, args.timeout_s, retry=not args.no_retry,
+                        routing=args.prefill_routing)
     trace = Trace(args.trace_file) if args.trace_file else None
     uvicorn.run(app, host=args.host, port=args.port, log_level="warning")
 

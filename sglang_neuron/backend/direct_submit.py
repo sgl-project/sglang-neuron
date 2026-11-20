@@ -556,10 +556,21 @@ class DirectSubmit:
 
 
 def shape_key(kwargs: dict) -> tuple:
-    """A call's shape key: the shape of each top-level tensor argument, in argument order."""
+    """A call's shape key: the shape of each tensor argument, in argument order, nested containers (dicts in key order,
+    lists and tuples) included. A family whose top-level tensors share one shape across its warmed shapes (Hy3's MTP step
+    sizes them at its slot width) tells its shapes apart by the tensors of its metadata (the batch's block tables)."""
     import torch
 
-    return tuple(tuple(v.shape) if isinstance(v, torch.Tensor) else None for v in kwargs.values())
+    def key(v):
+        if isinstance(v, torch.Tensor):
+            return tuple(v.shape)
+        if isinstance(v, dict):
+            return tuple((k, key(x)) for k, x in v.items())
+        if isinstance(v, (list, tuple)):
+            return tuple(key(x) for x in v)
+        return None
+
+    return tuple(key(v) for v in kwargs.values())
 
 
 class ShapeKeyedSubmit:
