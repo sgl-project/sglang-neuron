@@ -51,6 +51,7 @@ import ipaddress
 import json
 import logging
 import random
+import time
 import zlib
 from collections import OrderedDict
 from dataclasses import dataclass, field
@@ -72,6 +73,9 @@ except ImportError:  # SGLang depends on it, so the image has it
     orjson = None
 
 ROOM_LIMIT = 2**63
+# how long a prefill server that refused a connection gets no new turns, and the failures that mean it is unreachable
+DOWN_S = 60.0
+_UNREACHABLE = ("Cannot connect to host", "Connect call failed", "Server disconnected", "Connection reset by peer")
 # the sessions whose prefill server the balancer remembers (Backends.homes)
 _MAX_SESSIONS = 100_000
 SESSION_HEADERS = ("x-session-id", "x-correlation-id", "x-dynamo-session-id")
@@ -109,6 +113,9 @@ class Backends:
     # hashes to (--prefill-routing)
     routing: str = "load"
     pending_bytes: Dict[int, int] = field(default_factory=dict)
+    # prefill servers that refused a connection, until when (monotonic seconds): placement skips them, so a dead
+    # server's sessions move to the others instead of retrying into it (mark_down)
+    down: Dict[int, float] = field(default_factory=dict)
     in_flight: Dict[int, int] = field(default_factory=dict)
     retry: bool = True           # False under --no-retry
     retries: int = 0
@@ -136,11 +143,15 @@ class Backends:
         to the prefill server of its first turn, which holds the previous turns in its prefix cache; a session's first
         turn (a cold prompt) goes to the server with the fewest request bytes still prefilling, so long cold prompts
         spread over the servers instead of piling on the one a hash picks. ``size`` is the request's body bytes."""
-        servers = range(len(self.prefill_dp))
-        if session is not None and len(self.prefill_dp) > 1:
+        now = time.monotonic()
+        servers = [p for p in range(len(self.prefill_dp)) if self.down.get(p, 0.0) <= now] or list(
+            range(len(self.prefill_dp)))
+        if session is not None and len(servers) > 1:
             home = self.homes.get(session)
+            if home is not None and home not in servers:
+                home = None  # its server is down: place the session again
             if home is None and self.routing == "hash":
-                home = zlib.crc32(session.encode()) % len(self.prefill_dp)
+                home = servers[zlib.crc32(session.encode()) % len(servers)]
             elif home is None:
                 home = min(servers, key=lambda p: (self.pending_bytes.get(p, 0), random.random()))
                 if len(self.homes) >= _MAX_SESSIONS:
@@ -157,6 +168,13 @@ class Backends:
         dp = self.prefill_dp[server]
         room = random.randrange(0, ROOM_LIMIT - dp) // dp * dp + replica
         return server, room, target
+
+    def mark_down(self, server: int) -> None:
+        """Keep new turns off prefill ``server`` for DOWN_S seconds (it refused a connection)."""
+        if self.down.get(server, 0.0) <= time.monotonic():
+            log.warning("prefill server %s refused a connection: placing its sessions elsewhere for %.0f s",
+                        self.prefill[server], DOWN_S)
+        self.down[server] = time.monotonic() + DOWN_S
 
     def release(self, target: Tuple[int, int], size: int = 0) -> None:
         self.outstanding[target] = max(0, self.outstanding.get(target, 0) - 1)
@@ -273,6 +291,8 @@ class _Request:
         """Drop ``attempt``, which ``failure``d before the client got a byte, and run the request again."""
         self.retried = True
         backends.retries += 1
+        if failure.source == "prefill" and any(m in failure.error for m in _UNREACHABLE):
+            backends.mark_down(attempt.server)
         log.warning("%s failed before the client got a byte (%s: %s); running it again", self.endpoint,
                     failure.source, failure.error[:300])
         await attempt.end("retried", failure)
