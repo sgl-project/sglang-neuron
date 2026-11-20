@@ -33,6 +33,26 @@ def aligned_context(context: int, size: int, block: int, tile: int) -> int:
     return -(-tokens // quantum) * quantum
 
 
+class MiMoTokenIO(torch.nn.Module):
+    """The platform's fixed-width decode token relay (model_executor/token_io.FixedDecodeTokenIO) without its graph ops:
+    the graph takes the previous decode's device tokens and ``token_control`` as they are and assembles its ids in its
+    embedding kernel (kernels/head.embed), and its sampler kernel writes the tokens at the width
+    (model.MiMoV2Graph._decode_kernels)."""
+
+    def __init__(self, model, width: int):
+        super().__init__()
+        self.model = model
+        self.width = width
+
+    def forward(self, input_ids, positions, token_control=None, token_ids_out=None, **kwargs):
+        if token_ids_out is not None:
+            raise ValueError("MiMo-V2 decodes without pipeline stages (no token slot to sample into)")
+        if not 0 < positions.shape[0] <= self.width:
+            raise ValueError("Decode metadata exceeds the token capacity")
+        return self.model(input_ids=input_ids, positions=positions, token_control=token_control,
+                          token_width=self.width, **kwargs)
+
+
 class MiMoV2Runtime(NeuronModelRuntime):
     _mtp_host = None
 
@@ -49,7 +69,13 @@ class MiMoV2Runtime(NeuronModelRuntime):
 
     def _init_decode_token_io(self) -> None:
         if not self.mtp_on:
-            return super()._init_decode_token_io()
+            super()._init_decode_token_io()
+            from sglang_neuron.model_executor.token_io import FixedDecodeTokenIO
+
+            if isinstance(self.execution_model, FixedDecodeTokenIO):
+                # the graph assembles its ids from the relay and leaves its tokens at the width in its own kernels
+                self.execution_model = MiMoTokenIO(self.execution_model.model, self.decode_token_width)
+            return
         on = self.async_execution and not self.host_input_ids
         self.decode_token_width = int(self.buckets.num_seqs_buckets[-1]) if on else 0
         self.decode_token_assemble = False

@@ -173,8 +173,8 @@ def step_inputs(carry, length, ctrl, row_slots, full_table, swa_table, swa_offse
     """carry [N, S] int32; length [N] int32; ctrl [W, 4] int32; row_slots [W] int32; full_table [W, Bf] /
     swa_table [W, Bs] int32 (-1 past a row's pages); swa_offset [W] int32; the inverse frequencies [1, F] fp32. Returns
     int32 [R, 1] each of (tokens, positions, full slots, sliding slots, valid, fresh, live, base), fp32 [R, 1] each of
-    (full pos, sliding pos, sliding start), bf16 [half, R] (full cos, full sin, sliding cos, sliding sin), then a uint8 [S, W x heads, S] active mask for each
-    of ``mask_heads``."""
+    (full pos, sliding pos, sliding start), bf16 [half, R] (full cos, full sin, sliding cos, sliding sin), then a
+    uint8 [S, W x heads, S] active mask for each of ``mask_heads``."""
     N, S = carry.shape
     W = ctrl.shape[0]
     R = W * S
@@ -270,3 +270,82 @@ def step_inputs(carry, length, ctrl, row_slots, full_table, swa_table, swa_offse
             out_i(swa_slot, "swa_slots"), out_i(valid, "valid"), out_i(fresh, "fresh"), out_i(live, "live"),
             out_i(base, "base"), out_f(base, "full_pos"), out_f(send, "swa_pos"), out_f(sstart, "swa_start"),
             fc, fs, sc, ss, *(_active_mask(S, W * h, str(h)) for h in mask_heads))
+
+
+def _gated_mask(owner, B: int, h: int, name: str):
+    """[1, B x h, 1] uint8: row b's heads 1 where this rank keeps its new token (``owner`` [B], the runtime's
+    dcp_active_owner), 0 elsewhere (a one-token span's active part under DCP)."""
+    o_i = nl.ndarray((1, B), dtype=nl.int32, buffer=nl.sbuf)
+    nisa.dma_copy(dst=o_i[0:1, 0:B], src=owner.reshape((1, B)))
+    o_f = nl.ndarray((1, B), dtype=nl.float32, buffer=nl.sbuf)
+    nisa.tensor_copy(dst=o_f[0:1, 0:B], src=o_i[0:1, 0:B])
+    nisa.tensor_scalar(dst=o_f[0:1, 0:B], data=o_f[0:1, 0:B], op0=nl.greater, operand0=0.0)
+    m_f = nl.ndarray((1, B * h), dtype=nl.float32, buffer=nl.sbuf)
+    for j in range(h):
+        nisa.tensor_copy(dst=m_f[0:1, j:B * h:h], src=o_f[0:1, 0:B])
+    m_u = nl.ndarray((1, B * h), dtype=nl.uint8, buffer=nl.sbuf)
+    nisa.tensor_copy(dst=m_u[0:1, 0:B * h], src=m_f[0:1, 0:B * h])
+    out = nl.ndarray((1, B * h, 1), dtype=nl.uint8, buffer=nl.shared_hbm, name=f"decode_mask_{name}")
+    nisa.dma_copy(dst=out.reshape((1, B * h)), src=m_u[0:1, 0:B * h])
+    return out
+
+
+@nki.jit
+def decode_inputs(positions, full_slots, swa_slots, swa_offset, full_inv_freq, swa_inv_freq, window=128, half=128,
+                  mask_heads=(), dcp_full_end=None, dcp_swa_end=None, dcp_swa_start=None, dcp_owner=None):
+    """A decode step's inputs without MTP in one kernel (model.MiMoV2Graph._decode_kernels): one token a row, its
+    position and both kinds' slots from the runtime. positions / full_slots / swa_slots / swa_offset [B] (int32, or the
+    runtime's int64, which the compiler holds as int32); the inverse frequencies [1, F] fp32. Returns int32 [B, 1]
+    (full slots, sliding slots), fp32 [B, 1] (full pos, sliding pos, sliding start), bf16 [half, B] (full cos, full
+    sin, sliding cos, sliding sin) and a [1, B x heads, 1] uint8 active mask for each of ``mask_heads``:
+
+        full pos      = position                                       the prior the token reads
+        sliding pos   = max(position - offset, 0);  start = min(max(position - offset - window + 1, 0), sliding pos)
+
+    Under DCP (``dcp_owner`` given) the bounds are this rank's share's, the runtime's dcp_kv_end of each kind and the
+    sliding kind's dcp_kv_start, and each active mask (``mask_heads`` then the group's gathered heads) is gated by the
+    row's owner."""
+    B = positions.shape[0]
+    R = B
+    pos_i = nl.ndarray((P, 1), dtype=nl.int32, buffer=nl.sbuf)
+    nisa.dma_copy(dst=pos_i[0:R, 0:1], src=positions.reshape((B, 1)))
+    pos = _f(pos_i, R)
+    off_i = nl.ndarray((P, 1), dtype=nl.int32, buffer=nl.sbuf)
+    nisa.dma_copy(dst=off_i[0:R, 0:1], src=swa_offset.reshape((B, 1)))
+    off = _f(off_i, R)
+    frame = nl.ndarray((P, 1), dtype=nl.float32, buffer=nl.sbuf)
+    nisa.tensor_tensor(dst=frame[0:R, 0:1], data1=pos[0:R, 0:1], data2=off[0:R, 0:1], op=nl.subtract)
+    send = nl.ndarray((P, 1), dtype=nl.float32, buffer=nl.sbuf)
+    nisa.tensor_scalar(dst=send[0:R, 0:1], data=frame[0:R, 0:1], op0=nl.maximum, operand0=0.0)
+    sstart = nl.ndarray((P, 1), dtype=nl.float32, buffer=nl.sbuf)
+    nisa.tensor_scalar(dst=sstart[0:R, 0:1], data=frame[0:R, 0:1], op0=nl.add, operand0=float(1 - window),
+                       op1=nl.maximum, operand1=0.0)
+    nisa.tensor_tensor(dst=sstart[0:R, 0:1], data1=sstart[0:R, 0:1], data2=send[0:R, 0:1], op=nl.minimum)
+    full_end = pos
+    if dcp_owner is not None:
+        def load_f(src):
+            t = nl.ndarray((P, 1), dtype=nl.int32, buffer=nl.sbuf)
+            nisa.dma_copy(dst=t[0:R, 0:1], src=src.reshape((B, 1)))
+            return _f(t, R)
+
+        full_end, send, sstart = load_f(dcp_full_end), load_f(dcp_swa_end), load_f(dcp_swa_start)
+
+    def out_i(src, name):
+        t = nl.ndarray((P, 1), dtype=nl.int32, buffer=nl.sbuf)
+        nisa.dma_copy(dst=t[0:R, 0:1], src=src.reshape((B, 1)))
+        o = nl.ndarray((R, 1), dtype=nl.int32, buffer=nl.shared_hbm, name=f"decode_{name}")
+        nisa.dma_copy(dst=o, src=t[0:R, 0:1])
+        return o
+
+    def out_f(t, name):
+        o = nl.ndarray((R, 1), dtype=nl.float32, buffer=nl.shared_hbm, name=f"decode_{name}")
+        nisa.dma_copy(dst=o, src=t[0:R, 0:1])
+        return o
+
+    fc, fs = _rope(pos, full_inv_freq, R, half, "dfull")
+    sc, ss = _rope(pos, swa_inv_freq, R, half, "dswa")
+    masks = []
+    for h in mask_heads:  # NKI's tracer takes no comprehension over kernel calls with side effects
+        masks.append(_active_mask(1, B * h, f"d{h}") if dcp_owner is None else _gated_mask(dcp_owner, B, h, f"g{h}"))
+    return (out_i(full_slots, "full_slots"), out_i(swa_slots, "swa_slots"), out_f(full_end, "full_pos"),
+            out_f(send, "swa_pos"), out_f(sstart, "swa_start"), fc, fs, sc, ss, *masks)

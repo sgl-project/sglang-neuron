@@ -80,15 +80,73 @@ def _residual(x2d, add2d, B: int, H: int, name: str):
 
 
 @nki.jit
+def _dp_moe(X, h, R: int, H: int, HH: int, pid, n_prg: int, dp: int, dp_rank, world_mesh, moe_gamma, router_wT,
+            expert_bias, ebase, gate_up_w, down_w, gate_up_scale, down_scale, eps, route_scale, top_k, fp8_act, pre):
+    """moe_layer's MoE half under DP attention (its docstring): returns this group's rows of the all-reduced experts'
+    output, [128, H] in SBUF, rows 0 .. R - 1."""
+    cells = []
+    for cell in world_mesh:  # NKI's tracer takes no list comprehension
+        cells.append(list(cell))
+    wrg = nccl.ReplicaGroup(cells)
+    world = len(cells[0])
+    tp = world // dp
+    RA = dp * R
+    # this group's rows to every rank: each program its half of H, then the gather over the world
+    mine = nl.ndarray((R, H), dtype=X.dtype, buffer=nl.shared_hbm, name="dp_moe_mine")
+    nisa.dma_copy(dst=mine.ap(pattern=[[H, R], [1, HH]], offset=pid * HH), src=h[0:R, pid * HH:(pid + 1) * HH])
+    if n_prg > 1:
+        nisa.core_barrier(data=mine, cores=(0, 1))
+    every = nl.ndarray((world * R, H), dtype=X.dtype, buffer=nl.shared_hbm, name="dp_moe_every")
+    nccl.all_gather(srcs=[mine], dsts=[every], replica_group=wrg, collective_dim=0)
+    if n_prg > 1:
+        nisa.core_barrier(data=every, cores=(0, 1))
+    # each group's first rank's rows, group g at rows g x R
+    h_all = nl.ndarray((P, H), dtype=X.dtype, buffer=nl.sbuf)
+    for g in range(dp):
+        nisa.dma_copy(dst=h_all[g * R:(g + 1) * R, 0:H], src=every[g * tp * R:g * tp * R + R, 0:H])
+    part = moe_half(every[0:RA, 0:H], moe_gamma, router_wT, expert_bias, ebase, gate_up_w, down_w, gate_up_scale,
+                    down_scale, eps=eps, route_scale=route_scale, top_k=top_k, hidden_sb=h_all, out_in_sbuf=True,
+                    fp8_act=fp8_act, pre=pre)
+    # the experts' partial over the world, through shared HBM between core barriers, then this group's rows
+    p_hbm = nl.ndarray((RA, H), dtype=X.dtype, buffer=nl.shared_hbm, name="dp_moe_part")
+    nisa.dma_copy(dst=p_hbm.ap(pattern=[[H, RA], [1, HH]], offset=pid * HH), src=part[0:RA, 0:HH])
+    if n_prg > 1:
+        nisa.core_barrier(data=p_hbm, cores=(0, 1))
+    red = nl.ndarray((RA, H), dtype=X.dtype, buffer=nl.shared_hbm, name="dp_moe_reduced")
+    nccl.all_reduce(dsts=[red], srcs=[p_hbm], op=nl.add, replica_group=wrg)
+    if n_prg > 1:
+        nisa.core_barrier(data=red, cores=(0, 1))
+    g_i = nl.ndarray((P, 1), dtype=dp_rank.dtype, buffer=nl.sbuf)
+    nisa.dma_copy(dst=g_i[0:R, 0:1], src=dp_rank.reshape((1, 1)).ap(pattern=[[0, R], [1, 1]], offset=0))
+    idx_f = nl.ndarray((P, 1), dtype=nl.float32, buffer=nl.sbuf)
+    nisa.tensor_copy(dst=idx_f[0:R, 0:1], src=g_i[0:R, 0:1])
+    nisa.tensor_scalar(dst=idx_f[0:R, 0:1], data=idx_f[0:R, 0:1], op0=nl.multiply, operand0=float(R))
+    row = nl.ndarray((P, 1), dtype=nl.float32, buffer=nl.sbuf)
+    nisa.iota(row[0:R, 0:1], pattern=[[0, 1]], offset=0, channel_multiplier=1)
+    nisa.tensor_tensor(dst=idx_f[0:R, 0:1], data1=idx_f[0:R, 0:1], data2=row[0:R, 0:1], op=nl.add)
+    idx = nl.ndarray((P, 1), dtype=nl.int32, buffer=nl.sbuf)
+    nisa.tensor_copy(dst=idx[0:R, 0:1], src=idx_f[0:R, 0:1])
+    own = nl.ndarray((P, H), dtype=X.dtype, buffer=nl.sbuf)
+    nisa.dma_copy(dst=own[0:R, 0:H], src=red.ap(pattern=[[H, R], [1, H]], offset=0, vector_offset=idx[0:R, 0:1],
+                                                 indirect_dim=0))
+    return own
+
+
 def moe_layer(X, attn_gamma, W_qkv, cos, sin, active_blocks_table, K_cache, V_cache, attention_mask, sink, slots,
               W_o, moe_gamma, router_wT, expert_bias, ebase, gate_up_w, down_w, gate_up_scale, down_scale, mesh,
               k_scale=None, v_scale=None, eps=1e-6, softmax_scale=1.0, v_head_dim=128, route_scale=1.0, top_k=8,
-              fp8_act=True, prefetch=6, pos=None, rank=None, kvdp=1, kvdp_mesh=None, start=None):
+              fp8_act=True, prefetch=6, pos=None, rank=None, kvdp=1, kvdp_mesh=None, start=None, dcp=1,
+              dcp_mesh=None, dcp_mode=None, dp=1, dp_rank=None, world_mesh=None):
     """X [B, S, H] bf16, the layer's input (S tokens a row, a NEURON_MTP span or 1); the attention half's inputs as
     attn_half's (``k_scale`` / ``v_scale`` over an FP8 cache), the MoE half's as moe_half's. Returns the layer's
     output [B x S, H] bf16. The caches are written in place and not returned: returned beside the output, the
     caller's graph got another tensor than the output in the output's place (measured by tools/mimo_v2/check_layer.py),
-    while the in-place write lands without the return."""
+    while the in-place write lands without the return.
+
+    ``dp`` > 1 (DP attention on a PD decode: moe.MiMoV2MoE's cross-DP experts) runs the MoE half over every DP
+    group's rows: this group's residual stream all-gathered over ``world_mesh`` (the DP columns form no collective group
+    on a Trn2 64-rank layout), each group's first rank's rows kept, the experts' partial all-reduced over the world and
+    this group's rows (``dp_rank`` [1] int32 its DP group's index) taken back. dp x B x S must fit 128 rows."""
     B, S, H = X.shape
     R = B * S
     n_prg = nl.num_programs(axes=0)
@@ -108,14 +166,19 @@ def moe_layer(X, attn_gamma, W_qkv, cos, sin, active_blocks_table, K_cache, V_ca
     attn, _, _ = attn_half(X, attn_gamma, W_qkv, cos, sin, active_blocks_table, K_cache, V_cache,
                            attention_mask, sink, slots, W_o, k_scale, v_scale, rmsnorm_X_eps=eps,
                            softmax_scale=softmax_scale, v_head_dim=v_head_dim, out_in_sbuf=True, pos=pos, rank=rank,
-                           kvdp=kvdp, kvdp_mesh=kvdp_mesh, start=start)
+                           kvdp=kvdp, kvdp_mesh=kvdp_mesh, start=start, dcp=dcp, dcp_mesh=dcp_mesh,
+                           dcp_mode=dcp_mode)
     attn = _sb_all_reduce(attn, R, H, rg, pid, n_prg, 3)
     h = nl.ndarray((P, H), dtype=X.dtype, buffer=nl.sbuf)
     nisa.tensor_tensor(dst=h[0:R, 0:H], data1=x_sb[0:R, 0:H], data2=attn[0:R, 0:H], op=nl.add)
-    moe = moe_half(X.reshape((R, H)), moe_gamma, router_wT, expert_bias, ebase, gate_up_w, down_w, gate_up_scale,
-                   down_scale, eps=eps, route_scale=route_scale, top_k=top_k, hidden_sb=h, out_in_sbuf=True,
-                   fp8_act=fp8_act, pre=pre)
-    moe = _sb_all_reduce(moe, R, H, rg, pid, n_prg, 3)
+    if dp > 1:
+        moe = _dp_moe(X, h, R, H, HH, pid, n_prg, dp, dp_rank, world_mesh, moe_gamma, router_wT, expert_bias, ebase,
+                      gate_up_w, down_w, gate_up_scale, down_scale, eps, route_scale, top_k, fp8_act, pre)
+    else:
+        moe = moe_half(X.reshape((R, H)), moe_gamma, router_wT, expert_bias, ebase, gate_up_w, down_w,
+                       gate_up_scale, down_scale, eps=eps, route_scale=route_scale, top_k=top_k, hidden_sb=h,
+                       out_in_sbuf=True, fp8_act=fp8_act, pre=pre)
+        moe = _sb_all_reduce(moe, R, H, rg, pid, n_prg, 3)
     o_sb = nl.ndarray((P, H), dtype=X.dtype, buffer=nl.sbuf)
     nisa.tensor_tensor(dst=o_sb[0:R, 0:H], data1=h[0:R, 0:H], data2=moe[0:R, 0:H], op=nl.add)
     # each program stores its own half of H
@@ -127,7 +190,8 @@ def moe_layer(X, attn_gamma, W_qkv, cos, sin, active_blocks_table, K_cache, V_ca
 @nki.jit
 def dense_layer(X, attn_gamma, W_qkv, cos, sin, active_blocks_table, K_cache, V_cache, attention_mask, sink, slots,
                 W_o, mlp_gamma, W_gate, W_up, W_down, mesh, k_scale=None, v_scale=None, eps=1e-6, softmax_scale=1.0,
-                v_head_dim=128, pos=None, rank=None, kvdp=1, kvdp_mesh=None, start=None):
+                v_head_dim=128, pos=None, rank=None, kvdp=1, kvdp_mesh=None, start=None, dcp=1, dcp_mesh=None,
+                dcp_mode=None):
     """A dense layer's decode (layer 0): moe_layer with nkilib's mlp (RMSNorm, SiLU-gated gate / up, down) in place of
     the MoE half; W_gate / W_up [H, I] and W_down [I, H] this rank's shard of the intermediate dimension. Returns the
     layer's output [B x S, H] bf16; the caches are written in place."""
@@ -141,7 +205,8 @@ def dense_layer(X, attn_gamma, W_qkv, cos, sin, active_blocks_table, K_cache, V_
 
     attn, _, _ = attn_half(X, attn_gamma, W_qkv, cos, sin, active_blocks_table, K_cache, V_cache, attention_mask,
                            sink, slots, W_o, k_scale, v_scale, rmsnorm_X_eps=eps, softmax_scale=softmax_scale,
-                           v_head_dim=v_head_dim, pos=pos, rank=rank, kvdp=kvdp, kvdp_mesh=kvdp_mesh, start=start)
+                           v_head_dim=v_head_dim, pos=pos, rank=rank, kvdp=kvdp, kvdp_mesh=kvdp_mesh, start=start,
+                           dcp=dcp, dcp_mesh=dcp_mesh, dcp_mode=dcp_mode)
     attn = _all_reduce(attn, rg, n_prg, "dense_attn_reduced")
     h = _residual(X.reshape((R, H)), attn, R, H, "dense_attn_residual")
     outputs = mlp(hidden_tensor=h.reshape((R, 1, H)), gate_proj_weights_tensor=W_gate, up_proj_weights_tensor=W_up,

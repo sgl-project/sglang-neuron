@@ -480,7 +480,8 @@ def prefill_route(hn, router_wT, expert_bias, ep_rank, positions, top_k=8, route
 def _hbm_all_reduce(part, rg, n_prg: int, name: str):
     """The sum of ``part`` (shared HBM, both programs' halves written) over the group, into shared HBM: one collective,
     fenced by a core barrier before (both halves landed) and after (the sum landed before either program reads it), as
-    kernels/layer._all_reduce (unfenced in-kernel sums came back wrong on trn2)."""
+    kernels/layer._all_reduce (unfenced in-kernel sums came back wrong on trn2). The sum goes to a buffer of its own:
+    an all-reduce into the kernel's outputs hung the 4096- and 8192-token prefill graphs."""
     from nki import collectives as nccl
 
     if n_prg > 1:
@@ -970,3 +971,146 @@ def prefill_pack(k_cache, v_cache, table, cached, n_cols=1, window=0):
         nisa.tensor_copy(dst=out_i[0:1, 0:width], src=rel[0:1, 0:width])
         nisa.dma_copy(dst=t_out[0:1, 0:width], src=out_i[0:1, 0:width])
     return k_out, v_out, t_out
+
+
+@nki.jit
+def prefill_dcp_window(k_cache, v_cache, table, cached, k_chunk, v_chunk, mesh, dcp=8, kv_scale=1.0):
+    """A sliding layer's local KV for its chunk's prefill under DCP, in one kernel (attention._prefill_dcp's sliding
+    branch): the window's prior is the last page before the chunk, which the group's last rank holds; with the chunk's
+    own pages after it the layer attends locally (the segmented attention over this table).
+
+        col     = max(cached / (dcp x page) - 1, 0);  page_id = max(table[0, col], 0)     this rank's last prior page
+        prior   = all_gather(k_cache[page_id])[dcp - 1]                               the group's last rank's
+        K, V    = [prior | the chunk's pages] in bf16 (an FP8 cache's divided by its scale)
+        table'  = [min(j + (cached == 0), n - 1) for j < n];  prior_tokens = page where cached > 0, else 0
+
+    k_cache / v_cache [blocks, 1, page, d] (bf16 or FP8 at ``kv_scale``); table [1, width] int32; cached [1, 1] int32;
+    k_chunk / v_chunk [T, d] the chunk's K / V as the cache holds them (prefill_front's); ``mesh`` the DCP group.
+    Returns (K, V [1 + T / page, 1, page, d] bf16, table' [1, 1 + T / page] int32, prior_tokens [1, 1] int32). The
+    prior page's gather runs through shared HBM between core barriers."""
+    from nki import collectives as nccl
+
+    from sglang_neuron.models.mimo_v2.kernels.head import _replica_group
+
+    blocks, kvh, page, d = k_cache.shape
+    width = table.shape[1]
+    T = k_chunk.shape[0]
+    n = 1 + T // page
+    n_prg = nl.num_programs(axes=0)
+    pid = nl.program_id(axis=0)
+    rg = _replica_group(mesh)
+    shift = (dcp * page).bit_length() - 1  # dcp x page a power of two
+    fp8 = k_cache.dtype != nl.bfloat16
+    k_out = nl.ndarray((n, kvh, page, d), dtype=nl.bfloat16, buffer=nl.shared_hbm, name="prefill_dcpw_k")
+    v_out = nl.ndarray((n, kvh, page, d), dtype=nl.bfloat16, buffer=nl.shared_hbm, name="prefill_dcpw_v")
+    t_out = nl.ndarray((1, n), dtype=nl.int32, buffer=nl.shared_hbm, name="prefill_dcpw_table")
+    pt_out = nl.ndarray((1, 1), dtype=nl.int32, buffer=nl.shared_hbm, name="prefill_dcpw_prior")
+    mine = nl.ndarray((2, page, d), dtype=nl.bfloat16, buffer=nl.shared_hbm, name="prefill_dcpw_mine")
+    every = nl.ndarray((2 * dcp, page, d), dtype=nl.bfloat16, buffer=nl.shared_hbm, name="prefill_dcpw_every")
+
+    c_i = nl.ndarray((P, 1), dtype=cached.dtype, buffer=nl.sbuf)
+    nisa.dma_copy(dst=c_i[0:P, 0:1], src=cached.reshape((1, 1)).ap(pattern=[[0, P], [1, 1]], offset=0))
+    col = nl.ndarray((P, 1), dtype=nl.int32, buffer=nl.sbuf)
+    nisa.tensor_scalar(dst=col[0:P, 0:1], data=c_i[0:P, 0:1], op0=nl.right_shift, operand0=shift)
+    nisa.tensor_scalar(dst=col[0:P, 0:1], data=col[0:P, 0:1], op0=nl.add, operand0=-1)
+    nisa.tensor_scalar(dst=col[0:P, 0:1], data=col[0:P, 0:1], op0=nl.maximum, operand0=0, op1=nl.minimum,
+                       operand1=width - 1)
+    # the page id on every partition (each gathers the same column), then each token row of it: page_id x page + p
+    pg = nl.ndarray((P, 1), dtype=table.dtype, buffer=nl.sbuf)
+    nisa.dma_copy(dst=pg[0:P, 0:1], src=table.reshape((width, 1)).ap(pattern=[[1, P], [1, 1]], offset=0,
+                                                                      vector_offset=col[0:P, 0:1], indirect_dim=0))
+    nisa.tensor_scalar(dst=pg[0:P, 0:1], data=pg[0:P, 0:1], op0=nl.maximum, operand0=0)
+    pf = nl.ndarray((P, 1), dtype=nl.float32, buffer=nl.sbuf)
+    nisa.tensor_copy(dst=pf[0:P, 0:1], src=pg[0:P, 0:1])
+    nisa.tensor_scalar(dst=pf[0:P, 0:1], data=pf[0:P, 0:1], op0=nl.multiply, operand0=float(page))
+    pp = nl.ndarray((P, 1), dtype=nl.float32, buffer=nl.sbuf)
+    nisa.iota(pp[0:P, 0:1], pattern=[[0, 1]], offset=0, channel_multiplier=1)
+    nisa.tensor_tensor(dst=pf[0:P, 0:1], data1=pf[0:P, 0:1], data2=pp[0:P, 0:1], op=nl.add)
+    ridx = nl.ndarray((P, 1), dtype=nl.int32, buffer=nl.sbuf)
+    nisa.tensor_copy(dst=ridx[0:P, 0:1], src=pf[0:P, 0:1])
+    # this rank's prior page (K then V; page = 128 rows on the partitions), each program one of the two
+    for which, cache in ((0, k_cache), (1, v_cache)):
+        if n_prg > 1 and which != pid:
+            continue
+        rows = cache.reshape((blocks * kvh * page, d))
+        raw = nl.ndarray((P, d), dtype=cache.dtype, buffer=nl.sbuf)
+        nisa.dma_copy(dst=raw[0:page, 0:d], src=rows.ap(pattern=[[d, page], [1, d]], offset=0,
+                                                         vector_offset=ridx[0:page, 0:1], indirect_dim=0))
+        f = nl.ndarray((P, d), dtype=nl.float32, buffer=nl.sbuf)
+        nisa.tensor_copy(dst=f[0:page, 0:d], src=raw[0:page, 0:d])
+        if fp8:
+            nisa.tensor_scalar(dst=f[0:page, 0:d], data=f[0:page, 0:d], op0=nl.multiply, operand0=1.0 / kv_scale)
+        b = nl.ndarray((P, d), dtype=nl.bfloat16, buffer=nl.sbuf)
+        nisa.tensor_copy(dst=b[0:page, 0:d], src=f[0:page, 0:d])
+        nisa.dma_copy(dst=mine[which, 0:page, 0:d], src=b[0:page, 0:d])
+    if n_prg > 1:
+        nisa.core_barrier(data=mine, cores=(0, 1))
+    nccl.all_gather(srcs=[mine], dsts=[every], replica_group=rg, collective_dim=0)
+    if n_prg > 1:
+        nisa.core_barrier(data=every, cores=(0, 1))
+    # the last rank's K (rows 2 (dcp - 1)) and V (2 (dcp - 1) + 1), then the chunk's pages
+    for which, chunk, out in ((0, k_chunk, k_out), (1, v_chunk, v_out)):
+        if n_prg > 1 and which != pid:
+            continue
+        nisa.dma_copy(dst=out[0:1, 0, 0:page, 0:d], src=every[2 * (dcp - 1) + which:2 * (dcp - 1) + which + 1,
+                                                                0:page, 0:d])
+        for t0 in range(0, T, P):
+            ct = nl.ndarray((P, d), dtype=chunk.dtype, buffer=nl.sbuf)
+            nisa.dma_copy(dst=ct[0:P, 0:d], src=chunk[t0:t0 + P, 0:d])
+            cf = nl.ndarray((P, d), dtype=nl.float32, buffer=nl.sbuf)
+            nisa.tensor_copy(dst=cf[0:P, 0:d], src=ct[0:P, 0:d])
+            if fp8:
+                nisa.tensor_scalar(dst=cf[0:P, 0:d], data=cf[0:P, 0:d], op0=nl.multiply, operand0=1.0 / kv_scale)
+            cb = nl.ndarray((P, d), dtype=nl.bfloat16, buffer=nl.sbuf)
+            nisa.tensor_copy(dst=cb[0:P, 0:d], src=cf[0:P, 0:d])
+            p_idx = 1 + t0 // page
+            o0 = t0 % page
+            nisa.dma_copy(dst=out[p_idx:p_idx + 1, 0, o0:o0 + P, 0:d], src=cb[0:P, 0:d])
+    if n_prg == 1 or pid == 0:
+        # table' = min(j + first, n - 1), first = (cached == 0); prior_tokens = page x (cached > 0)
+        cf1 = nl.ndarray((1, 1), dtype=nl.float32, buffer=nl.sbuf)
+        nisa.tensor_copy(dst=cf1[0:1, 0:1], src=c_i[0:1, 0:1])
+        has = nl.ndarray((1, 1), dtype=nl.float32, buffer=nl.sbuf)
+        nisa.tensor_scalar(dst=has[0:1, 0:1], data=cf1[0:1, 0:1], op0=nl.greater, operand0=0.0)
+        first = nl.ndarray((1, 1), dtype=nl.float32, buffer=nl.sbuf)
+        nisa.tensor_scalar(dst=first[0:1, 0:1], data=has[0:1, 0:1], op0=nl.multiply, operand0=-1.0, op1=nl.add,
+                           operand1=1.0)
+        j = nl.ndarray((1, n), dtype=nl.float32, buffer=nl.sbuf)
+        nisa.iota(j[0:1, 0:n], pattern=[[1, n]], offset=0, channel_multiplier=0)
+        nisa.tensor_scalar(dst=j[0:1, 0:n], data=j[0:1, 0:n], op0=nl.add, operand0=first[0:1, 0:1], op1=nl.minimum,
+                           operand1=float(n - 1))
+        j_i = nl.ndarray((1, n), dtype=nl.int32, buffer=nl.sbuf)
+        nisa.tensor_copy(dst=j_i[0:1, 0:n], src=j[0:1, 0:n])
+        nisa.dma_copy(dst=t_out, src=j_i[0:1, 0:n])
+        nisa.tensor_scalar(dst=has[0:1, 0:1], data=has[0:1, 0:1], op0=nl.multiply, operand0=float(page))
+        h_i = nl.ndarray((1, 1), dtype=nl.int32, buffer=nl.sbuf)
+        nisa.tensor_copy(dst=h_i[0:1, 0:1], src=has[0:1, 0:1])
+        nisa.dma_copy(dst=pt_out, src=h_i[0:1, 0:1])
+    return k_out, v_out, t_out, pt_out
+
+
+@nki.jit
+def dcp_full_inputs(table, cached, dcp=8, kv_scale=1.0):
+    """A full layer's DCP prefill inputs (attention._prefill_dcp's full branch, kernels/attention_block.
+    prefill_kv_parallel's): the table with its missing columns (-1) at page 0, each rank's share of the prior
+    (cached / dcp) and the FP8 scale tile 1 / kv_scale. table [1, width] int32; cached [1, 1] int32 (dcp a power of
+    two). Returns (table' [1, width] int32, prior [1, 1] int32, scale [128, 1] fp32)."""
+    width = table.shape[1]
+    n_prg = nl.num_programs(axes=0)
+    pid = nl.program_id(axis=0)
+    t_out = nl.ndarray((1, width), dtype=nl.int32, buffer=nl.shared_hbm, name="dcp_full_table")
+    p_out = nl.ndarray((1, 1), dtype=nl.int32, buffer=nl.shared_hbm, name="dcp_full_prior")
+    s_out = nl.ndarray((P, 1), dtype=nl.float32, buffer=nl.shared_hbm, name="dcp_full_scale")
+    tb = nl.ndarray((1, width), dtype=table.dtype, buffer=nl.sbuf)
+    nisa.dma_copy(dst=tb[0:1, 0:width], src=table[0:1, 0:width])
+    nisa.tensor_scalar(dst=tb[0:1, 0:width], data=tb[0:1, 0:width], op0=nl.maximum, operand0=0)
+    c = nl.ndarray((1, 1), dtype=cached.dtype, buffer=nl.sbuf)
+    nisa.dma_copy(dst=c[0:1, 0:1], src=cached.reshape((1, 1)))
+    nisa.tensor_scalar(dst=c[0:1, 0:1], data=c[0:1, 0:1], op0=nl.right_shift, operand0=dcp.bit_length() - 1)
+    sc = nl.ndarray((P, 1), dtype=nl.float32, buffer=nl.sbuf)
+    nisa.memset(dst=sc[0:P, 0:1], value=1.0 / kv_scale)
+    if n_prg == 1 or pid == 0:
+        nisa.dma_copy(dst=t_out, src=tb[0:1, 0:width])
+        nisa.dma_copy(dst=p_out, src=c[0:1, 0:1])
+        nisa.dma_copy(dst=s_out, src=sc[0:P, 0:1])
+    return t_out, p_out, s_out

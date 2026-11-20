@@ -123,10 +123,37 @@ def _attention_kvdp(X, H, eps, gamma, W_qkv, cos, sin, table, K_cache, V_cache, 
     )
 
 
+def _attention_dcp(X, H, eps, gamma, W_qkv, cos, sin, table, K_cache, V_cache, active_mask, sink, softmax_scale,
+                   k_scale, v_scale, pos, start, dcp, dcp_mesh, dcp_mode):
+    """The attention over the DCP group's KV shards (attn_half's ``dcp``): masked by position over this rank's share of
+    the prior (``pos`` the runtime's dcp_kv_end, ``start`` its dcp_kv_start on a sliding layer), the span's active part
+    gated by the row's owner in ``active_mask``, the group's query heads gathered and the partial softmaxes merged
+    across it by the vendored kernel's CP path (kernels/cp: nkilib's takes heads of at most 128 channels)."""
+    from sglang_neuron.models.mimo_v2.kernels.cp.attention_block_tkg import attention_block_tkg as attention_tkg_cp
+
+    cells = []
+    for cell in dcp_mesh:  # NKI's tracer takes no list comprehension
+        cells.append(list(cell))
+    return attention_tkg_cp(
+        X=X, X_hidden_dim_actual=H, rmsnorm_X_enabled=True, rmsnorm_X_eps=eps, rmsnorm_X_gamma=gamma, W_qkv=W_qkv,
+        bias_qkv=None, quantization_type_qkv=QuantizationType.NONE, weight_dequant_scale_qkv=None,
+        input_dequant_scale_qkv=None, rmsnorm_QK_pre_rope_enabled=False, rmsnorm_QK_pre_rope_eps=0.0,
+        rmsnorm_QK_pre_rope_W_Q=None, rmsnorm_QK_pre_rope_W_K=None, cos=cos, sin=sin, rope_contiguous_layout=True,
+        rmsnorm_QK_post_rope_enabled=False, rmsnorm_QK_post_rope_eps=0.0, rmsnorm_QK_post_rope_W_Q=None,
+        rmsnorm_QK_post_rope_W_K=None, K_cache_transposed=False, active_blocks_table=table, K_cache=K_cache,
+        V_cache=V_cache, attention_mask=active_mask, sink=sink, update_cache=False, kv_cache_update_idx=None,
+        W_out=None, bias_out=None, quantization_type_out=QuantizationType.NONE, weight_dequant_scale_out=None,
+        input_dequant_scale_out=None, transposed_out=False, out_in_sb=False, softmax_scale=softmax_scale,
+        pos_ids=pos, swa_start_pos_ids=start, k_scale=k_scale, v_scale=v_scale, CP=dcp,
+        CP_replica_group=nccl.ReplicaGroup(cells), CP_collective_mode=dcp_mode,
+    )
+
+
 @nki.jit
 def attn_half(X, rmsnorm_X_gamma, W_qkv, cos, sin, active_blocks_table, K_cache, V_cache, attention_mask, sink,
               slots, W_o, k_scale=None, v_scale=None, rmsnorm_X_eps=1e-6, softmax_scale=1.0, v_head_dim=128,
-              out_in_sbuf=False, pos=None, rank=None, kvdp=1, kvdp_mesh=None, start=None):
+              out_in_sbuf=False, pos=None, rank=None, kvdp=1, kvdp_mesh=None, start=None, dcp=1, dcp_mesh=None,
+              dcp_mode=None):
     """X [B, S, H] bf16 (S tokens a row: 1, or a NEURON_MTP span, which attend each other causally under the span
     mask); W_qkv [H, (heads + 2) x d]; cos / sin [d / 2, B, S]; the caches [pages, 1, page, d]; the mask in the
     kernel's layout; sink [heads, 1] fp32 or None; slots [B x S, 1] int32 (row-major: token s of row b at b x S + s);
@@ -141,7 +168,11 @@ def attn_half(X, rmsnorm_X_gamma, W_qkv, cos, sin, active_blocks_table, K_cache,
     decode_posid_kvdp): each attends B / kvdp rows, masked by position (``pos`` [B, S] fp32, each token's prior length;
     ``attention_mask`` then the span's active part, [S, B / kvdp, heads x kvdp, S] uint8), and this rank's table rows
     and place in its group come from ``rank`` [1] int32, its attention-TP rank, inside the kernel. Every row's new K / V
-    come back, so every rank writes them all as before."""
+    come back, so every rank writes them all as before.
+
+    ``dcp`` > 1 attends over the DCP group's KV shards (_attention_dcp): ``pos`` / ``start`` this rank's share's bounds
+    and ``attention_mask`` the owner-gated active part; the new K / V come back for every row, and ``slots`` (0 where
+    another rank keeps the token) writes each on its owner."""
     B, S, H = X.shape
     R = B * S
     pages, _, page, d = K_cache.shape
@@ -151,7 +182,11 @@ def attn_half(X, rmsnorm_X_gamma, W_qkv, cos, sin, active_blocks_table, K_cache,
     HH = H // n_prg
     h0 = pid * HH
 
-    if kvdp > 1:
+    if dcp > 1:
+        heads_out, k_new, v_new = _attention_dcp(X, H, rmsnorm_X_eps, rmsnorm_X_gamma, W_qkv, cos, sin,
+                                                 active_blocks_table, K_cache, V_cache, attention_mask, sink,
+                                                 softmax_scale, k_scale, v_scale, pos, start, dcp, dcp_mesh, dcp_mode)
+    elif kvdp > 1:
         heads_out, k_new, v_new = _attention_kvdp(X, H, rmsnorm_X_eps, rmsnorm_X_gamma, W_qkv, cos, sin,
                                                   active_blocks_table, K_cache, V_cache, attention_mask, sink,
                                                   softmax_scale, k_scale, v_scale, pos, rank, kvdp, kvdp_mesh)

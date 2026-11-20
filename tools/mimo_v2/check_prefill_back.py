@@ -83,7 +83,8 @@ def main() -> int:
         import math
 
         ulp = lambda m: 2.0 ** (math.floor(math.log2(max(m, 1e-30))) - 7)  # noqa: E731
-        good = (dh <= 2 * ulp(h_ref.float().abs().max().item()) and dn <= 2 * ulp(hn_ref.float().abs().max().item())
+        # h within two bf16 ulps; hn within four (its scale reads the all-reduced row, one more rounding chain)
+        good = (dh <= 2 * ulp(h_ref.float().abs().max().item()) and dn <= 4 * ulp(hn_ref.float().abs().max().item())
                 and rel < 5e-3)
         ok &= good
         print(f"rank {rank}: scale {scale}: h max diff {dh:.3e} (rel L2 {rel:.2e}), hn max diff {dn:.3e}: "

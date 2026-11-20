@@ -44,10 +44,14 @@ def _start(rank, T: int, Vr: int):
 
 
 @nki.jit
-def embed(ids, weight, rank, mesh):
+def embed(ids, weight, rank, mesh, control=None, rows=0):
     """ids [T, 1] int32 (T <= 128); weight [Vr, H] bf16, this rank's vocabulary rows; rank [1] int32, this rank's
-    place in the group. Returns the embeddings [T, H] bf16."""
-    T = ids.shape[0]
+    place in the group. Returns the embeddings [T, H] bf16.
+
+    With ``control`` [2, W] int32 (the platform's fixed-width decode token relay, model_executor/token_io) ``ids`` is
+    the previous decode's device token vector [W] and the step's ``rows`` ids are assembled here: row r takes
+    ids[control[1, r]] where that is not negative, else the host's control[0, r] (FixedDecodeTokenIO._assembled)."""
+    T = ids.shape[0] if control is None else rows
     Vr, H = weight.shape
     n_prg = nl.num_programs(axes=0)
     pid = nl.program_id(axis=0)
@@ -55,10 +59,33 @@ def embed(ids, weight, rank, mesh):
     rg = _replica_group(mesh)
 
     # the local row of each id, or Vr (past the shard: skipped) for an id another rank holds
-    ids_i = nl.ndarray((P, 1), dtype=ids.dtype, buffer=nl.sbuf)
-    nisa.dma_copy(dst=ids_i[0:T, 0:1], src=ids.ap(pattern=[[1, T], [1, 1]], offset=0))
     ids_f = nl.ndarray((P, 1), dtype=nl.float32, buffer=nl.sbuf)
-    nisa.tensor_copy(dst=ids_f[0:T, 0:1], src=ids_i[0:T, 0:1])
+    if control is None:
+        ids_i = nl.ndarray((P, 1), dtype=ids.dtype, buffer=nl.sbuf)
+        nisa.dma_copy(dst=ids_i[0:T, 0:1], src=ids.ap(pattern=[[1, T], [1, 1]], offset=0))
+        nisa.tensor_copy(dst=ids_f[0:T, 0:1], src=ids_i[0:T, 0:1])
+    else:
+        W = control.shape[1]
+        host_i = nl.ndarray((P, 1), dtype=control.dtype, buffer=nl.sbuf)
+        nisa.dma_copy(dst=host_i[0:T, 0:1], src=control.ap(pattern=[[1, T], [1, 1]], offset=0))
+        src_i = nl.ndarray((P, 1), dtype=control.dtype, buffer=nl.sbuf)
+        nisa.dma_copy(dst=src_i[0:T, 0:1], src=control.ap(pattern=[[1, T], [1, 1]], offset=W))
+        src_c = nl.ndarray((P, 1), dtype=nl.int32, buffer=nl.sbuf)
+        nisa.tensor_scalar(dst=src_c[0:T, 0:1], data=src_i[0:T, 0:1], op0=nl.maximum, operand0=0)
+        dev_i = nl.ndarray((P, 1), dtype=ids.dtype, buffer=nl.sbuf)
+        nisa.dma_copy(dst=dev_i[0:T, 0:1], src=ids.reshape((W, 1)).ap(pattern=[[1, T], [1, 1]], offset=0,
+                                                                       vector_offset=src_c[0:T, 0:1], indirect_dim=0))
+        # ids = host + (src >= 0) x (device - host), exact in fp32 (ids below 2**24)
+        hf = nl.ndarray((P, 1), dtype=nl.float32, buffer=nl.sbuf)
+        nisa.tensor_copy(dst=hf[0:T, 0:1], src=host_i[0:T, 0:1])
+        df = nl.ndarray((P, 1), dtype=nl.float32, buffer=nl.sbuf)
+        nisa.tensor_copy(dst=df[0:T, 0:1], src=dev_i[0:T, 0:1])
+        sf = nl.ndarray((P, 1), dtype=nl.float32, buffer=nl.sbuf)
+        nisa.tensor_copy(dst=sf[0:T, 0:1], src=src_i[0:T, 0:1])
+        nisa.tensor_scalar(dst=sf[0:T, 0:1], data=sf[0:T, 0:1], op0=nl.greater_equal, operand0=0.0)
+        nisa.tensor_tensor(dst=df[0:T, 0:1], data1=df[0:T, 0:1], data2=hf[0:T, 0:1], op=nl.subtract)
+        nisa.tensor_tensor(dst=df[0:T, 0:1], data1=df[0:T, 0:1], data2=sf[0:T, 0:1], op=nl.multiply)
+        nisa.tensor_tensor(dst=ids_f[0:T, 0:1], data1=hf[0:T, 0:1], data2=df[0:T, 0:1], op=nl.add)
     st = _start(rank, T, Vr)
     local = nl.ndarray((P, 1), dtype=nl.float32, buffer=nl.sbuf)
     nisa.tensor_tensor(dst=local[0:T, 0:1], data1=ids_f[0:T, 0:1], data2=st[0:T, 0:1], op=nl.subtract)

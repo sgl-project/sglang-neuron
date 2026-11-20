@@ -84,13 +84,19 @@ def _top(work, n: int, k: int, T: int, vals, idx):
 
 
 @nki.jit
-def sample(x, norm_w, lm_wT, rank, mesh, temperatures, seeds, filters, positions, eps=1e-6, span=1, rows=None):
+def sample(x, norm_w, lm_wT, rank, mesh, temperatures, seeds, filters, positions, eps=1e-6, span=1, rows=None,
+           top_logprobs=0, original_logprob=False, out_width=0):
     """x [T, H] bf16 (T <= 128) the states before the final norm; norm_w [1, H] bf16; lm_wT [H, Vr] bf16 this rank's
     LM head columns; rank [1] int32; per request (T / ``span`` of them, a request's ``span`` rows consecutive):
     temperatures [T / span, 1] fp32, seeds [T / span, 1] int32 (sampling.fold_seeds), filters [T / span, 3] fp32
     (top_k, top_p, min_p normalized; min_p unused); per row positions [T, 1] int32 (the row's input position).
     With ``rows`` [T, 1] int32 the rows are x's and positions' rows at them (a prefill chunk's sampled rows), gathered
-    in the kernel. Returns each row's sampled token [T, 1] int32."""
+    in the kernel. Returns (each row's sampled token [T, 1] int32, its logprob [T, 1] fp32, and with ``top_logprobs``
+    K > 0 the K best candidates' logprobs [T, K] fp32 and ids [T, K] int32), the logprobs as
+    sampling.sample_filtered_sharded_logits reports them: logit x scale - logsumexp(logits x scale) over the whole
+    vocabulary, scale 1 / temperature (1 for a greedy row, or with ``original_logprob``:
+    SGLANG_RETURN_ORIGINAL_LOGPROB). With ``out_width`` W > T the tokens come out [W, 1], 0 past row T - 1 (the
+    platform's fixed-width decode token relay, model_executor/token_io)."""
     H = x.shape[1]
     T = x.shape[0] if rows is None else rows.shape[0]
     Vr = lm_wT.shape[1]
@@ -143,6 +149,10 @@ def sample(x, norm_w, lm_wT, rank, mesh, temperatures, seeds, filters, positions
             nisa.nc_matmul(dst=ps[0:T, 0:cs], stationary=nT[0:P, h1, 0:T], moving=w[0:P, 0:cs])
         nisa.tensor_copy(dst=lb[0:T, 0:cs], src=ps[0:T, 0:cs])
         nisa.tensor_copy(dst=logits[0:T, c0:c0 + cs], src=lb[0:T, 0:cs])
+
+    # the logits as computed, for the logsumexp (the top-k selection below overwrites the picked ones)
+    lcopy = nl.ndarray((P, VH), dtype=nl.float32, buffer=nl.sbuf)
+    nisa.tensor_copy(dst=lcopy[0:T, 0:VH], src=logits[0:T, 0:VH])
 
     # ---- this program's top K_RANK, with global ids ----
     cv = nl.ndarray((T, K_RANK), dtype=nl.float32, buffer=nl.sbuf)
@@ -233,6 +243,45 @@ def sample(x, norm_w, lm_wT, rank, mesh, temperatures, seeds, filters, positions
     nisa.tensor_tensor(dst=t2[0:T, 0:1], data1=t2[0:T, 0:1], data2=temp[0:T, 0:1], op=nl.add)
     inv = nl.ndarray((P, 1), dtype=nl.float32, buffer=nl.sbuf)
     nisa.reciprocal(dst=inv[0:T, 0:1], data=t2[0:T, 0:1])
+    # ---- logsumexp(logits x scale) over the vocabulary: each program's (max x scale, sum exp), every rank's ----
+    lsc = nl.ndarray((P, 1), dtype=nl.float32, buffer=nl.sbuf)
+    if original_logprob:
+        nisa.memset(dst=lsc[0:T, 0:1], value=1.0)
+    else:
+        nisa.tensor_copy(dst=lsc[0:T, 0:1], src=inv[0:T, 0:1])
+    lmax = nl.ndarray((P, 1), dtype=nl.float32, buffer=nl.sbuf)
+    nisa.tensor_reduce(lmax[0:T, 0:1], op=nl.maximum, data=lcopy[0:T, 0:VH], axis=1, keepdims=True)
+    shifted = nl.ndarray((P, VH), dtype=nl.float32, buffer=nl.sbuf)
+    nisa.tensor_scalar(dst=shifted[0:T, 0:VH], data=lcopy[0:T, 0:VH], op0=nl.subtract, operand0=lmax[0:T, 0:1],
+                       op1=nl.multiply, operand1=lsc[0:T, 0:1])
+    ex = nl.ndarray((P, VH), dtype=nl.float32, buffer=nl.sbuf)
+    pair = nl.ndarray((T, 2), dtype=nl.float32, buffer=nl.sbuf)
+    nisa.activation(dst=ex[0:T, 0:VH], op=nl.exp, data=shifted[0:T, 0:VH], reduce_op=nl.add,
+                    reduce_res=pair[0:T, 1:2], reduce_cmd=nisa.reduce_cmd.reset_reduce)
+    nisa.tensor_tensor(dst=pair[0:T, 0:1], data1=lmax[0:T, 0:1], data2=lsc[0:T, 0:1], op=nl.multiply)
+    n_pairs = n_prg * ranks
+    pairs = nl.ndarray((P, 2 * n_pairs), dtype=nl.float32, buffer=nl.sbuf)
+    gp = nl.ndarray((T, 2 * ranks), dtype=nl.float32, buffer=nl.sbuf)
+    nccl.all_gather(srcs=[pair], dsts=[gp], replica_group=rg, collective_dim=1)
+    nisa.tensor_copy(dst=pairs[0:T, 0:2 * ranks], src=gp)
+    if n_prg > 1:
+        nisa.sendrecv(src=gp, dst=pairs[0:T, 2 * ranks:4 * ranks], send_to_rank=other, recv_from_rank=other,
+                      pipe_id=2)
+    # the pairs interleaved: (max x scale) at even columns, sum exp at odd
+    big = nl.ndarray((P, 1), dtype=nl.float32, buffer=nl.sbuf)
+    nisa.tensor_reduce(big[0:T, 0:1], op=nl.maximum, data=pairs[0:T, 0:2 * n_pairs:2], axis=1, keepdims=True)
+    dm = nl.ndarray((P, n_pairs), dtype=nl.float32, buffer=nl.sbuf)
+    nisa.tensor_scalar(dst=dm[0:T, 0:n_pairs], data=pairs[0:T, 0:2 * n_pairs:2], op0=nl.subtract,
+                       operand0=big[0:T, 0:1])
+    em = nl.ndarray((P, n_pairs), dtype=nl.float32, buffer=nl.sbuf)
+    nisa.activation(dst=em[0:T, 0:n_pairs], op=nl.exp, data=dm[0:T, 0:n_pairs])
+    nisa.tensor_tensor(dst=em[0:T, 0:n_pairs], data1=em[0:T, 0:n_pairs], data2=pairs[0:T, 1:2 * n_pairs:2],
+                       op=nl.multiply)
+    tot_s = nl.ndarray((P, 1), dtype=nl.float32, buffer=nl.sbuf)
+    nisa.tensor_reduce(tot_s[0:T, 0:1], op=nl.add, data=em[0:T, 0:n_pairs], axis=1, keepdims=True)
+    lse = nl.ndarray((P, 1), dtype=nl.float32, buffer=nl.sbuf)
+    nisa.activation(dst=lse[0:T, 0:1], op=nl.log, data=tot_s[0:T, 0:1])
+    nisa.tensor_tensor(dst=lse[0:T, 0:1], data1=lse[0:T, 0:1], data2=big[0:T, 0:1], op=nl.add)
     # weights = exp((masked - max) / temperature); the max is candidate 0
     nb2 = nl.ndarray((P, 1), dtype=nl.float32, buffer=nl.sbuf)
     nisa.tensor_tensor(dst=nb2[0:T, 0:1], data1=masked[0:T, 0:1], data2=inv[0:T, 0:1], op=nl.multiply)
@@ -298,8 +347,41 @@ def sample(x, norm_w, lm_wT, rank, mesh, temperatures, seeds, filters, positions
     tok_f = nl.ndarray((P, 1), dtype=nl.float32, buffer=nl.sbuf)
     nisa.tensor_reduce(tok_f[0:T, 0:1], op=nl.add, data=poh[0:T, 0:n_pool], axis=1, keepdims=True)
     tok = nl.ndarray((P, 1), dtype=nl.int32, buffer=nl.sbuf)
+    if out_width > T:
+        # the rows past T at 0 (a memset starts at a partition quadrant: the whole tile first)
+        nisa.memset(dst=tok[0:out_width, 0:1], value=0)
     nisa.tensor_copy(dst=tok[0:T, 0:1], src=tok_f[0:T, 0:1])
-    out = nl.ndarray((T, 1), dtype=nl.int32, buffer=nl.shared_hbm, name="sample_out")
+    OW = max(T, out_width)
+    out = nl.ndarray((OW, 1), dtype=nl.int32, buffer=nl.shared_hbm, name="sample_out")
+    # the drawn candidate's logprob: its logit (place ``place`` of the sorted candidates) x scale - logsumexp
+    nisa.tensor_scalar(dst=oh[0:T, 0:K_POOL], data=col[0:T, 0:K_POOL], op0=nl.equal, operand0=place[0:T, 0:1])
+    nisa.tensor_tensor(dst=pick[0:T, 0:K_POOL], data1=vals[0:T, 0:K_POOL], data2=oh[0:T, 0:K_POOL], op=nl.multiply)
+    raw = nl.ndarray((P, 1), dtype=nl.float32, buffer=nl.sbuf)
+    nisa.tensor_reduce(raw[0:T, 0:1], op=nl.add, data=pick[0:T, 0:K_POOL], axis=1, keepdims=True)
+    lp = nl.ndarray((P, 1), dtype=nl.float32, buffer=nl.sbuf)
+    nisa.tensor_scalar(dst=lp[0:T, 0:1], data=raw[0:T, 0:1], op0=nl.multiply, operand0=lsc[0:T, 0:1],
+                       op1=nl.subtract, operand1=lse[0:T, 0:1])
+    lp_out = nl.ndarray((T, 1), dtype=nl.float32, buffer=nl.shared_hbm, name="sample_logprob")
+    K = top_logprobs
+    tv_out = nl.ndarray((T, max(K, 1)), dtype=nl.float32, buffer=nl.shared_hbm, name="sample_top_vals")
+    ti_out = nl.ndarray((T, max(K, 1)), dtype=nl.int32, buffer=nl.shared_hbm, name="sample_top_ids")
+    if K:
+        tv = nl.ndarray((P, K), dtype=nl.float32, buffer=nl.sbuf)
+        nisa.tensor_scalar(dst=tv[0:T, 0:K], data=vals[0:T, 0:K], op0=nl.multiply, operand0=lsc[0:T, 0:1],
+                           op1=nl.subtract, operand1=lse[0:T, 0:1])
+        ti_f = nl.ndarray((P, K), dtype=nl.float32, buffer=nl.sbuf)
+        for k in range(K):
+            nisa.tensor_scalar(dst=poh[0:T, 0:n_pool], data=pcol[0:T, 0:n_pool], op0=nl.equal,
+                               operand0=at_f[0:T, k:k + 1])
+            nisa.tensor_tensor(dst=poh[0:T, 0:n_pool], data1=poh[0:T, 0:n_pool], data2=pool_i[0:T, 0:n_pool],
+                               op=nl.multiply)
+            nisa.tensor_reduce(ti_f[0:T, k:k + 1], op=nl.add, data=poh[0:T, 0:n_pool], axis=1, keepdims=True)
+        ti = nl.ndarray((P, K), dtype=nl.int32, buffer=nl.sbuf)
+        nisa.tensor_copy(dst=ti[0:T, 0:K], src=ti_f[0:T, 0:K])
     if n_prg == 1 or pid == 0:
-        nisa.dma_copy(dst=out, src=tok[0:T, 0:1])
-    return out
+        nisa.dma_copy(dst=out, src=tok[0:OW, 0:1])
+        nisa.dma_copy(dst=lp_out, src=lp[0:T, 0:1])
+        if K:
+            nisa.dma_copy(dst=tv_out, src=tv[0:T, 0:K])
+            nisa.dma_copy(dst=ti_out, src=ti[0:T, 0:K])
+    return out, lp_out, tv_out, ti_out

@@ -34,7 +34,8 @@ def main() -> int:
     if not any(a.startswith(prefix) for a in cc):
         cc.append(prefix + FP8_FN_AS_E4M3)
     g = torch.Generator().manual_seed(7)
-    T, H, nq, d, page, blocks = 512, 4096, 1, 256, 128, 40
+    T = int(os.environ.get("CK_T", 512))
+    H, nq, d, page, blocks = 4096, 1, 256, 128, T // 128 + 8
     x = (torch.randn(T, H, generator=g) * 0.5).to(torch.bfloat16)
     norm = RMSNorm(H, 1e-6)
     norm.weight.data = (1 + 0.1 * torch.randn(H, generator=g)).to(torch.bfloat16)
@@ -86,9 +87,13 @@ def main() -> int:
         drv = (v_k.float() - vr[:, 0].to(dtype).float()).abs().max().item()
         rows_ok = max(drk, drv) <= max(dk, dv) + 1e-6 or max(drk, drv) < 0.07
         clean = kc_k.reshape(-1, d)[untouched].float().abs().max().item() == 0
-        tol = 0.07 if fp8 else 0.02
-        good = dq < 0.05 and dk < tol * max(1.0, kc_ref.float().abs().max().item()) and dv < tol * max(
-            1.0, vc_ref.float().abs().max().item()) and clean and rows_ok
+        # one ulp of the cache's dtype at the largest magnitude (e4m3: 3 mantissa bits, bf16: 7)
+        import math
+
+        bits = 3 if fp8 else 7
+        ulp = lambda m: 2.0 ** (math.floor(math.log2(max(m, 1e-30))) - bits)  # noqa: E731
+        good = (dq < 0.05 and dk <= ulp(kc_ref.float().abs().max().item())
+                and dv <= ulp(vc_ref.float().abs().max().item()) and clean and rows_ok)
         ok &= good
         print(f"  {'fp8' if fp8 else 'bf16'} cache: q max diff {dq:.3e}, k rows {dk:.3e}, v rows {dv:.3e}, "
               f"K/V rows out {max(drk, drv):.3e}, other rows untouched {clean}: {'ok' if good else 'DIFF'}", flush=True)

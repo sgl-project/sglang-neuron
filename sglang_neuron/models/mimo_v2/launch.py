@@ -40,6 +40,14 @@ def launch_problems(server_args, checkpoint_config, environ=os.environ) -> list:
     from sglang_neuron.models.mimo_v2.config import config_problems
 
     problems = list(config_problems(checkpoint_config))
+    from sglang_neuron.backend import envs as neuron_envs
+    from sglang_neuron import sampling
+
+    mode = sampling.sampler_mode()
+    if not neuron_envs.SGLANG_NEURON_CPU_MODE and mode not in ("greedy", "topk_topp"):
+        problems.append(f"SGLANG_NEURON_SAMPLER={mode}: MiMo-V2 samples in its own kernels (kernels/sample.py), greedy "
+                        "or topk_topp (the host sampler would read logits off an XLA LM head; the temperature mode's "
+                        "exact full-vocabulary draw has no kernel)")
     if getattr(server_args, "enable_multimodal", None):
         problems.append("--enable-multimodal: the Neuron graphs serve MiMo-V2's text decoder only (no vision or audio "
                         "tower)")

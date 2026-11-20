@@ -54,10 +54,12 @@ def main() -> int:
     d = lambda t: t.contiguous().to(device)  # noqa: E731
     with stack.compile_scope(list(COMPILER_ARGS)):
         fn = torch.compile(lambda *a: wrap_nki(sample)[get_logical_nc_config()](
-            a[0], a[1], a[2], a[3], mesh, a[4], a[5], a[6], a[7], eps=eps, span=1), backend=stack.compile_backend_name(),
-            fullgraph=True, dynamic=False)
-        got = fn(d(x), d(norm_w), d(my_lmT), d(torch.tensor([rank], dtype=torch.int32)), d(temps), d(seeds),
-                 d(filters), d(positions)).cpu().reshape(-1)
+            a[0], a[1], a[2], a[3], mesh, a[4], a[5], a[6], a[7], eps=eps, span=1, top_logprobs=5),
+            backend=stack.compile_backend_name(), fullgraph=True, dynamic=False)
+        outs = fn(d(x), d(norm_w), d(my_lmT), d(torch.tensor([rank], dtype=torch.int32)), d(temps), d(seeds),
+                  d(filters), d(positions))
+        got, got_lp, got_tv, got_ti = (o.cpu() for o in outs)
+        got = got.reshape(-1)
     # torch: the rule over the same candidates
     xf = x.float()
     normed = (norm_w.float() * (xf * torch.rsqrt(xf.pow(2).mean(-1, keepdim=True) + eps)).bfloat16().float()
@@ -89,7 +91,19 @@ def main() -> int:
     near = all(abs(a - b) <= 5 for _, a, b in places)
     if rank == 0:
         print(f"  (row, kernel place, rule place): {places}", flush=True)
-    ok = agree.float().mean().item() >= 0.75 and greedy_ok and near
+    # logprobs: the drawn token's logit x scale - logsumexp(logits x scale) over the vocabulary, scale 1 / temperature
+    # (1 for a greedy row); the top 5 the best candidates'
+    scale = torch.where(temps.view(-1) < 1e-5, torch.ones(T), 1.0 / temps.view(-1).clamp(min=1e-5)).view(T, 1)
+    lse = torch.logsumexp(logits * scale, dim=-1, keepdim=True)
+    lp_ref = logits.gather(1, got.long().view(T, 1)) * scale - lse
+    d_lp = (got_lp.view(T, 1) - lp_ref).abs().max().item()
+    d_tv = (got_tv - (vals[:, :5] * scale - lse)).abs().max().item()
+    # the ids by their logits: equal bf16 logits can order either way
+    ids_ok = torch.equal(logits.gather(1, got_ti.long()), vals[:, :5])
+    if rank == 0:
+        print(f"  logprob max diff {d_lp:.2e}; top-5 logprobs {d_tv:.2e}, ids {'match' if ids_ok else 'DIFF'}",
+              flush=True)
+    ok = agree.float().mean().item() >= 0.75 and greedy_ok and near and d_lp < 1e-2 and d_tv < 1e-2 and ids_ok
     print(f"{'PASS' if ok else 'FAIL'} rank {rank}/{world}: sampled tokens agree with the torch rule on "
           f"{int(agree.sum())}/{T} rows; greedy rows argmax {greedy_ok}; disagreeing rows "
           f"{torch.nonzero(~agree).view(-1).tolist()[:8]}", flush=True)

@@ -149,6 +149,12 @@ class MiMoV2Graph(nn.Module):
         # under NEURON_MTP the checkpoint's MTP layers the draft runs (mtp.py); the decode is then the MTP step
         # (mtp_step.py)
         self.mtp = None
+        if not mtp.enabled():
+            from sglang_neuron import sampling as neuron_sampling
+
+            # without MTP each graph samples its rows in its own forward too (_sample_rows): kernels on a device
+            self.samples_in_forward = True
+            self.sampler_modes = neuron_sampling.SAMPLER_MODES
         if mtp.enabled():
             self.mtp = nn.ModuleList([mtp.MiMoMtp(config, quantized, k) for k in range(mtp.num_layers())])
             if phase == "decode":
@@ -168,7 +174,7 @@ class MiMoV2Graph(nn.Module):
             else:
                 from sglang_neuron import sampling as neuron_sampling
 
-                # the prefill samples its chunk's row in its own forward too (_prefill_sample): kernels on a device
+                # the prefill samples its chunk's row in its own forward too (_sample_rows): kernels on a device
                 self.samples_in_forward = True
                 self.sampler_modes = neuron_sampling.SAMPLER_MODES
 
@@ -260,7 +266,8 @@ class MiMoV2Graph(nn.Module):
 
     def _mask_heads(self) -> tuple:
         """The decoder layers' distinct per-rank query head counts: one span active mask from the step kernel each."""
-        return tuple(sorted({int(layer.self_attn.num_heads) for layer in self.decoder_layers()}))
+        return tuple(sorted({int(layer.self_attn.num_heads * layer.self_attn.dcp_size)
+                             for layer in self.decoder_layers()}))
 
     def _sample_kernel(self, hidden, positions, params, width: int, spec: int) -> torch.Tensor:
         """[width, spec] the target's draw at each span token by kernels/sample.py, each token with its row's
@@ -275,7 +282,7 @@ class MiMoV2Graph(nn.Module):
             self._head_mesh(), temperatures.reshape(width, 1).to(torch.float32), seeds.reshape(width, 1).to(torch.int32),
             filters.reshape(width, 3).to(torch.float32), positions.reshape(-1, 1).to(torch.int32), eps=self.norm.eps,
             span=spec)
-        return out
+        return out[0]
 
     def _prefill_inputs(self, input_ids, positions) -> tuple:
         """A prefill chunk's embeddings and both kinds' RoPE tables in one kernel (kernels/prefill.prefill_inputs)."""
@@ -294,10 +301,19 @@ class MiMoV2Graph(nn.Module):
 
     @torch.no_grad()
     def forward(self, input_ids, positions, attn_metadata, sampling_positions, rank, mtp_row_slots=None,
-                mtp_ctrl=None, sampling_temperatures=None, sampling_seeds=None, sampling_filters=None):
+                mtp_ctrl=None, sampling_temperatures=None, sampling_seeds=None, sampling_filters=None,
+                token_control=None, token_width=0):
         if self.mtp is not None and self.phase == "decode":
             return self._mtp_decode(attn_metadata, rank, mtp_row_slots, mtp_ctrl,
                                     (sampling_temperatures, sampling_seeds, sampling_filters))
+        if self.phase == "decode" and can_run_kernel(positions):
+            return self._decode_kernels(input_ids, positions, attn_metadata, sampling_temperatures, sampling_seeds,
+                                        sampling_filters, token_control, token_width)
+        if token_control is not None:
+            # the CPU reference of the token relay (model_executor/token_io.FixedDecodeTokenIO)
+            source = token_control[1]
+            gathered = torch.index_select(input_ids, 0, source.clamp(min=0).to(torch.int64))
+            input_ids = torch.where(source >= 0, gathered, token_control[0])[:positions.shape[0]]
         if self.phase == "prefill" and can_run_kernel(positions) and positions.shape[0] % 128 == 0:
             hidden, tables = self._prefill_inputs(input_ids, positions)
         else:
@@ -340,11 +356,17 @@ class MiMoV2Graph(nn.Module):
                     hidden = hidden + layer.mlp.fused_decode(hidden, norm.weight, norm.eps, step["ebase"])
                 else:
                     hidden = hidden + layer.mlp(norm(hidden))
-        if self.phase == "prefill" and getattr(self, "samples_in_forward", False):
-            out = self._prefill_sample(hidden, positions, sampling_positions, sampling_temperatures, sampling_seeds,
-                                       sampling_filters)
-            self._mtp_prefill(hidden, input_ids, None, sampling_positions, attn_metadata[self._first_layer(True)],
-                              tables[True], rank)
+        if getattr(self, "samples_in_forward", False):
+            # the graph samples its rows itself (a CPU decode without MTP reaches here: the device's is _decode_kernels)
+            out = self._sample_rows(hidden, positions, sampling_positions, sampling_temperatures, sampling_seeds,
+                                    sampling_filters)
+            if self.mtp is not None and self.phase == "prefill":
+                self._mtp_prefill(hidden, input_ids, None, sampling_positions,
+                                  attn_metadata[self._first_layer(True)], tables[True], rank)
+            if token_width and out["token_ids"].shape[0] < token_width:
+                out = dict(out)
+                out["token_ids"] = torch.nn.functional.pad(out["token_ids"],
+                                                           (0, token_width - out["token_ids"].shape[0]), value=0)
             return out
         logits = self.lm_head(self.norm(hidden.index_select(0, sampling_positions)))
         if self.mtp is not None:
@@ -352,41 +374,108 @@ class MiMoV2Graph(nn.Module):
                               tables[True], rank)
         return logits
 
-    def _prefill_sample(self, hidden, positions, sampling_positions, temperatures, seeds, filters):
-        """The chunk's sampled row's token, as host.SampledExecution draws it from the logits: on a device the final
-        norm, the LM head and the draw in one kernel (head.greedy, kernels/sample.py with the row gathered in it); the
-        torch below is the CPU reference."""
+    def _sample_rows(self, hidden, positions, sampling_positions, temperatures, seeds, filters, out_width=0) -> dict:
+        """The sampled rows' tokens and logprobs, as host.SampledExecution draws them from the logits: on a device the
+        final norm, the LM head, the draw and the logprobs in one kernel (kernels/sample.py, the rows gathered in it,
+        ``sampling_positions`` None for every row of ``hidden``); the torch below is the CPU reference."""
         from sglang_neuron import sampling
 
         mode = sampling.sampler_mode()
         if can_run_kernel(hidden):
-            rows = sampling_positions.reshape(-1, 1).to(torch.int32)
-            if mode == "greedy" or temperatures is None:
-                return {"token_ids": self.greedy(hidden, self.norm, rows)}
-            if mode != "topk_topp":
-                raise ValueError(f"NEURON_MTP samples in kernels/sample.py: SGLANG_NEURON_SAMPLER=topk_topp or greedy, "
-                                 f"not {mode}")
             from sglang_neuron.backend.stack import wrap_nki
-            from sglang_neuron.models.mimo_v2.kernels.sample import sample
+            from sglang_neuron.models.mimo_v2.kernels.sample import K_POOL, sample
             from sglang_neuron.utils.hardware_config import get_logical_nc_config
 
-            n = rows.shape[0]
-            out = wrap_nki(sample)[get_logical_nc_config()](
+            if mode not in ("greedy", "topk_topp"):
+                raise ValueError(f"MiMo-V2 samples in kernels/sample.py: SGLANG_NEURON_SAMPLER=topk_topp or greedy, "
+                                 f"not {mode}")
+            k = int(sampling.MAX_TOP_LOGPROBS)
+            if k > K_POOL:
+                raise ValueError(f"SGLANG_NEURON_MAX_TOP_LOGPROBS={k}: the sampler kernel keeps {K_POOL} candidates")
+            rows = None if sampling_positions is None else sampling_positions.reshape(-1, 1).to(torch.int32)
+            n = hidden.shape[0] if rows is None else rows.shape[0]
+            dev = hidden.device
+            if mode == "greedy" or temperatures is None:
+                # temperature 0 everywhere: candidate 0, the argmax
+                temperatures = torch.zeros(n, dtype=torch.float32, device=dev)
+                seeds = torch.zeros(n, dtype=torch.int32, device=dev)
+                filters = None
+            if filters is None:
+                filters = torch.tensor([[float(sampling.TOP_K_ALL), 1.0, 0.0]], dtype=torch.float32,
+                                       device=dev).expand(n, 3).contiguous()
+            tok, lp, tv, ti = wrap_nki(sample)[get_logical_nc_config()](
                 hidden, self.norm.weight.view(1, -1), self.lm_head_T, self.lm_head_tp_group.rank_in_group_tensor,
                 self._head_mesh(), temperatures.reshape(n, 1).to(torch.float32), seeds.reshape(n, 1).to(torch.int32),
                 filters.reshape(n, 3).to(torch.float32), positions.reshape(-1, 1).to(torch.int32), eps=self.norm.eps,
-                rows=rows)
-            return {"token_ids": out.reshape(-1)}
-        logits = self.lm_head(self.norm(hidden.index_select(0, sampling_positions)))
+                rows=rows, top_logprobs=k, original_logprob=sampling.return_original_logprob(), out_width=out_width)
+            out = {"token_ids": tok.reshape(-1), "logprobs": lp.reshape(-1)}
+            if k:
+                out.update(top_vals=tv, top_ids=ti)
+            return out
+        states = hidden if sampling_positions is None else hidden.index_select(0, sampling_positions)
+        logits = self.lm_head(self.norm(states))
         group = self.lm_head_tp_group
         rank = group.rank_in_group_tensor
         if mode == "greedy" or temperatures is None:
             return sampling.greedy_sharded_logits(logits, group, rank, self.config.vocab_size)
-        keys = sampling.noise_row_keys(seeds, sampling.sampled_positions(positions, sampling_positions))
+        at = positions if sampling_positions is None else sampling.sampled_positions(positions, sampling_positions)
+        keys = sampling.noise_row_keys(seeds, at)
         if mode == "topk_topp":
             return sampling.sample_filtered_sharded_logits(logits, group, rank, self.config.vocab_size, temperatures,
                                                            keys, filters)
         return sampling.sample_sharded_logits(logits, group, rank, self.config.vocab_size, temperatures, keys)
+
+    def _decode_kernels(self, input_ids, positions, attn_metadata, temperatures, seeds, filters, token_control=None,
+                        token_width=0) -> dict:
+        """One decode step without MTP on a device, as kernels: the step's inputs (kernels/step.decode_inputs: both
+        kinds' RoPE tables, slots and position-mask inputs), the embedding (head.embed), one kernel a layer
+        (kernels/layer.py, masked by position, the full layers over KV data parallelism) and the sampler with its
+        logprobs (kernels/sample.py)."""
+        from sglang_neuron.backend.stack import resolve_full_mesh, wrap_nki
+        from sglang_neuron.models.mimo_v2.kernels.step import decode_inputs
+        from sglang_neuron.utils.hardware_config import get_logical_nc_config
+
+        if not all(self._layer_kernel_serves(layer) for layer in self.layers):
+            raise ValueError("MiMo-V2 decodes on the one-kernel layers (kernels/layer.py): every MoE layer's experts "
+                             "in the MoE half kernel")
+        md = {True: attn_metadata[self._first_layer(True)], False: attn_metadata[self._first_layer(False)]}
+        rows = positions.shape[0]
+        half = self.full_rope.inv_freq.shape[0] + self.full_rope.pass_through
+        attn0 = self.layers[0].self_attn
+        dcp = {}
+        if attn0.dcp_size > 1:
+            # DCP: this rank's share's bounds and the rows whose new token it keeps (the runtime's)
+            i32 = lambda t: t.reshape(-1).to(torch.int32)  # noqa: E731
+            dcp = dict(dcp_full_end=i32(md[False]["dcp_kv_end"]), dcp_swa_end=i32(md[True]["dcp_kv_end"]),
+                       dcp_swa_start=i32(md[True]["dcp_kv_start"]), dcp_owner=i32(md[True]["dcp_active_owner"]))
+        outs = wrap_nki(decode_inputs)[get_logical_nc_config()](
+            positions.reshape(-1).to(torch.int32), md[False]["slot_mapping"].reshape(-1).to(torch.int32),
+            md[True]["slot_mapping"].reshape(-1).to(torch.int32), md[True]["swa_kv_pos_offset"].reshape(-1).to(
+                torch.int32), self.full_rope.inv_freq.view(1, -1), self.swa_rope.inv_freq.view(1, -1),
+            window=int(self.config.swa.sliding_window), half=half, mask_heads=self._mask_heads(), **dcp)
+        full_slots, swa_slots, full_pos, swa_pos, swa_start, fc, fs, sc, ss, *masks = outs
+        layout = lambda t: t.reshape(t.shape[0], rows, 1)  # noqa: E731
+        step = {("cos", False): layout(fc), ("sin", False): layout(fs), ("cos", True): layout(sc),
+                ("sin", True): layout(ss), ("slots", False): full_slots, ("slots", True): swa_slots,
+                ("pos", False): full_pos, ("pos", True): swa_pos, ("start", True): swa_start,
+                "mesh": tuple(tuple(int(r) for r in cell) for cell in resolve_full_mesh(attn0.attn_tp_group)),
+                "ebase": self._expert_base(), "kv_scales": attn0._scale_tensors(positions.device)}
+        step.update({("mask", h): m for h, m in zip(self._mask_heads(), masks)})
+        if token_control is None:
+            hidden = self.embed(input_ids.reshape(-1))
+        else:
+            # the relay's ids, assembled in the embedding kernel (kernels/head.embed's control)
+            from sglang_neuron.models.mimo_v2.kernels.head import embed
+
+            hidden = wrap_nki(embed)[get_logical_nc_config()](
+                input_ids.reshape(-1, 1).to(torch.int32), self.embed_tokens.weight,
+                self.lm_head_tp_group.rank_in_group_tensor, self._head_mesh(), control=token_control, rows=rows)
+        for layer in self.layers:
+            k = layer.is_swa
+            hidden = self._layer_call(layer, hidden.view(rows, 1, -1),
+                                      attn_metadata[layer.self_attn.name]["block_table_tensor"], None,
+                                      step[("cos", k)], step[("sin", k)], step[("slots", k)], step)
+        return self._sample_rows(hidden, positions, None, temperatures, seeds, filters, out_width=token_width)
 
     # -- NEURON_MTP (mtp_step.py) -------------------------------------------------------------------------------------
 
@@ -589,8 +678,6 @@ class MiMoV2Graph(nn.Module):
     def _layer_kernel_serves(layer) -> bool:
         """Whether ``layer``'s decode runs as one kernel: a dense layer, or an MoE layer whose experts the MoE half
         kernel takes (moe.MiMoV2MoE.fused)."""
-        if layer.self_attn.dcp_size > 1:
-            return False  # its attention half attends this rank's own KV, without DCP
         return isinstance(layer.mlp, DenseMLP) or getattr(layer.mlp, "fused", False)
 
     def _step_inputs(self, tables, attn_metadata, layer) -> dict:
@@ -654,23 +741,31 @@ class MiMoV2Graph(nn.Module):
         attn, mlp = layer.self_attn, layer.mlp
         rows, span = x.shape[0], x.shape[1]
         posid = ("pos", layer.is_swa) in step
-        kvdp = self._kvdp(layer, rows) if posid else 1
+        dcp = attn.dcp_size
+        kvdp = self._kvdp(layer, rows) if posid and dcp == 1 else 1
+        heads_attn = attn.num_heads * dcp  # the heads its attention sees: the DCP group's gathered
         if posid:
             # the span's active part alone (the prior is masked by position): token q sees the span's tokens k <= q
-            built = step.get(("mask", int(attn.num_heads)))
-            if built is not None and tuple(built.shape) == (span, rows * attn.num_heads, span):
+            built = step.get(("mask", int(heads_attn)))
+            if built is not None and tuple(built.shape) == (span, rows * heads_attn, span):
                 # the step kernel's (kernels/step.py), the same memory for any kvdp: a view, no XLA op
-                mask = built.view(span, rows // kvdp, attn.num_heads * kvdp, span)
+                mask = built.view(span, rows // kvdp, heads_attn * kvdp, span)
             else:
                 k_idx = torch.arange(span, device=x.device).reshape(span, 1, 1, 1)
                 q_idx = torch.arange(span, device=x.device).reshape(1, 1, 1, span)
-                mask = (k_idx <= q_idx).expand(span, rows // kvdp, attn.num_heads * kvdp, span).to(torch.uint8)
+                mask = (k_idx <= q_idx).expand(span, rows // kvdp, heads_attn * kvdp, span).to(torch.uint8)
+        sink = attn._sink_column() if dcp == 1 else (None if attn.dcp_sink is None else attn.dcp_sink.reshape(-1, 1))
         attn_args = (x, layer.input_norm_f32, attn.qkv_weight, cos, sin, table, attn.k_cache, attn.v_cache, mask,
-                     attn._sink_column(), slots, attn._kernel_o_weight())
+                     sink, slots, attn._kernel_o_weight())
         k_scale, v_scale = step.get("kv_scales", (None, None))
         common = dict(k_scale=k_scale, v_scale=v_scale, eps=layer.input_layernorm.eps,
                       softmax_scale=attn.scaling / attn.kv_scale, v_head_dim=attn.v_head_dim)
-        if kvdp > 1:
+        if dcp > 1:
+            from sglang_neuron.ops.attention.attention_decode import dcp_collective_mode
+
+            common.update(pos=step[("pos", layer.is_swa)], start=step.get(("start", layer.is_swa)), dcp=dcp,
+                          dcp_mesh=attn._mesh(), dcp_mode=dcp_collective_mode(dcp))
+        elif kvdp > 1:
             common.update(pos=step[("pos", False)], rank=attn.attn_tp_group.rank_in_group_tensor, kvdp=kvdp,
                           kvdp_mesh=self._kvdp_mesh(layer, kvdp))
         elif posid:
@@ -679,6 +774,13 @@ class MiMoV2Graph(nn.Module):
         if isinstance(mlp, DenseMLP):
             return wrap_nki(dense_layer)[get_logical_nc_config()](
                 *attn_args, gamma, mlp.gate_weight, mlp.up_weight, mlp.down_weight, step["mesh"], **common)
+        if mlp.dp_size > 1:
+            # DP attention (a PD decode): the experts over every DP group's rows (kernels/layer._dp_moe)
+            from sglang_neuron.backend.stack import resolve_full_mesh
+
+            common.update(dp=mlp.dp_size, dp_rank=mlp.dp_group.rank_in_group_tensor,
+                          world_mesh=tuple(tuple(int(r) for r in cell)
+                                           for cell in resolve_full_mesh(mlp.wide_ep_group)))
         return wrap_nki(moe_layer)[get_logical_nc_config()](
             *attn_args, gamma, mlp.router_wT, mlp.expert_bias.view(1, -1), step["ebase"], mlp.gate_up_weight,
             mlp.down_weight, mlp.gate_up_scale, mlp.down_scale, step["mesh"], route_scale=float(mlp.scaling),

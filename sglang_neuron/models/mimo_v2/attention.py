@@ -243,13 +243,18 @@ class MiMoAttention(nn.Module):
             slots = md["slot_mapping"].to(torch.int32).reshape(-1, 1)
             # without DCP the queries come out times the segmented attention's softmax scale (over an FP8 cache, over
             # its scale too), which the attention then takes as 1
-            q_scale = 1.0 if self.dcp_size > 1 else self.scaling / (self.kv_scale if self.fp8_kv else 1.0)
+            # (under DCP a sliding layer's local attention takes the softmax scale on q too; a full layer's KV-parallel
+            # kernel applies it itself)
+            if self.dcp_size > 1:
+                q_scale = self.scaling if self.sliding_window else 1.0
+            else:
+                q_scale = self.scaling / (self.kv_scale if self.fp8_kv else 1.0)
             heads, k, v, k_cache, v_cache = wrap_nki(prefill_front)[get_logical_nc_config()](
                 x, norm.weight.view(1, -1), self.qkv_weight, cos, sin, slots, self.k_cache, self.v_cache,
                 eps=norm.eps, num_heads=self.num_heads, kv_scale=float(self.kv_scale) if self.fp8_kv else 1.0,
                 q_scale=float(q_scale))
             if self.dcp_size > 1:
-                return self._prefill_dcp(heads.transpose(0, 1), k.unsqueeze(1), v.unsqueeze(1), k_cache, v_cache, md)
+                return self._prefill_dcp_kernels(heads, k, v, k_cache, v_cache, md)
             return self._prefill_attend(heads, k_cache, v_cache, md, x.shape[0], prescaled=True)
         x = norm(x)
         q, k, v = self._split(x @ self.qkv_weight)
@@ -314,6 +319,43 @@ class MiMoAttention(nn.Module):
         from sglang_neuron.backend.stack import resolve_full_mesh
 
         return tuple(tuple(int(r) for r in cell) for cell in resolve_full_mesh(self.dcp_group))
+
+    def _prefill_dcp_kernels(self, heads, k, v, k_cache, v_cache, md) -> tuple:
+        """A chunk's attention under DCP on a device, as kernels: ``heads`` [num_heads, T, d] prefill_front's queries
+        (a sliding layer's times the softmax scale), ``k`` / ``v`` [T, d] the chunk's K / V as the cache holds them.
+        A full layer: the prior's pages (FP8: gathered and packed, kernels/prefill.prefill_pack), the table's missing
+        columns at page 0 and each rank's share (kernels/prefill.dcp_full_inputs), then nkilib's KV-parallel segmented
+        attention; a sliding layer: its window's prior page from the group's last rank and the chunk's own pages
+        (kernels/prefill.prefill_dcp_window), attended locally. Returns (heads [num_heads, T, d], 1.0)."""
+        from sglang_neuron.backend.stack import wrap_nki
+        from sglang_neuron.models.mimo_v2.kernels import attention_block
+        from sglang_neuron.models.mimo_v2.kernels.prefill import dcp_full_inputs, prefill_dcp_window, prefill_pack
+        from sglang_neuron.ops.attention.attention_segmented_cte import _attention_segmented_cte
+        from sglang_neuron.utils.hardware_config import get_logical_nc_config
+
+        grid = get_logical_nc_config()
+        size, page, tokens = self.dcp_size, md["block_size"], heads.shape[1]
+        cached = md["cached_seq_len"].to(torch.int32).reshape(1, 1)
+        table = md["block_table_tensor"].to(torch.int32)
+        scale = float(self.kv_scale) if self.fp8_kv else 1.0
+        if self.sliding_window is None:
+            if self.fp8_kv:
+                k_cache, v_cache, table = wrap_nki(prefill_pack)[grid](k_cache, v_cache, table, cached,
+                                                                       n_cols=table.shape[1], window=0)
+            table, prior, inv = wrap_nki(dcp_full_inputs)[grid](table, cached, dcp=size, kv_scale=scale)
+            ks = vs = inv if self.fp8_kv else None
+            out = wrap_nki(attention_block.prefill_kv_parallel)[grid](
+                heads, k_cache, v_cache, table, cached, self.dcp_group.rank_in_group_tensor.to(torch.int32).reshape(
+                    1, 1), prior, ks, vs, scale=self.scaling, block_size=page, seg_size=min(tokens, size * page),
+                dcp_size=size, dcp_mesh=self._mesh(), fp8_packed=self.fp8_kv)
+            return out, 1.0
+        k_local, v_local, local_table, prior_tokens = wrap_nki(prefill_dcp_window)[grid](
+            k_cache, v_cache, table, cached, k, v, self._mesh(), dcp=size, kv_scale=scale)
+        out = wrap_nki(_attention_segmented_cte)[grid](
+            q=heads, k_cache=k_local, v_cache=v_local, block_tables=local_table, prior_tokens=prior_tokens,
+            block_size=page, prior_seg_size=md["kv_segment_size"], scale=1.0, sliding_window=self.sliding_window,
+            sink=self._sink_column(), num_q_heads=heads.shape[0], fp8_packed=False)
+        return out, 1.0
 
     def _prefill_dcp(self, q, k, v, k_cache, v_cache, md) -> tuple:
         """A chunk's attention under DCP (module docstring); ``k`` / ``v`` [T, 1, d] its K/V as the cache holds them
