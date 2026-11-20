@@ -334,28 +334,13 @@ class MiMoV2Graph(nn.Module):
                                               layer.post_attention_layernorm)
                 hidden = layer.mlp.prefill_residual(hidden, normed, real=real, positions=ids32)
         else:
-            attn0 = self.layers[0].self_attn
-            # under DCP the decode attends the group's gathered query heads
-            inputs = decode_masks(attn_metadata, positions, self.config, attn0.num_heads * attn0.dcp_size)
-            step = None
+            inputs = decode_masks(positions)
             for layer in self.layers:
                 cos, sin = tables[layer.is_swa]
                 attn = layer.self_attn
-                md = attn_metadata[attn.name]
-                kind_inputs = inputs["swa" if layer.is_swa else "full"]
-                if kind_inputs.mask is not None and self._layer_kernel_serves(layer):
-                    if step is None:
-                        step = self._step_inputs(tables, attn_metadata, layer)
-                    hidden = self._layer_kernel(layer, hidden, md, kind_inputs, step)
-                    continue
-                hidden = hidden + attn.decode(hidden, layer.input_layernorm, cos, sin, md, kind_inputs)
-                norm = layer.post_attention_layernorm
-                if getattr(layer.mlp, "fused", False):
-                    if step is None:
-                        step = self._step_inputs(tables, attn_metadata, layer)
-                    hidden = hidden + layer.mlp.fused_decode(hidden, norm.weight, norm.eps, step["ebase"])
-                else:
-                    hidden = hidden + layer.mlp(norm(hidden))
+                hidden = hidden + attn.decode(hidden, layer.input_layernorm, cos, sin, attn_metadata[attn.name],
+                                              inputs["swa" if layer.is_swa else "full"])
+                hidden = hidden + layer.mlp(layer.post_attention_layernorm(hidden))
         if getattr(self, "samples_in_forward", False):
             # the graph samples its rows itself (a CPU decode without MTP reaches here: the device's is _decode_kernels)
             out = self._sample_rows(hidden, positions, sampling_positions, sampling_temperatures, sampling_seeds,
@@ -589,11 +574,7 @@ class MiMoV2Graph(nn.Module):
             out, _, _ = attn.span_decode(hidden, layer.input_layernorm, cos, sin, attn_metadata[attn.name],
                                          masks[layer.is_swa], kv_slots[layer.is_swa], spec)
             hidden = hidden + out
-            norm = layer.post_attention_layernorm
-            if getattr(layer.mlp, "fused", False):
-                hidden = hidden + layer.mlp.fused_decode(hidden, norm.weight, norm.eps, ebase)
-            else:
-                hidden = hidden + layer.mlp(norm(hidden))
+            hidden = hidden + layer.mlp(layer.post_attention_layernorm(hidden))
         # the kernels' int32 draws stay int32 into the step's tail kernels ("raw")
         keep_i32 = "raw" in span
         if params[0] is None or sampling.sampler_mode() == "greedy":
@@ -679,33 +660,6 @@ class MiMoV2Graph(nn.Module):
         """Whether ``layer``'s decode runs as one kernel: a dense layer, or an MoE layer whose experts the MoE half
         kernel takes (moe.MiMoV2MoE.fused)."""
         return isinstance(layer.mlp, DenseMLP) or getattr(layer.mlp, "fused", False)
-
-    def _step_inputs(self, tables, attn_metadata, layer) -> dict:
-        """The kernels' inputs a decode step shares across its layers, built once: each kind's cos / sin in the
-        kernel's [d / 2, B, 1] layout, each kind's slots as int32 [B, 1] (the sliding layers' are the window pool's),
-        this rank's first local expert and the attention-TP group's mesh."""
-        from sglang_neuron.backend.stack import resolve_full_mesh
-
-        step = {"mesh": tuple(tuple(int(r) for r in cell)
-                              for cell in resolve_full_mesh(layer.self_attn.attn_tp_group))}
-        for is_swa, (cos, sin) in tables.items():
-            step[("cos", is_swa)] = cos.t().unsqueeze(-1).contiguous()
-            step[("sin", is_swa)] = sin.t().unsqueeze(-1).contiguous()
-        for other in self.layers:
-            key = ("slots", other.is_swa)
-            if key not in step:
-                slots = attn_metadata[other.self_attn.name]["slot_mapping"]
-                step[key] = slots.view(slots.shape[0], 1).to(torch.int32)
-        step["ebase"] = self._expert_base()
-        step["kv_scales"] = layer.self_attn._scale_tensors(layer.self_attn.qkv_weight.device)
-        return step
-
-    def _layer_kernel(self, layer, hidden, md, inputs, step):
-        """One layer's decode in one kernel (kernels/layer.py), its all-reduces inside."""
-        rows = hidden.shape[0]
-        return self._layer_call(layer, hidden.view(rows, 1, -1), md["block_table_tensor"], inputs.mask,
-                                step[("cos", layer.is_swa)], step[("sin", layer.is_swa)],
-                                step[("slots", layer.is_swa)], step)
 
     def _kvdp(self, layer, rows: int) -> int:
         """The KV data parallelism of ``layer``'s decode attention at ``rows`` rows (kernels/attn_half.py ``kvdp``):

@@ -6,11 +6,10 @@ the ranks, and with more ranks than KV heads each rank holds one KV head, replic
 - **Prefill**, one request's chunk: the QKV projection and the partial RoPE in the graph, the chunk's K/V into its
   pages (kv_write.py), then nkilib's segmented attention over the prior and the chunk, with the layer's window and
   sinks; the window kernel loads only the pages a window reaches.
-- **Decode**: nkilib's ``attention_block_tkg`` runs the input RMSNorm, the QKV projection, RoPE and the attention
-  over the paged prior with the sinks. Its in-kernel output projection and cache write take heads of at most 128
-  channels, so it runs with ``W_out=None`` and ``update_cache=False``: the graph writes the new token's K/V it returns
-  and projects the heads' first ``v_head_dim`` channels itself. The step's masks are built once per layer kind
-  (``decode_masks``).
+- **Decode**: each layer runs as one kernel (kernels/layer.py, from model.MiMoV2Graph._decode_kernels): the input
+  RMSNorm, the QKV projection, RoPE, the K/V write and nkilib's ``attention_block_tkg`` over the paged prior with the
+  sinks, the output projection and the all-reduce (kernels/attn_half.py); the step's masks, slots and RoPE tables come
+  out of kernels/step.decode_inputs. ``decode`` here is the CPU reference.
 
 No decode ends its loop early: nkilib's early exit (``max_context_len``) is wrong past an 8K prior
 (sgl-project/sglang-neuron#4).
@@ -411,51 +410,20 @@ class MiMoAttention(nn.Module):
             sliding_window=self.sliding_window, sink=self._sink_column())
         return out, 1.0
 
-    def _dcp_decode(self, x, norm, cos, sin, md, mask, slots, span: int = 1) -> torch.Tensor:
-        """``span`` tokens a row (one outside a NEURON_MTP step) over the DCP group's shards: ``mask`` the group's (the
-        runtime's per-row bounds), ``slots`` [B x span] this rank's slot of each token (0 where another rank keeps it);
-        the K/V written after the attention, the output all-reduced."""
-        from sglang_neuron.backend.stack import wrap_nki
-        from sglang_neuron.models.mimo_v2.kernels import attention_block
-        from sglang_neuron.ops.attention.attention_decode import dcp_collective_mode
-        from sglang_neuron.utils.hardware_config import get_logical_nc_config
-
-        tokens = x.shape[0]
-        rows = tokens // span
-        layout = lambda t: t.reshape(rows, span, -1).permute(2, 0, 1).contiguous()  # noqa: E731
-        k_scale, v_scale = self._scale_tensors(x.device)
-        sink = None if self.dcp_sink is None else self.dcp_sink.reshape(-1, 1)
-        out, k_new, v_new = wrap_nki(attention_block.decode_masked_dcp)[get_logical_nc_config()](
-            X=x.view(rows, span, -1), X_hidden_dim_actual=self.hidden_size, rmsnorm_X_eps=norm.eps,
-            rmsnorm_X_gamma=norm.weight.unsqueeze(0).to(torch.float32), W_qkv=self.qkv_weight, cos=layout(cos),
-            sin=layout(sin), active_blocks_table=md["block_table_tensor"], K_cache=self.k_cache, V_cache=self.v_cache,
-            attention_mask=mask, sink=sink, softmax_scale=self.scaling / self.kv_scale, k_scale=k_scale,
-            v_scale=v_scale, dcp_size=self.dcp_size, dcp_mesh=self._mesh(), dcp_mode=dcp_collective_mode(self.dcp_size))
-        heads = out.reshape(rows, self.num_heads, KV_HEAD_DIM, span).permute(0, 3, 1, 2).reshape(
-            tokens, self.num_heads, KV_HEAD_DIM)
-        if self.kv_scale != 1.0:
-            heads = heads / self.kv_scale
-        kv_write.write_kv(self.k_cache, self.v_cache, _fp8_rows_t(k_new, KV_HEAD_DIM, tokens).reshape(
-            1, tokens, KV_HEAD_DIM), v_new.reshape(1, tokens, KV_HEAD_DIM), slots)
-        return self._project_out(heads)
-
     # -- decode -------------------------------------------------------------------------------------------------------
 
     def decode(self, x: torch.Tensor, norm, cos: torch.Tensor, sin: torch.Tensor, md: dict,
                inputs: DecodeInputs) -> torch.Tensor:
-        """The attention output [B, H] of one token a row; ``x`` [B, H] is the residual stream (the kernel applies the
-        layer's input norm ``norm``), cos / sin [B, KV_HEAD_DIM / 2] the layer kind's tables."""
+        """The CPU reference of a decode step's attention: the output [B, H] of one token a row; ``x`` [B, H] is the
+        residual stream (the input norm ``norm`` applied here), cos / sin [B, KV_HEAD_DIM / 2] the layer kind's
+        tables."""
         if self.num_kv_heads != 1:
             raise ValueError(f"the MiMo-V2 decode attends one KV head per rank, not {self.num_kv_heads}")
+        if can_run_kernel(x) or self.dcp_size > 1:
+            raise ValueError("a device decode runs the one-kernel layers (model.MiMoV2Graph._decode_kernels); "
+                             "this is the CPU reference, without DCP")
         rows = x.shape[0]
-        if self.dcp_size > 1:
-            return self._dcp_decode(x, norm, cos, sin, md, inputs.mask, md["slot_mapping"].reshape(-1))
-        if can_run_kernel(x) and inputs.mask is not None:
-            return self._fused_decode(x, norm, cos, sin, md, inputs)
-        if not can_run_kernel(x):
-            heads, k_new, v_new = self._torch_decode(x, norm, cos, sin, md, inputs.positions)
-        else:
-            heads, k_new, v_new = self._kernel_decode(x, norm, cos, sin, md, inputs)
+        heads, k_new, v_new = self._torch_decode(x, norm, cos, sin, md, inputs.positions)
         kv_write.write_kv(self.k_cache, self.v_cache, k_new.reshape(1, rows, KV_HEAD_DIM),
                           v_new.reshape(1, rows, KV_HEAD_DIM), md["slot_mapping"])
         return self._project_out(heads)
@@ -498,51 +466,6 @@ class MiMoAttention(nn.Module):
         k_cache, v_cache = kv_write.write_kv(k_cache, v_cache, _fp8_rows_t(k_new, KV_HEAD_DIM, tokens).reshape(
             1, tokens, KV_HEAD_DIM), v_new.reshape(1, tokens, KV_HEAD_DIM), slots)
         return self._project_out(heads), k_cache, v_cache
-
-    def _fused_decode(self, x, norm, cos, sin, md, inputs: DecodeInputs) -> torch.Tensor:
-        """The attention half in one kernel (kernels/attn_half.py), its partial all-reduced."""
-        from sglang_neuron.backend.stack import wrap_nki
-        from sglang_neuron.models.mimo_v2.kernels.attn_half import attn_half
-        from sglang_neuron.utils.hardware_config import get_logical_nc_config
-
-        rows = x.shape[0]
-        k_scale, v_scale = self._scale_tensors(x.device)
-        out, _, _ = wrap_nki(attn_half)[get_logical_nc_config()](
-            x.view(rows, 1, -1), norm.weight.unsqueeze(0).to(torch.float32), self.qkv_weight,
-            cos.t().unsqueeze(-1).contiguous(), sin.t().unsqueeze(-1).contiguous(), md["block_table_tensor"],
-            self.k_cache, self.v_cache, inputs.mask, self._sink_column(),
-            md["slot_mapping"].view(rows, 1).to(torch.int32), self._kernel_o_weight(), k_scale, v_scale,
-            rmsnorm_X_eps=norm.eps, softmax_scale=self.scaling / self.kv_scale, v_head_dim=self.v_head_dim)
-        return neuron_collectives.all_reduce(self.attn_tp_group, out)
-
-    def _kernel_decode(self, x, norm, cos, sin, md, inputs: DecodeInputs) -> tuple:
-        from sglang_neuron.backend.stack import wrap_nki
-        from sglang_neuron.models.mimo_v2.kernels import attention_block
-
-        rows = x.shape[0]
-        args = dict(
-            X=x.view(rows, 1, -1), rmsnorm_X_gamma=norm.weight.unsqueeze(0).to(torch.float32), rmsnorm_X_eps=norm.eps,
-            X_hidden_dim_actual=self.hidden_size, W_qkv=self.qkv_weight,
-            # [B, d / 2] -> the kernel's [d / 2, B, 1]
-            cos=cos.t().unsqueeze(-1).contiguous(), sin=sin.t().unsqueeze(-1).contiguous(),
-            K_cache=self.k_cache, V_cache=self.v_cache, sink=self._sink_column(),
-            softmax_scale=self.scaling / self.kv_scale,
-        )
-        from sglang_neuron.utils.hardware_config import get_logical_nc_config
-
-        if self.fp8_kv:
-            k_scale, v_scale = self._scale_tensors(x.device)
-            out, k_new, v_new = wrap_nki(attention_block.decode_masked_fp8)[get_logical_nc_config()](
-                active_blocks_table=md["block_table_tensor"], attention_mask=inputs.mask, k_scale=k_scale,
-                v_scale=v_scale, **args)
-        else:
-            out, k_new, v_new = wrap_nki(attention_block.decode_masked)[get_logical_nc_config()](
-                active_blocks_table=md["block_table_tensor"], attention_mask=inputs.mask, **args)
-        # out [B, heads, d, 1]; K [d, B, 1] and V [B, 1, 1, d] for one KV head (nkilib attention_block_tkg)
-        heads = out.reshape(rows, self.num_heads, KV_HEAD_DIM, 1)[..., 0]
-        if self.kv_scale != 1.0:
-            heads = heads / self.kv_scale
-        return heads, _fp8_rows_t(k_new, KV_HEAD_DIM, rows), v_new.reshape(rows, KV_HEAD_DIM)
 
     def _torch_decode(self, x, norm, cos, sin, md, positions) -> tuple:
         """The kernel's decode by plain attention over each row's pages (the CPU reference): the prior is the row's
@@ -593,30 +516,10 @@ def qk_swap_layout(mask: torch.Tensor, *, d_head: int, fp8_kv: bool, fp8_packed:
     return mask.permute(1, 2, 3, 0).contiguous() if swapped else mask
 
 
-def decode_masks(attn_metadata: dict, positions: torch.Tensor, config: MiMoV2Config, num_heads: int) -> dict:
-    """Each layer kind's ``DecodeInputs`` for a decode step (``{"swa": ..., "full": ...}``), built once for all of its
-    layers. On a CPU none are needed (the torch path masks by position)."""
-    swa_layer = next((config.layer_name(i) for i, s in enumerate(config.swa_layers) if s), None)
-    full_layer = next((config.layer_name(i) for i, s in enumerate(config.swa_layers) if not s), None)
-    if not can_run_kernel(positions):
-        return {"swa": DecodeInputs(positions=positions), "full": DecodeInputs(positions=positions)}
-    from sglang_neuron.models.gpt_oss.attention_masks import decode_attention_masks
-
-    swa_mask = full_mask = None
-    if swa_layer is not None or full_layer is not None:
-        swa_mask, full_mask = decode_attention_masks(
-            attn_metadata, positions, sliding_window=config.swa.sliding_window or 0, q_heads=num_heads,
-            swa_layer=swa_layer, full_layer=full_layer)
-
-    def kernel_layout(mask):
-        return qk_swap_layout(mask, d_head=KV_HEAD_DIM, fp8_kv=fp8_kv_cache(), fp8_packed=False)
-
-    out = {}
-    if swa_mask is not None:
-        out["swa"] = DecodeInputs(positions=positions, mask=kernel_layout(swa_mask))
-    if full_mask is not None:
-        out["full"] = DecodeInputs(positions=positions, mask=kernel_layout(full_mask))
-    return out
+def decode_masks(positions: torch.Tensor) -> dict:
+    """Each layer kind's ``DecodeInputs`` for a CPU decode step (``{"swa": ..., "full": ...}``): the torch path masks
+    by position (a device decode builds its masks in kernels/step.decode_inputs)."""
+    return {"swa": DecodeInputs(positions=positions), "full": DecodeInputs(positions=positions)}
 
 
 def span_mask(md: dict, prior_end: torch.Tensor, positions: torch.Tensor, *, window: Optional[int], num_heads: int):

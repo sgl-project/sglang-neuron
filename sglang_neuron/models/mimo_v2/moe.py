@@ -160,22 +160,6 @@ class MiMoV2MoE(SparseMoE):
         out = neuron_collectives.all_reduce(self.wide_ep_group, out)
         return shard_select(out, 0, self.dp_group, n_shards=self.dp_size)
 
-    def fused_decode(self, x, ln_w, eps: float, ebase) -> torch.Tensor:
-        """The decode MoE half in one kernel (kernels/moe_half.py) on the residual stream ``x`` [T, H] (before the norm,
-        whose weight is ``ln_w``), all-reduced; ``ebase`` [1, 1] fp32 is this rank's first local expert id."""
-        from sglang_neuron.backend.stack import wrap_nki
-        from sglang_neuron.models.mimo_v2.kernels.moe_half import moe_half
-        from sglang_neuron.utils.hardware_config import get_logical_nc_config
-
-        kernel = wrap_nki(moe_half)[get_logical_nc_config()]
-        x = self._gather(x)
-        tiles = [kernel(x[s:s + experts_fp8.MAX_TOKENS], ln_w.view(1, -1), self.router_wT, self.expert_bias.view(1, -1),
-                        ebase, self.gate_up_weight, self.down_weight, self.gate_up_scale, self.down_scale, eps=eps,
-                        route_scale=float(self.scaling), top_k=self.top_k)
-                 for s in range(0, x.shape[0], experts_fp8.MAX_TOKENS)]
-        out = tiles[0] if len(tiles) == 1 else torch.cat(tiles, dim=0)
-        return self._reduce(out)
-
     def weight_mappings(self, src: str, dst: str) -> dict:
         mlp, experts = f"{src}.mlp", f"{src}.mlp.experts"
         local = self.local_experts
