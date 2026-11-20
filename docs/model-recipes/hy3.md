@@ -95,6 +95,8 @@ python3 -m sglang.launch_server --model-path /models/Hy3-FP8 --served-model-name
 - `SGLANG_NEURON_HY3_SPARSE_PREFILL_KEEP=16384`: a DCP prefill chunk over a longer prior attends to 16384 of its prior
   tokens, picked by the page summaries under the chunk's query-group envelopes (`sparse.prefill_select`).
 - `--prefill-decode-interval 2`: a waiting prefill runs after at most two decode steps.
+- `SGLANG_NEURON_HY3_DECODE_NORM=nki` (the default) runs the decode's input and final RMSNorms in one NKI kernel
+  (`kernels/rmsnorm_rows.py`); `torch` keeps the RMSNorm module.
 - `SGLANG_NEURON_PREFILL_YIELD=2048` (optional, `sglang_patches/prefill_yield.py`) lets a prompt of at most 2048 new tokens
   prefill between two chunks of a long one: under AgentX it lowers TTFT and raises the decode's P90 ITL (below).
 
@@ -129,17 +131,31 @@ tencent/Hy3-FP8 on one trn2.48xlarge (Neuron SDK 2.33), the aggregated configura
 | decode TPOT, 128-token prompts, 1024 out, temperature 0.9, concurrency 8 | 14.9 ms (MTP accepted length 3.1) |
 | GSM8K (5-shot, 200 problems, MTP on) | 0.935 to 0.950 |
 | needle retrieval, 16k to 85k tokens, 3 depths | 12/12 |
-| InferenceX AgentX, concurrency 8, 1 h (`semianalysis_cc_traces_weka_062126_256k`, real acceptance) | 206.9 output tokens/s, 923 requests; TTFT p50/p90/p99 1.87/5.71/18.1 s; ITL p50/p90 30.1/53.4 ms |
-| the same with `SGLANG_NEURON_PREFILL_YIELD=2048` | 206.2 output tokens/s; TTFT 1.72/5.27/16.6 s; ITL 30.9/59.2 ms |
+| decode step, 8 rows, MTP span 4, 32k / 64k / 128k contexts | 42.6 / 42.7 / 43.7 ms |
+| InferenceX AgentX, concurrency 8, 1 h (`semianalysis_cc_traces_weka_062126_256k`, real acceptance, harness 1.0.14) | 216.2 output tokens/s, 932 requests; TTFT p50/p90/p99 1.89/5.11/15.8 s; ITL p50/p90 27.2/48.5 ms |
+| the same before the NKI decode RMSNorm and the folded V scale (harness 1.0.14, decode buckets 1 to 16) | 207.9 output tokens/s; TTFT 1.93/5.37/20.3 s; ITL 30.1/51.2 ms |
+| the same at concurrency 1 / 2 / 4 (before them) | 64.2 / 84.9 / 134.5 output tokens/s; ITL p50 18.4 / 19.9 / 21.8 ms |
+| `SGLANG_NEURON_PREFILL_YIELD=2048` (harness 1.0.12, before them) | 206.2 output tokens/s against 206.9 without; TTFT 1.72/5.27/16.6 s; ITL 30.9/59.2 ms |
 
 How the AgentX point moved (same run each, one change at a time): 149.1 (the configuration before the prefill segments)
 -> 154.3 (query/prior segments) -> 171.8 (sparse DCP prefill) -> 185.0 (`temperature` sampler admitted under MTP) ->
 187.8 (drafts without the logprob path, decode bucket 12) -> 191.9 (direct submit of the decode graph) -> 202.2
-(span summaries from the computed K) -> 206.9 (`--prefill-decode-interval 2`).
+(span summaries from the computed K) -> 206.9 (`--prefill-decode-interval 2`) -> 216.2 (harness 1.0.14: the decode's
+RMSNorms in an NKI kernel and the V scale folded into the bf16 output projection, 8% off the decode step; the MTP
+prefill's MoE masking its padding rows). At concurrency 16 one node is KV-bound (172.0 tokens/s, prefix hit 86.7%); serve
+that load disaggregated.
 
 PD (one trn2.48xlarge each for the prefill and the decode): GSM8K (200 problems) 0.945 with the sparse decode, 80k-token
-needle retrieval correct, decode TPOT 19.0 ms at concurrency 8. AgentX on the 2P1D layout above (two TP32 prefills, one
-TP64 DCP8 decode):
+needle retrieval correct, decode TPOT 19.0 ms at concurrency 8. AgentX, 1 h, with the prefills' 524288-token pools and
+HiCache L2 (harness 1.0.14; GSM8K through the balancer 0.940, needle 12/12):
+
+| | nodes | output tokens/s | TTFT p50/p90/p99 | ITL p50/p90 | prefix hit |
+| --- | --- | --- | --- | --- | --- |
+| 2P1D (two TP32 prefills on one node), concurrency 8 | 2 | 245.4 | 1.98/4.83/15.8 s | 19.2/25.0 ms | 95.5% |
+| 4P1D (two TP32 prefills on each of two nodes), concurrency 8 | 3 | 248.2 | 1.77/3.66/9.79 s | 19.1/24.3 ms | 95.5% |
+| 4P1D, concurrency 16 | 3 | 445.9 | 2.14/5.93/26.2 s | 21.2/27.1 ms | 94.3% |
+
+Earlier 2P1D points (before HiCache's side buffers, the MTP prefill fixes and the NKI decode RMSNorm):
 
 | | output tokens/s | TTFT p50/p90/p99 | ITL p50/p90 | prefix hit |
 | --- | --- | --- | --- | --- |
@@ -158,6 +174,10 @@ compares with other 20-minute runs only.
   cold prompt wait for all of its chunks (`SGLANG_NEURON_PREFILL_YIELD` trades decode ITL for part of it).
 - A decode layer (bs 8, MTP span 4, 32k context) is about 0.43 ms, a quarter of it waiting on its three collectives (the
   DCP merge and two 64-rank all-reduces of 256 KB, 27 us each, latency-bound; the runtime's default algorithms are the
-  fastest measured); the span fold and the selection still cost about 3.9 ms of a 43.6 ms step.
+  fastest measured); the span fold and the selection still cost about 3.9 ms of the step, and the decode MoE block
+  (EP64, three local experts read whole every layer) is near the HBM bound.
+- HiCache L2 serves the PD prefill (no DCP) only: under DCP a page lives on rank page mod D, and a load into another
+  page id would move it to another rank. A 2P1D prefill at concurrency 16 is not yet measured with the bounded batch DMA
+  (`SGLANG_NEURON_HICACHE_MAX_BATCH_OPS`).
 - The PD prefill runs without DCP, so its attention over a long prior is not sharded; the DCP stripe transfer serves MLA
   pools only today.
