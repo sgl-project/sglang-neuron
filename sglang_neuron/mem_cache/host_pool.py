@@ -41,6 +41,10 @@ logger = logging.getLogger(__name__)
 
 _STATS = os.environ.get("SGLANG_NEURON_HICACHE_STATS", "0") == "1"
 _VERIFY = os.environ.get("SGLANG_NEURON_HICACHE_VERIFY", "0") == "1"
+# the most _BatchOp records one nrt_tensor_{read,write}_batch call takes (tensors x runs): the driver copies the whole
+# list into kernel memory, and a load of a long scattered prefix over a pool with many regions (Hy3: 242, its K, V
+# and sparse summaries) failed there with -12 (ENOMEM), which killed the server; a transfer splits its runs instead
+MAX_BATCH_OPS = int(os.environ.get("SGLANG_NEURON_HICACHE_MAX_BATCH_OPS", "16384"))
 
 
 # ---- runtime library --------------------------------------------------------------------------------------------
@@ -350,8 +354,10 @@ class TransferEngine:
         if self.handles is None:  # CPU mode: host tensors stand in for the device
             job.ops = torch_page_copy(self.devt, self.host, job.runs, job.to_host)
             return
-        ops = batch_ops(job.runs, *self._op_cols)  # kept alive by this frame until the call returns
-        self._execute(job.to_host, ops)
+        step = max(1, MAX_BATCH_OPS // max(1, len(self.devt)))
+        for i in range(0, len(job.runs), step):
+            ops = batch_ops(job.runs[i:i + step], *self._op_cols)  # kept alive by this frame until the call returns
+            self._execute(job.to_host, ops)
         job.ops = len(self.devt) * len(job.runs)
 
     # -- completion (any thread) --

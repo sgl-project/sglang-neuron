@@ -99,6 +99,7 @@ KNOBS: dict = {
     "SGLANG_NEURON_HICACHE_ASYNC_LOAD": CONFIG,
     "SGLANG_NEURON_HICACHE_STATS": DEBUG,
     "SGLANG_NEURON_HICACHE_VERIFY": DEBUG,
+    "SGLANG_NEURON_HICACHE_MAX_BATCH_OPS": CONFIG,
     # the HBM the recurrent-state radix checkpoint store leaves free (mem_cache/state_checkpoint_pool.RESERVE_ENV)
     "SGLANG_NEURON_STATE_CKPT_RESERVE_GB": CONFIG,
     # the in-flight bound (backend.device_io), which the giga-kernel decode's result lag takes as its lag
