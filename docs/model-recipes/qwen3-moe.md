@@ -98,6 +98,36 @@ flowchart LR
 
 `--stream-interval 4` streams each answer four tokens at a time, so one benchmark client keeps up with every stream.
 
+## FP8 KV cache
+
+`--kv-cache-dtype fp8_e4m3` stores the KV cache in OCP e4m3: V as `[pages, kv_heads, page, d]` and K in the kernels'
+packed layout, `[pages, kv_heads, page // 2, d, 2]` (`NeuronMHATokenToKVPool.fp8_packed_k`), at half the bf16 bytes. The
+same kernels run with their FP8 inputs set (`sglang_neuron/ops/attention/qkv_paged.py`,
+`sglang_neuron/ops/attention/attention_decode_paged.py`): the prefill's `qkv_cte` writes packed K and V, the segmented
+attention reads them, and the decode's `attention_block_tkg` reads and writes them. The checkpoint has no KV scales, so
+K and V are stored at unit scale, clamped to ±448, and neither the softmax scale nor the output projection is
+rescaled. A decode bucket whose context the packed read cannot tile is refused when its graph traces.
+
+Halving the KV doubles the tokens the pool holds at the same HBM, which is where the throughput comes from. On a
+trn3.48xlarge at TP4 EP4 (one chip), 4,096-token prompts and 4,096-token answers, as many concurrent requests as the
+server runs:
+
+| KV dtype | Pool (tokens, one chip) | Running requests | Output tok/s |
+| --- | --- | --- | --- |
+| bf16 | 532,480 | 64 | 936 |
+| `fp8_e4m3` | 1,056,768 | 128 | 1,271 |
+
+The cost is accuracy. Qwen3-30B-A3B's K is RMS-normed per head with gammas up to 34 (layer 3), and e4m3's rounding on
+those channels moves attention logits. GSM8K (1,319 questions, 5-shot, greedy) drops by about ten points, and SGLang's
+CUDA path drops as much, so the loss is the format's on this model rather than the Neuron kernels':
+
+| Server | bf16 KV | `fp8_e4m3` KV |
+| --- | --- | --- |
+| sglang-neuron, trn3 | 0.907 | 0.810, 0.863 (two runs) |
+| SGLang 0.5.23 CUDA, H200 (FA3) | 0.912, 0.913 | 0.795, 0.795 |
+
+Check accuracy on your own workload before serving FP8 KV.
+
 ## Compiled shapes
 
 As Qwen3's: a prefill graph of the chunk and of each smaller KV segment tile that splits over the attention TP ranks,
@@ -123,5 +153,6 @@ A launch the graphs can't serve fails at startup, naming the setting at fault:
   ranks per expert, a smaller `--ep-size` or a larger `--tp-size`, shrink the shard). Qwen3-30B-A3B's shard is 768 at
   `--ep-size 4`, so every chunk is served;
 - DP attention (`--enable-dp-attention`), on any role;
-- a KV cache dtype other than `auto`, `bf16` or `bfloat16`, a page size other than 128, and the features every model
-  refuses ([What a launch refuses](../design/runtime.md#what-a-launch-refuses)).
+- a KV cache dtype other than `auto`, `bf16`, `bfloat16` or `fp8_e4m3`, a page size other than 128, and the features
+  every model refuses ([What a launch refuses](../design/runtime.md#what-a-launch-refuses));
+- under `fp8_e4m3`, a decode bucket whose context the packed K read cannot tile ([FP8 KV cache](#fp8-kv-cache)).

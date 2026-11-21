@@ -289,7 +289,9 @@ one that ends a prompt, so a prefix-cache hit still runs a compiled shape.
 The KV cache is in pages of 128 tokens, in a dtype the model's graphs serve. A launch without `--page-size` gets 128;
 another page size, or a KV dtype the model does not serve, is refused.
 
-- `--kv-cache-dtype fp8_e4m3` for GPT-OSS, which serves no other; `auto`, `bf16` or `bfloat16` for the other models.
+- `--kv-cache-dtype fp8_e4m3` for GPT-OSS, which serves no other; `auto`, `bf16`, `bfloat16` or `fp8_e4m3` for
+  Qwen3-MoE ([FP8 KV cache](../model-recipes/qwen3-moe.md#fp8-kv-cache)); `auto`, `bf16` or `bfloat16` for the other
+  models.
 - `--max-total-tokens` sizes the pool. Without it the pool is sized from the free device memory, and the compiled
   graphs, and so the compile cache, then depend on that reading.
 - **Design:** [KV cache](../design/runtime.md#kv-cache).

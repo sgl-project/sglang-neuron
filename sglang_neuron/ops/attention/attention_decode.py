@@ -223,6 +223,14 @@ def swizzle_packed_k(k: Tensor) -> Tensor:
     return k.reshape(*lead, page // 2, 2, d_head).transpose(-1, -2).contiguous()
 
 
+def scatter_packed_k(k_packed: Tensor, index, values: Tensor, dtype: torch.dtype) -> None:
+    """Write ``values`` at ``index`` of the [..., page, d_head] view of the packed K cache, in place, through ``dtype``
+    (CPU indexing has no fp8 kernels)."""
+    unpacked = unswizzle_packed_k(k_packed).to(dtype)
+    unpacked[index] = values.to(k_packed.dtype).to(dtype)
+    k_packed.copy_(swizzle_packed_k(unpacked.to(k_packed.dtype)))
+
+
 def _torch_attention_decode(X, *, X_hidden_dim_actual, rmsnorm_X_eps, rmsnorm_X_gamma, W_qkv, bias_qkv, cos, sin,
                             active_blocks_table, K_cache, V_cache, attention_mask, sink, softmax_scale,
                             kv_cache_update_idx, k_scale, v_scale, fp8_packed, W_out, bias_out,
