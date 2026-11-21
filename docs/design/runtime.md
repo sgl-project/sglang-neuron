@@ -705,13 +705,14 @@ torch-neuronx's backend hands each traced graph to its compile service and retur
 worker while the caller goes on, and the graph's first execution waits for it. A shape's warm call executes it,
 though, and the program-switch fence before the next shape's execution waits for that execution
 ([The program-switch fence](#the-program-switch-fence)), so a loop of warm calls compiles one graph at a time. The trace
-ahead breaks that chain (`_trace_all`, `sglang_neuron/model_executor/graph_runner.py`): it calls every shape once with
-torch-neuronx's submit (`execute_compiled_graph`) replaced by a no-op and the executor's copy of outputs into inputs
-off, so each call traces, lowers and queues its compile, records its executors in dynamo's cache and their NEFF keys in
-the SPMD check, and runs nothing. Every shape's compile then runs concurrently while the later shapes trace. Each logs
-`[neuron] trace <kind> bucket=<n>`, and `[neuron] traced <n> shapes in <s>s` ends the pass. The warm calls that follow
-hit dynamo's cache, wait for their own compile at their first execution, and run under the fence as before. A runtime
-of one shape, a direct submit, a pipeline stage, CPU mode and `SGLANG_NEURON_SERIAL_WARMUP=1` skip the trace ahead.
+ahead breaks that chain (`_trace_all`, `sglang_neuron/model_executor/graph_runner.py`): it calls every shape once inside
+`device_io.unsubmitted()`, where the plugin's submit wrapper returns before the runtime gets the graph and the executor
+binding cache copies no output into an input, so each call traces, lowers and queues its compile, records its executors
+in dynamo's cache and their NEFF keys in the SPMD check, and runs nothing. Every shape's compile then runs concurrently
+while the later shapes trace. Each logs `[neuron] trace <kind> bucket=<n>`, and `[neuron] traced <n> shapes in <s>s`
+ends the pass. The warm calls that follow hit dynamo's cache, wait for their own compile at their first execution, and
+run under the fence as before. A runtime of one shape, a direct submit (which never reaches the submit wrapper), a
+pipeline stage and CPU mode skip the trace ahead.
 
 Each shape's warm call logs `[neuron] warm <kind> bucket=<n>` (with ` context=<c>` for a decode shape). Its synthetic
 inputs touch only page 0 ([Page 0 and padding](#page-0-and-padding)). The sampled tokens are read back inside the

@@ -37,7 +37,10 @@ from sglang.srt.model_executor.runner.base_runner import BaseRunner
 
 from sglang_neuron import envs
 from sglang_neuron.attention.backend import NeuronForwardMetadata
+from sglang_neuron.backend import device_io, executor_cache, spmd_check, stack
+from sglang_neuron.backend import envs as backend_envs
 from sglang_neuron.model_executor.runtime_init import SCRATCHPAD_PAGE_MB, neuron_device
+from sglang_neuron.parallel.state import tp_barrier, world_barrier
 
 logger = logging.getLogger(__name__)
 
@@ -60,30 +63,6 @@ def _output_tensor(out):
     if isinstance(out, torch.Tensor):
         return out
     return out["token_ids"] if "token_ids" in out else next(iter(out.values()))
-
-
-@contextlib.contextmanager
-def _traced_unsubmitted():
-    """Graph calls inside trace and lower each new shape, which hands its NEFF to torch-neuronx's asynchronous compile
-    and leaves the Executor in dynamo's cache, but submit nothing: the Executor prepares its inputs and allocates its
-    outputs, and neither its device execution nor its copy-back of outputs into inputs runs. The outputs are
-    unwritten."""
-    import torch_neuronx
-    from torch_neuronx.neuron_dynamo_backend.executor import Executor
-
-    submit, writeback = torch_neuronx._C.execute_compiled_graph, Executor._writeback_shadowed_aliases
-
-    def unsubmitted(*args, **kwargs):
-        return None
-
-    # device_io.upload's install check: the uploads enqueued here are awaited by the next real submit
-    unsubmitted._sgn_submit = getattr(submit, "_sgn_submit", False)
-    torch_neuronx._C.execute_compiled_graph = unsubmitted
-    Executor._writeback_shadowed_aliases = lambda self, inputs, tensors: tensors
-    try:
-        yield
-    finally:
-        torch_neuronx._C.execute_compiled_graph, Executor._writeback_shadowed_aliases = submit, writeback
 
 
 def _effective_temperatures(fb) -> Optional[torch.Tensor]:
@@ -725,10 +704,6 @@ class NeuronModelRuntime:
             self._warmup_all()
 
     def _warmup_all(self):
-        from sglang_neuron.backend import envs as backend_envs
-        from sglang_neuron.backend import spmd_check, stack
-        from sglang_neuron.parallel.state import tp_barrier, world_barrier
-
         t0 = time.time()
         shapes = self._warm_shapes()
         if self.sgl_model.segmented_prefill:
@@ -761,23 +736,16 @@ class NeuronModelRuntime:
 
     def _trace_ahead(self, shapes) -> bool:
         """Whether the warm-up traces every shape before it runs any: on a device, for a runtime of several shapes,
-        unless SGLANG_NEURON_SERIAL_WARMUP is set or the runtime submits outside the compiled graph (a direct submit)
-        or across pipeline stages."""
-        from sglang_neuron import env_registry
-        from sglang_neuron.backend import envs as backend_envs
-
+        unless the runtime submits outside the compiled graph (a direct submit) or across pipeline stages."""
         return (len(shapes) > 1 and not backend_envs.SGLANG_NEURON_CPU_MODE
-                and not env_registry.zero_or_one("SGLANG_NEURON_SERIAL_WARMUP")
                 and getattr(self, "direct_submit", None) is None and not getattr(self, "pp_active", False))
 
     def _trace_all(self, shapes, group) -> None:
-        """Trace and lower every shape with nothing submitted (_traced_unsubmitted), so their compiles run
+        """Trace and lower every shape with nothing submitted (device_io.unsubmitted), so their compiles run
         concurrently in torch-neuronx's compile service while the next shapes trace; each shape's NEFF is compared
         across the ranks (spmd_check) as it would be at its first warm call."""
-        from sglang_neuron.backend import spmd_check
-
         t0 = time.time()
-        with _traced_unsubmitted():
+        with device_io.unsubmitted():
             for kind, bucket, context in shapes:
                 logger.info("[neuron] trace %s bucket=%d%s", kind, bucket, f" context={context}" if context else "")
                 with spmd_check.warming(f"{self.graphs}:{kind}:{bucket}:{context}", group, self.tp_size):
@@ -786,15 +754,11 @@ class NeuronModelRuntime:
                     time.time() - t0)
 
     def _warm_each(self, shapes, group) -> None:
-        from sglang_neuron.backend import envs as backend_envs
-        from sglang_neuron.backend import executor_cache, spmd_check, stack
-
         for kind, bucket, context in shapes:
             logger.info("[neuron] warm %s bucket=%d%s", kind, bucket, f" context={context}" if context else "")
             kwargs = self._synthetic_inputs(kind, bucket, context)
-            # torch-neuronx compiles the shape's graph at this call; its executors' NEFFs belong to the shape
-            with stack.compile_scope(self.compiler_args), \
-                    spmd_check.warming(f"{self.graphs}:{kind}:{bucket}:{context}", group, self.tp_size):
+            # a shape the trace ahead skipped compiles at this call; its executors' NEFFs belong to the shape
+            with spmd_check.warming(f"{self.graphs}:{kind}:{bucket}:{context}", group, self.tp_size):
                 # the direct submit's first bind call (the first serving step is its second)
                 direct = getattr(self, "direct_submit", None)
                 slots = ({k: v for k, v in kwargs.items() if k.endswith("_out")}
@@ -805,7 +769,7 @@ class NeuronModelRuntime:
                     executor_cache.arm_writeback()  # the warm call's own record (_check_boundary_in_slots)
                 out = self.compiled(**kwargs) if direct is None else direct.full(self.compiled, kwargs)
                 # the first execution (its NEFF load on torch-neuronx's runtime worker) finishes under the compiler
-                # environment that compiled it, and the scope restores the environment with nothing in flight
+                # environment that compiled it, and _warmup_all's scope restores the environment with nothing in flight
                 _ = _output_tensor(out).cpu()
             written = executor_cache.take_writeback() if armed else None
             if slots:

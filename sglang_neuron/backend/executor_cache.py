@@ -49,7 +49,7 @@ import logging
 import threading
 from typing import Optional
 
-from sglang_neuron.backend import spmd_check, torch_pins
+from sglang_neuron.backend import device_io, spmd_check, torch_pins
 
 logger = logging.getLogger(__name__)
 
@@ -216,7 +216,9 @@ def _validate_copy_back_targets(original):
 
 def _writeback_shadowed_aliases(original):
     def writeback(self, inputs, tensors):
-        pairs = [(tensors[out_idx], inputs[in_idx]) for out_idx, in_idx in self.copy_back_map.items()]
+        if device_io.unsubmitting():
+            return tensors
+        pairs =[(tensors[out_idx], inputs[in_idx]) for out_idx, in_idx in self.copy_back_map.items()]
         last = self.__dict__.get("_sgn_in_place")
         if last is not None and len(last) == len(pairs) and all(
                 r is lr and o is lo for (r, o), (lr, lo) in zip(pairs, last)):

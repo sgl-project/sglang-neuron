@@ -85,8 +85,6 @@ KNOBS: dict = {
     "SGLANG_NEURON_STATE_CKPT_RESERVE_GB": CONFIG,
     # the in-flight bound (backend.device_io), which the giga-kernel decode's result lag takes as its lag
     "SGLANG_NEURON_MAX_INFLIGHT_LAUNCHES": CONFIG,
-    # warm the shapes one at a time, each compiled before the next is traced (graph_runner._warmup_all)
-    "SGLANG_NEURON_SERIAL_WARMUP": CONFIG,
     # no Neuron device: the CPU tests run the torch paths
     "SGLANG_NEURON_CPU_MODE": DEBUG,
     # diagnostics and profiling
