@@ -13,15 +13,11 @@ from nkilib.core.utils.common_types import NormType, QKNormConfig
 from torch import Tensor
 
 from sglang_neuron.backend.stack import wrap_nki
-from sglang_neuron.ops.attention.attention_decode import swizzle_packed_k, unswizzle_packed_k
+from sglang_neuron.ops.attention.attention_decode import scatter_packed_k
 from sglang_neuron.ops.attention.attention_decode_mask import P_MAX
-from sglang_neuron.utils.dtype_utils import FP8_CLAMP_MAX
+from sglang_neuron.utils.dtype_utils import FP8_CLAMP_MAX, fp8_round, is_fp8
 from sglang_neuron.utils.hardware_config import get_logical_nc_config
 from sglang_neuron.utils.neuron_utils import can_run_kernel
-
-
-def is_fp8_cache(cache: Tensor) -> bool:
-    return cache.dtype in (torch.float8_e4m3fn, torch.float8_e5m2)
 
 
 def _qk_norm(q_norm, k_norm, norm_eps):
@@ -30,21 +26,13 @@ def _qk_norm(q_norm, k_norm, norm_eps):
 
 
 @nki.jit
-def _qkv_head_split(hidden, weights, bias, cos, sin, q_norm, k_norm, norm_eps, d_head, num_q_heads, num_kv_heads,
-                    k_cache, v_cache, block_size, slot_mapping):
+def _qkv(hidden, weights, bias, cos, sin, q_norm, k_norm, norm_eps, d_head, num_q_heads, num_kv_heads, k_cache, v_cache,
+         block_size, slot_mapping, fp8_packed=False, k_scale=None, v_scale=None, fp8_max=None, fp8_min=None,
+         kv_dtype=None):
     return qkv_cte(input=hidden, fused_qkv_weights=weights, bias=bias, fused_rope=True, cos_cache=cos, sin_cache=sin,
                    d_head=d_head, num_q_heads=num_q_heads, num_kv_heads=num_kv_heads, k_cache=k_cache, v_cache=v_cache,
-                   use_block_kv=True, head_split_kv_cache=True, block_size=block_size, slot_mapping=slot_mapping,
-                   qk_norm_pre_rope=_qk_norm(q_norm, k_norm, norm_eps))
-
-
-@nki.jit
-def _qkv_fp8_packed(hidden, weights, bias, cos, sin, q_norm, k_norm, norm_eps, d_head, num_q_heads, num_kv_heads,
-                        k_cache, v_cache, block_size, slot_mapping, k_scale, v_scale, fp8_max, fp8_min, kv_dtype):
-    return qkv_cte(input=hidden, fused_qkv_weights=weights, bias=bias, fused_rope=True, cos_cache=cos, sin_cache=sin,
-                   d_head=d_head, num_q_heads=num_q_heads, num_kv_heads=num_kv_heads, k_cache=k_cache, v_cache=v_cache,
-                   use_block_kv=True, fp8_packed=True, k_scale=k_scale, v_scale=v_scale,
-                   fp8_max=fp8_max, fp8_min=fp8_min, kv_dtype=kv_dtype, block_size=block_size,
+                   use_block_kv=True, head_split_kv_cache=not fp8_packed, fp8_packed=fp8_packed, k_scale=k_scale,
+                   v_scale=v_scale, fp8_max=fp8_max, fp8_min=fp8_min, kv_dtype=kv_dtype, block_size=block_size,
                    slot_mapping=slot_mapping, qk_norm_pre_rope=_qk_norm(q_norm, k_norm, norm_eps))
 
 
@@ -59,16 +47,14 @@ def qkv_paged(hidden: Tensor, *, weights: Tensor, bias: Tensor | None, cos: Tens
     args = dict(weights=weights, bias=bias, cos=cos, sin=sin, q_norm=q_norm, k_norm=k_norm, norm_eps=norm_eps,
                 d_head=d_head, num_q_heads=num_q_heads, num_kv_heads=num_kv_heads, k_cache=k_cache, v_cache=v_cache,
                 block_size=block_size, slot_mapping=slot_mapping)
-    fp8 = is_fp8_cache(v_cache)
     if not can_run_kernel(hidden):
         return _torch_qkv_paged(hidden, **args)
-    if not fp8:
-        return wrap_nki(_qkv_head_split)[get_logical_nc_config()](hidden, **args)
-    # the kernel loads its scales as [P_MAX, 1] and recognizes FP8 by the NKI dtype
-    unit = torch.ones((P_MAX, 1), dtype=torch.float32, device=hidden.device)
-    return wrap_nki(_qkv_fp8_packed)[get_logical_nc_config()](
-        hidden, k_scale=unit, v_scale=unit, fp8_max=FP8_CLAMP_MAX, fp8_min=-FP8_CLAMP_MAX,
-        kv_dtype=nl.float8_e4m3fn, **args)
+    if is_fp8(v_cache):
+        # the kernel loads its scales as [P_MAX, 1] and recognizes FP8 by the NKI dtype
+        unit = torch.ones((P_MAX, 1), dtype=torch.float32, device=hidden.device)
+        args.update(fp8_packed=True, k_scale=unit, v_scale=unit, fp8_max=FP8_CLAMP_MAX, fp8_min=-FP8_CLAMP_MAX,
+                    kv_dtype=nl.float8_e4m3fn)
+    return wrap_nki(_qkv)[get_logical_nc_config()](hidden, **args)
 
 
 def _rms(x: Tensor, gamma: Tensor, eps: float) -> Tensor:
@@ -94,16 +80,13 @@ def _torch_qkv_paged(hidden, *, weights, bias, cos, sin, q_norm, k_norm, norm_ep
     q, k = rope(q), rope(k)
     slots = slot_mapping.reshape(-1).to(torch.int64)
     index = (slots // block_size, slice(None), slots % block_size)
-    if not is_fp8_cache(v_cache):
+    if not is_fp8(v_cache):
         k_cache[index] = k.to(k_cache.dtype)
         v_cache[index] = v.to(v_cache.dtype)
         return q.reshape(1, tokens, -1), k_cache, v_cache
-    k, v = k.float().clamp(-FP8_CLAMP_MAX, FP8_CLAMP_MAX), v.float().clamp(-FP8_CLAMP_MAX, FP8_CLAMP_MAX)
+    scatter_packed_k(k_cache, index, fp8_round(k, k_cache.dtype, hidden.dtype), hidden.dtype)
     # through the compute dtype: CPU indexing has no fp8 kernels
-    unpacked = unswizzle_packed_k(k_cache).to(hidden.dtype)
-    unpacked[index] = k.to(k_cache.dtype).to(hidden.dtype)
-    k_cache.copy_(swizzle_packed_k(unpacked.to(k_cache.dtype)))
     values = v_cache.to(hidden.dtype)
-    values[index] = v.to(v_cache.dtype).to(hidden.dtype)
+    values[index] = fp8_round(v, v_cache.dtype, hidden.dtype)
     v_cache.copy_(values.to(v_cache.dtype))
     return q.reshape(1, tokens, -1), k_cache, v_cache

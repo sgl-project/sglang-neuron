@@ -10,7 +10,7 @@ from nkilib.core.utils.common_types import DtypeMode
 from torch import Tensor
 
 from sglang_neuron.backend.stack import wrap_nki
-from sglang_neuron.ops.attention.attention_decode import swizzle_packed_k, unswizzle_packed_k
+from sglang_neuron.ops.attention.attention_decode import scatter_packed_k
 from sglang_neuron.ops.attention.attention_decode_mask import P_MAX
 from sglang_neuron.utils.dtype_utils import FP8_CLAMP_MAX
 from sglang_neuron.utils.hardware_config import get_logical_nc_config
@@ -77,9 +77,6 @@ def _torch_qkv(hidden, qkv_weights, bias, d_head, cos_cache, sin_cache, num_q_he
         torch.arange(num_kv_heads, device=k_cache.device).repeat(tokens),
         (slots % block_size).repeat_interleave(num_kv_heads),
     )
-    # through the compute dtype: CPU indexing has no fp8 kernels
-    unpacked = unswizzle_packed_k(k_cache).to(hidden.dtype)
-    unpacked.index_put_(index, k.reshape(tokens * num_kv_heads, d_head).to(k_cache.dtype).to(hidden.dtype))
-    k_cache.copy_(swizzle_packed_k(unpacked.to(k_cache.dtype)))
+    scatter_packed_k(k_cache, index, k.reshape(tokens * num_kv_heads, d_head), hidden.dtype)
     v_cache.index_put_(index, v.reshape(tokens * num_kv_heads, d_head).to(v_cache.dtype))
     return q, k_cache, v_cache

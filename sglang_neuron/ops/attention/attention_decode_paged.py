@@ -23,13 +23,9 @@ from sglang_neuron.backend.stack import wrap_nki
 from sglang_neuron.ops.attention.attention_decode import (packed_fp8_viable_for_bucket, swizzle_packed_k,
                                                           unswizzle_packed_k)
 from sglang_neuron.ops.attention.attention_decode_mask import P_MAX
-from sglang_neuron.utils.dtype_utils import FP8_CLAMP_MAX
+from sglang_neuron.utils.dtype_utils import fp8_round, is_fp8
 from sglang_neuron.utils.hardware_config import get_logical_nc_config
 from sglang_neuron.utils.neuron_utils import can_run_kernel
-
-
-def _is_fp8(cache: Tensor) -> bool:
-    return cache.dtype in (torch.float8_e4m3fn, torch.float8_e5m2)
 
 
 @dataclass
@@ -134,10 +130,9 @@ def attention_decode_paged(x: Tensor, *, w_qkv: Tensor, bias_qkv: Tensor | None,
                 active_blocks_table=inputs.table, K_cache=k_cache, V_cache=v_cache,
                 attention_mask=inputs.active_mask, kv_cache_update_idx=inputs.update_idx, pos_ids=inputs.pos_ids,
                 max_context_len=inputs.max_context, softmax_scale=softmax_scale, W_out=w_out)
-    fp8 = _is_fp8(v_cache)
     if not can_run_kernel(x):
         return _torch_attention_decode_paged(x, **args)
-    if fp8:
+    if is_fp8(v_cache):
         rows, page = x.shape[0], v_cache.shape[2]
         s_prior = inputs.table.shape[-1] * page
         if not packed_fp8_viable_for_bucket(block_len=page, bs=rows, q_head=w_out.shape[0] // v_cache.shape[-1],
@@ -162,7 +157,7 @@ def _torch_attention_decode_paged(x, *, W_qkv, bias_qkv, q_norm, k_norm, norm_ep
     """The kernel's result by plain attention over every block the table lists, keys masked by position. Static shapes
     and no ``.item()``, so it traces."""
     del attention_mask, max_context_len  # the reference masks by position over every listed block
-    if not _is_fp8(V_cache):
+    if not is_fp8(V_cache):
         return _torch_decode(x, W_qkv, bias_qkv, q_norm, k_norm, norm_eps, cos, sin, active_blocks_table, K_cache,
                              V_cache, kv_cache_update_idx, pos_ids, softmax_scale, W_out)
     # through the compute dtype (CPU indexing has no fp8 kernels); the new token's K/V round-trip through FP8 on write
@@ -196,8 +191,7 @@ def _torch_decode(x, W_qkv, bias_qkv, q_norm, k_norm, norm_eps, cos, sin, active
 
     q, k = rope(q), rope(k)
     if fp8 is not None:
-        k = k.float().clamp(-FP8_CLAMP_MAX, FP8_CLAMP_MAX).to(fp8).to(x.dtype)
-        v = v.float().clamp(-FP8_CLAMP_MAX, FP8_CLAMP_MAX).to(fp8).to(x.dtype)
+        k, v = fp8_round(k, fp8, x.dtype), fp8_round(v, fp8, x.dtype)
     table = active_blocks_table.long()                                         # [B, kv, blocks]
     blocks = table.shape[-1]
     keys = K_cache.reshape(pages * kv_heads, page, d)[table.clamp(min=0)]      # [B, kv, blocks, page, d]
