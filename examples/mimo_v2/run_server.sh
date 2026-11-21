@@ -20,6 +20,9 @@ CONTEXT=${CONTEXT:-262144}
 # the segmented prefill tiles go up to 8192 tokens (utils/bucket_utils.SUPPORTED_KV_SEGMENT_SIZES)
 CHUNK=${CHUNK:-8192}
 MAX_RUNNING=${MAX_RUNNING:-16}
+# the expert parallelism: 64 holds 4 whole experts a rank; 16 holds 16 experts a rank, each a quarter of its intermediate
+# rows (the experts' load then sums over 16 of them, which evens the ranks' MoE time)
+EP_SIZE=${EP_SIZE:-64}
 # the weights and the KV pools' share of each core's HBM; the rest holds the graphs and their DMA rings. Under DCP the
 # prefill graphs' rings take more: at 0.85 a DCP server cannot load its prefill graphs ("Failed to allocate DEVICE
 # memory" for the spill rings), at 0.75 it loads all four (8K chunk) and a rank's 1/D share of the KV still fits
@@ -63,7 +66,7 @@ if [ -n "${MAX_TOTAL_TOKENS:-}" ]; then
 fi
 
 exec python3 -m sglang.launch_server --model-path "$MODEL_PATH" --served-model-name "$SERVED_NAME" \
-    --trust-remote-code --tp-size 64 --ep-size 64 \
+    --trust-remote-code --tp-size 64 --ep-size "$EP_SIZE" \
     --context-length "$CONTEXT" --chunked-prefill-size "$CHUNK" --max-running-requests "$MAX_RUNNING" \
     --mem-fraction-static "$MEM_FRACTION" --swa-full-tokens-ratio "$SWA_RATIO" \
     --reasoning-parser mimo --tool-call-parser mimo \

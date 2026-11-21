@@ -16,6 +16,7 @@ def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--tokens", type=int, default=1024)
     parser.add_argument("--padding", type=int, default=77)
+    parser.add_argument("--local-experts", type=int, default=4, help="a rank's experts: 4 at EP64, 16 at EP16")
     args = parser.parse_args()
     from sglang_neuron.process_init import init_stack
 
@@ -32,7 +33,7 @@ def main() -> int:
     from sglang_neuron.utils.hardware_config import get_logical_nc_config
 
     g = torch.Generator().manual_seed(11)
-    T, H, EA, E, K, ep_rank = args.tokens, 4096, 256, 4, 8, 5
+    T, H, EA, E, K, ep_rank = args.tokens, 4096, 256, args.local_experts, 8, 5
     n_real = T - args.padding  # the chunk's padding: its last real position repeated
     hn = torch.randn(T, H, generator=g).to(torch.bfloat16)
     w = (torch.randn(EA, H, generator=g) * H ** -0.5).to(torch.bfloat16)

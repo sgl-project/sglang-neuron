@@ -451,20 +451,23 @@ def prefill_route(hn, router_wT, expert_bias, ep_rank, positions, top_k=8, route
             for e in range(E):
                 nisa.tensor_scalar(dst=oh[0:P, e * P:(e + 1) * P], data=io[0:P, 0:P], op0=nl.equal,
                                    operand0=jj[0:P, e:e + 1])
-            # v[e, j] = 1 + the row whose place is j, 0 for an empty place; and the tile's counts
-            v = nl.ndarray((1, E * P), dtype=nl.float32, buffer=nl.psum)
-            nisa.nc_matmul(dst=v[0:1, 0:E * P], stationary=pp1[0:P, 0:1], moving=oh[0:P, 0:E * P])
+            # v[e, j] = 1 + the row whose place is j, 0 for an empty place, four experts a matmul (a moving tile is at
+            # most 512 wide); then the token id (t0 + row) at a filled place, -1 at an empty one
+            val_i = nl.ndarray((1, E * P), dtype=nl.int32, buffer=nl.sbuf)
+            for g0 in range(0, E, 4):
+                w = min(4, E - g0) * P
+                c0 = g0 * P
+                v = nl.ndarray((1, 4 * P), dtype=nl.float32, buffer=nl.psum)
+                nisa.nc_matmul(dst=v[0:1, 0:w], stationary=pp1[0:P, 0:1], moving=oh[0:P, c0:c0 + w])
+                mk = nl.ndarray((1, 4 * P), dtype=nl.float32, buffer=nl.sbuf)
+                nisa.tensor_scalar(dst=mk[0:1, 0:w], data=v[0:1, 0:w], op0=nl.greater, operand0=0.5,
+                                   op1=nl.multiply, operand1=t0f[0:1, 0:1])
+                val = nl.ndarray((1, 4 * P), dtype=nl.float32, buffer=nl.sbuf)
+                nisa.tensor_tensor(dst=val[0:1, 0:w], data1=mk[0:1, 0:w], data2=v[0:1, 0:w], op=nl.add)
+                nisa.tensor_scalar(dst=val[0:1, 0:w], data=val[0:1, 0:w], op0=nl.add, operand0=-1.0)
+                nisa.tensor_copy(dst=val_i[0:1, c0:c0 + w], src=val[0:1, 0:w])
             cnt = nl.ndarray((1, E), dtype=nl.float32, buffer=nl.psum)
             nisa.nc_matmul(dst=cnt[0:1, 0:E], stationary=ones[0:P, 0:1], moving=st_b[0:P, 0:E])
-            # the token id (t0 + row) at a filled place, -1 at an empty one
-            mk = nl.ndarray((1, E * P), dtype=nl.float32, buffer=nl.sbuf)
-            nisa.tensor_scalar(dst=mk[0:1, 0:E * P], data=v[0:1, 0:E * P], op0=nl.greater, operand0=0.5,
-                               op1=nl.multiply, operand1=t0f[0:1, 0:1])
-            val = nl.ndarray((1, E * P), dtype=nl.float32, buffer=nl.sbuf)
-            nisa.tensor_tensor(dst=val[0:1, 0:E * P], data1=mk[0:1, 0:E * P], data2=v[0:1, 0:E * P], op=nl.add)
-            nisa.tensor_scalar(dst=val[0:1, 0:E * P], data=val[0:1, 0:E * P], op0=nl.add, operand0=-1.0)
-            val_i = nl.ndarray((1, E * P), dtype=nl.int32, buffer=nl.sbuf)
-            nisa.tensor_copy(dst=val_i[0:1, 0:E * P], src=val[0:1, 0:E * P])
             w_i = nl.ndarray((1, E), dtype=nl.int32, buffer=nl.sbuf)
             nisa.tensor_copy(dst=w_i[0:1, 0:E], src=before[0:1, 0:E])
             for e in range(E):
