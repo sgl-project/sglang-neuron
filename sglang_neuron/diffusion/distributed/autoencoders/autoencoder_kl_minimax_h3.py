@@ -471,6 +471,9 @@ class DistributedAutoencoderKLMiniMaxH3(NeuronAutoencoderKLMiniMaxH3):
     # Optional: maps a ``(B, C, t, H, W)`` slice of the decoded video to ``(B, t, H, W, C)``
     # frames on the device; ``decode`` then returns the frames.
     frame_fn = None
+    # Change 9 on (True) or rank 0's host stitch (False). A small group (one device, 4 ranks)
+    # holds ~10 columns per rank, and the device merge's graphs then exceed a core's HBM.
+    merge_on_device = True
 
     def init_distributed(
         self,
@@ -575,7 +578,7 @@ class DistributedAutoencoderKLMiniMaxH3(NeuronAutoencoderKLMiniMaxH3):
     ) -> torch.Tensor | None:
         executor = self.distributed_executor
         num_chunks, num_rows, num_columns = grid_spec.grid_shape
-        if isinstance(executor, _MiniMaxH3VaeExecutor):
+        if isinstance(executor, _MiniMaxH3VaeExecutor) and self.merge_on_device:
             layout = executor.column_layout(num_chunks, num_columns)
             return self._merge_on_device(local_tile_tensor, grid_spec, layout)
         tiles = executor.gather_tiles(local_tile_tensor, meta_gather, grid_spec, tid_coord_map)

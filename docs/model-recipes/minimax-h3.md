@@ -172,6 +172,35 @@ docker run --rm --init --ipc=host --cap-add SYS_NICE \
       --num-gpus 64 --tp-size 8 --warmup-mode request --host 0.0.0.0 --port 30000
 ```
 
+## One trn2 device (trn2.3xlarge)
+
+The same pipeline runs on one trn2 device, TP4 on its 4 logical NeuronCores (LNC=2), with
+`--num-gpus 4 --tp-size 4` and the options in `examples/minimax_h3/single_device.json`. On one
+device the DiT (15.7 GB per rank with its AdaLN projections), the conditioner (12.9 GB per rank)
+and the replicated video decoder (4.9 GB) do not fit in a core's 24 GB together, so these options
+move weights through the host instead of keeping every component resident. Each is off by
+default; the 64-core launch above uses none of them.
+
+| Option | What it does |
+|---|---|
+| `adaln_on_host` | The 50 blocks' AdaLN projections (6.5 GB per rank) stay on the host; `block_modulations` runs there and is all-gathered over the TP and CP gloo groups. |
+| `compile_per_block` | The DiT as a prologue, one graph per block (all 50 share one NEFF) and an epilogue, instead of one whole-model graph. |
+| `rope_by_matmul` | The partial rotate-half RoPE as `x * cos' + (x @ R) * sin'`, bit-exact, instead of strided slices and concatenations. One device only: at TP8 x CP8 it makes the denoise slower. |
+| `attention_heads_per_call` | Without CP, attention over this many heads per kernel launch instead of all 14. |
+| `text_encoder_stream_layers` | The conditioner's 50 blocks stay on the host and pass through the device this many at a time, the next chunk copied while the current one runs. |
+| `vae_swap_dit_blocks` | The video VAE stays on the host and swaps in for the decode (and fl2va's keyframe encode) while this many DiT blocks step out. Set it to 50, the whole block stack. The denoise then keeps one step in flight, and rank 0 stitches the decoded tiles on the host. |
+| `vae_fused_vit` | The video decoder's 36 ViT blocks on fused NKI kernels (qkv_cte with QK RMSNorm and RoPE, attention_cte, output_projection_cte, the MLP kernel). |
+| `host_weights_dir` | The host copies as memory-mapped files in this directory, so the kernel drops and re-reads their pages under memory pressure instead of swapping them. Point it at a local instance-store mount (about 56 GB). |
+
+```bash
+sglang serve --model-type diffusion --model-path /models/MiniMax-H3 \
+  --num-gpus 4 --tp-size 4 --pipeline-config-path /path/to/single_device.json \
+  --warmup-mode request --host 0.0.0.0 --port 30000
+```
+
+The trn2.3xlarge has 124 GB of host memory: give it a swap file (64 GB) and, for
+`host_weights_dir`, mount its instance store.
+
 ## Compiled shapes
 
 The DiT's packed sequence holds the text, keyframe, video and audio rows, so the first request at

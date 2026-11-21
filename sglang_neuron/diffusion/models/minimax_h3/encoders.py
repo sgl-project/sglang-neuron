@@ -549,14 +549,43 @@ class NeuronQwen3VLDecoderLayer(nn.Module):
         return self.mlp(normed), residual
 
 
+class _Probed(nn.Module):
+    """``layer``'s outputs plus one element of the first, for the host to read back (see
+    ``NeuronQwen3VLTextModel.forward_streamed``)."""
+
+    def __init__(self, layer: nn.Module):
+        super().__init__()
+        self.layer = layer
+
+    def forward(self, *args):
+        hidden_states, residual = self.layer(*args)
+        return hidden_states, residual, hidden_states.reshape(-1)[:1] * 1
+
+
+#: stream_layers: streamed layers launched before the oldest one's probe is read back. A chunk's
+#: weights are released only after its launches retire, so this bounds the device copies held.
+_MAX_LAYERS_IN_FLIGHT = 4
+
+
 class NeuronQwen3VLTextModel(nn.Module):
     """The vocab-sharded embedding and the first ``num_layers`` Qwen3-VL text blocks, with no
-    final norm."""
+    final norm.
 
-    def __init__(self, config, num_layers: int, dtype=torch.bfloat16, tp_group=None):
+    ``stream_layers > 0`` (one device, where the 50 blocks' shards do not fit next to the DiT):
+    the blocks' weights stay on the host and pass through the device ``stream_layers`` blocks
+    at a time, the next chunk copied in while the current one runs. Each block then runs as its
+    own graph; the blocks are identical, so they share one NEFF."""
+
+    def __init__(
+        self, config, num_layers: int, dtype=torch.bfloat16, tp_group=None, stream_layers: int = 0
+    ):
         super().__init__()
         tp_size, _ = _tp_size_rank(tp_group)
         self._tp_size = tp_size
+        self.stream_layers = stream_layers
+        self._host_weights: list[dict[str, torch.Tensor]] | None = None
+        self._compiled_layers = None
+        self._compiled_embed = None
         if tp_size > 1:
             self.embed_tokens = VocabDimShardedEmbedding(
                 config.vocab_size, config.hidden_size, dtype=dtype, tp_group=tp_group
@@ -605,6 +634,16 @@ class NeuronQwen3VLTextModel(nn.Module):
         ``encoder_positions`` ``[1, rows]`` int32, its rows' sequence positions. Returns
         ``[T, hidden]``.
         """
+        hidden_states, deepstack = self.embed(input_ids, rank, encoder_embeds, encoder_positions)
+        residual = None
+        for layer_idx, layer in enumerate(self.layers):
+            hidden_states, residual = layer(hidden_states, residual, cos, sin)
+            hidden_states = self._add_deepstack(hidden_states, deepstack, layer_idx)
+        return hidden_states + residual
+
+    def embed(self, input_ids, rank, encoder_embeds=None, encoder_positions=None):
+        """The token embedding and, with a keyframe, the vision splice: the hidden states and
+        the DeepStack slices the blocks add."""
         if self._tp_size > 1:
             hidden_states = self.embed_tokens(input_ids, scatter_tokens=False, rank=rank)
         else:
@@ -630,19 +669,100 @@ class NeuronQwen3VLTextModel(nn.Module):
                 encoder_slot_mapping,
                 rank=torch.zeros_like(rank),
             )
+        return hidden_states, deepstack
 
+    def _add_deepstack(self, hidden_states, deepstack, layer_idx):
+        # Deepstack slice i is added after block i. HF's hidden_states[k] is block k - 1's
+        # output before its own deepstack add, so the last block built here gets none.
+        if (
+            deepstack is not None
+            and layer_idx < deepstack.shape[0]
+            and layer_idx < len(self.layers) - 1
+        ):
+            hidden_states = hidden_states + deepstack[layer_idx]
+        return hidden_states
+
+    def keep_layers_on_host(self, directory: str | None = None, key: str = "") -> None:
+        """``stream_layers``: take the blocks' weights as the host copy they stream from.
+
+        With ``directory`` (a local disk) the copy is a file there, memory-mapped read-only, so
+        the kernel can drop and re-read its pages instead of swapping them (see
+        ``host_weights.to_mapped``)."""
+        weights = [
+            {name: param.data for name, param in layer.named_parameters()} for layer in self.layers
+        ]
+        if directory:
+            from sglang_neuron.diffusion.models.minimax_h3.host_weights import to_mapped
+
+            flat = {(i, name): t for i, layer in enumerate(weights) for name, t in layer.items()}
+            mapped = to_mapped(flat, key, directory)
+            weights = [
+                {name: mapped[(i, name)] for name in layer} for i, layer in enumerate(weights)
+            ]
+        self._host_weights = weights
+        for index in range(len(self.layers)):
+            self._place(index, None)
+
+    def _place(self, index: int, device) -> None:
+        """Point block ``index`` at device copies of its weights, or back at the host copy."""
+        layer = self.layers[index]
+        for name, host in self._host_weights[index].items():
+            module_name, _, attr = name.rpartition(".")
+            owner = layer.get_submodule(module_name) if module_name else layer
+            value = host if device is None else host.to(device)
+            owner._parameters[attr] = nn.Parameter(value, requires_grad=False)
+
+    def compile_streamed(self, *args, **kwargs) -> None:
+        """``stream_layers``: the embedding and each block as their own graphs (one NEFF for all
+        the blocks)."""
+        import torch._dynamo.config as dynamo_config
+
+        dynamo_config.recompile_limit = max(dynamo_config.recompile_limit, 4 * len(self.layers))
+        self._compiled_embed = torch.compile(self.embed, *args, **kwargs)
+        self._compiled_layers = [
+            torch.compile(_Probed(layer), *args, **kwargs) for layer in self.layers
+        ]
+
+    def forward_streamed(
+        self, device, input_ids, cos, sin, rank, encoder_embeds=None, encoder_positions=None
+    ) -> torch.Tensor:
+        """``forward``, with the blocks' weights streamed through ``device`` (``stream_layers``)."""
+        embed = self._compiled_embed or self.embed
+        layers = self._compiled_layers or [_Probed(layer) for layer in self.layers]
+        hidden_states, deepstack = embed(input_ids, rank, encoder_embeds, encoder_positions)
+        n = self.stream_layers
+        chunks = [
+            range(start, min(start + n, len(self.layers)))
+            for start in range(0, len(self.layers), n)
+        ]
+        for index in chunks[0]:
+            self._place(index, device)
         residual = None
-        for layer_idx, layer in enumerate(self.layers):
-            hidden_states, residual = layer(hidden_states, residual, cos, sin)
-            # Deepstack slice i is added after block i. HF's hidden_states[k] is block k - 1's
-            # output before its own deepstack add, so the last block built here gets none.
-            if (
-                deepstack is not None
-                and layer_idx < deepstack.shape[0]
-                and layer_idx < len(self.layers) - 1
-            ):
-                hidden_states = hidden_states + deepstack[layer_idx]
-        return hidden_states + residual
+        for position, chunk in enumerate(chunks):
+            pending = []
+            for index in chunk:
+                hidden_states, residual, probe = layers[index](hidden_states, residual, cos, sin)
+                hidden_states = self._add_deepstack(hidden_states, deepstack, index)
+                pending.append(probe)
+                if index == chunk[0] and position + 1 < len(chunks):
+                    # Copy the next chunk in while this one runs.
+                    for upcoming in chunks[position + 1]:
+                        self._place(upcoming, device)
+                while len(pending) > _MAX_LAYERS_IN_FLIGHT:
+                    pending.pop(0).cpu()
+            # A launch must be retired before the weights it reads are released.
+            for probe in pending:
+                probe.cpu()
+            for index in chunk:
+                self._place(index, None)
+        out = hidden_states + residual
+        # The streamed chunks' device copies are freed, but the caching allocator keeps them;
+        # empty it so the DiT that runs next gets that HBM back, unfragmented.
+        from sglang_neuron.diffusion.models.minimax_h3.host_weights import release_device_cache
+
+        out.reshape(-1)[:1].cpu()
+        release_device_cache()
+        return out
 
 
 class NeuronQwen3VLTextEncoder(nn.Module):
@@ -661,10 +781,21 @@ class NeuronQwen3VLTextEncoder(nn.Module):
     get_rope_index = Qwen3VLModel.get_rope_index
     get_vision_position_ids = Qwen3VLModel.get_vision_position_ids
 
-    def __init__(self, model_path: str, dtype: torch.dtype = torch.bfloat16, tp_group=None):
+    def __init__(
+        self,
+        model_path: str,
+        dtype: torch.dtype = torch.bfloat16,
+        tp_group=None,
+        stream_layers: int = 0,
+        host_weights_dir: str | None = None,
+    ):
         super().__init__()
         self._compiled = None
         self._compiled_visual = None
+        # stream_layers (see NeuronQwen3VLTextModel): where the streamed blocks run; the module
+        # itself stays on the host. host_weights_dir: file-backed host copy (see host_weights).
+        self._stream_device = None
+        self._host_weights_dir = host_weights_dir
         self._dtype = dtype
         self._tp_group = tp_group
         self._tp_size, self._tp_rank = _tp_size_rank(tp_group)
@@ -683,7 +814,11 @@ class NeuronQwen3VLTextEncoder(nn.Module):
             self.config.vision_config, dtype=torch.float32, tp_group=tp_group
         )
         self.language_model = NeuronQwen3VLTextModel(
-            tc, self.num_conditioning_layers, dtype=dtype, tp_group=tp_group
+            tc,
+            self.num_conditioning_layers,
+            dtype=dtype,
+            tp_group=tp_group,
+            stream_layers=stream_layers,
         )
 
     def load_weights(self, model_path: str):
@@ -700,6 +835,27 @@ class NeuronQwen3VLTextEncoder(nn.Module):
             self._tp_rank,
             self._tp_size,
         )
+        if self.language_model.stream_layers:
+            key = f"minimax_h3_te_{os.path.basename(os.path.abspath(model_path))}"
+            self.language_model.keep_layers_on_host(
+                self._host_weights_dir, f"{key}_r{self._tp_rank}of{self._tp_size}"
+            )
+
+    def to(self, *args, **kwargs):
+        """``nn.Module.to``; with ``stream_layers`` the blocks stay on the host (only their
+        destination is recorded) and the embedding and vision tower move."""
+        if not self.language_model.stream_layers:
+            return super().to(*args, **kwargs)
+        device = torch._C._nn._parse_to(*args, **kwargs)[0]
+        if device is not None and device.type != "cpu":
+            self._stream_device = device
+        layers = self.language_model.layers
+        del self.language_model._modules["layers"]
+        try:
+            super().to(*args, **kwargs)
+        finally:
+            self.language_model._modules["layers"] = layers
+        return self
 
     @property
     def dtype(self):
@@ -739,10 +895,13 @@ class NeuronQwen3VLTextEncoder(nn.Module):
         Static shapes: each text bucket, and each keyframe resolution, is a graph of its own.
         """
         kwargs.setdefault("dynamic", False)
+        self._compiled_visual = torch.compile(self.visual.forward, *args, **kwargs)
+        if self.language_model.stream_layers:
+            self.language_model.compile_streamed(*args, **kwargs)
+            return
         # Bound methods, not the modules: a compiled module assigned here would register as a
         # submodule and duplicate its weights in state_dict.
         self._compiled = torch.compile(self.language_model.forward, *args, **kwargs)
-        self._compiled_visual = torch.compile(self.visual.forward, *args, **kwargs)
 
     def forward(
         self,
@@ -777,7 +936,7 @@ class NeuronQwen3VLTextEncoder(nn.Module):
         T = int(attention_mask.sum())
         if not attention_mask[0, :T].all():
             raise ValueError("input_ids must be right-padded")
-        device = next(self.parameters()).device
+        device = self._stream_device or next(self.visual.parameters()).device
         if (input_ids == self.config.video_token_id).any():
             raise NotImplementedError("video vision blocks are not supported")
         image_rows = input_ids[0] == self.config.image_token_id
@@ -802,8 +961,10 @@ class NeuronQwen3VLTextEncoder(nn.Module):
         )
 
         rank = torch.tensor([self._tp_rank], dtype=torch.long, device=device)
-        fn = self._compiled if self._compiled is not None else self.language_model
-        hidden_states = fn(
-            input_ids[0].to(device), cos[0].to(device), sin[0].to(device), rank, *vision
-        )
+        inputs = (input_ids[0].to(device), cos[0].to(device), sin[0].to(device), rank, *vision)
+        if self.language_model.stream_layers:
+            hidden_states = self.language_model.forward_streamed(device, *inputs)
+        else:
+            fn = self._compiled if self._compiled is not None else self.language_model
+            hidden_states = fn(*inputs)
         return _TextEncoderOutput(hidden_states[None, :T])

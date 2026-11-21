@@ -3,13 +3,24 @@
 
 TP on raw ``nn.Parameter`` with the shared loaders and NKI kernels. The block stack runs on each
 rank's CP slice of the packed sequence, 1/TP of it per rank under ``tp_sequence_parallel``.
+
+Single-device options (TP4, CP1 on one trn2 device), all off by default:
+
+* ``rope_by_matmul``: the partial rotate-half RoPE as ``x * cos' + (x @ R) * sin'``, bit-exact,
+  instead of strided slices and concatenations.
+* ``attention_heads_per_call``: at CP1, attention over that many heads per kernel launch.
+* ``compile_per_block``: the DiT as a prologue, one shared block graph and an epilogue.
+* ``adaln_on_host``: the blocks' AdaLN projections stay on the host; ``block_modulations`` runs
+  there.
 """
 
+import copy
 import logging
 import math
 from dataclasses import dataclass
 
 import torch
+import torch.distributed as dist
 import torch.nn as nn
 import torch.nn.functional as F
 from diffusers.models.embeddings import TimestepEmbedding, Timesteps
@@ -90,6 +101,23 @@ class MiniMaxH3Config:
     tp_sequence_parallel: bool = True
     # Reuse a schedule's block_modulations across requests (NeuronMiniMaxH3Model.denoise).
     adaln_cache: bool = True
+    # One device (TP4, CP1): the 50 blocks' AdaLN projections (13B parameters, 6.5 GB per rank at
+    # TP4) stay on the host, and block_modulations runs there; the DiT never holds them in HBM.
+    adaln_on_host: bool = False
+    # One device: the DiT runs as a prologue, one graph per transformer block and an epilogue.
+    # The blocks are identical, so they share one NEFF, and the whole-model graph's working set
+    # (which does not fit one device at 768p) is never built.
+    compile_per_block: bool = False
+    # Partial rotate-half RoPE as one full-head-width expression, x * cos' + (x @ R) * sin', with R
+    # the signed rotate-half permutation of the rotary channels and cos'/sin' padded with 1/0.
+    # Bit-exact against the slice/cat form; the compiler lowers it as a [*, D] x [D, D] matmul and
+    # two elementwise ops instead of strided slices and concatenations, which at 768p on one device
+    # are ~145K tiny DMAs and ~170 ms of each block. Single device (TP=4, CP=1) only: at TP8 x CP8
+    # each core holds 1/16 of those rows x heads and the extra matmul makes denoise 55 % slower.
+    rope_by_matmul: bool = False
+    # CP=1: attention over this many heads per kernel launch instead of all of them (0 = all). The
+    # kernel is Scalar/Vector-bound at 37K rows; smaller launches throttle less.
+    attention_heads_per_call: int = 0
 
     def __post_init__(self):
         assert 2 * MINIMAX_H3_MODALITY_NUM * self.rope_freq_dim <= self.attention_head_dim
@@ -140,6 +168,37 @@ class MiniMaxH3SwiGLU(nn.Module):
         )
         out = out[:num_rows].reshape(*shape[:-1], out.shape[-1])
         return sp_exit(out, self.tp_group, self.tp_size, sp_lengths is not None)
+
+
+#: Rows per RoPE matmul: one flat (rows, D) x (D, D) over every head (530K rows at TP4) overflows
+#: an access-pattern count in the backend (NCC_IBTN021).
+_ROPE_CHUNK_ROWS = 32768
+
+
+def _rope_rotate_matrix(head_dim: int, rotary_dim: int) -> torch.Tensor:
+    """``R`` with ``x @ R`` = rotate-half of ``x``'s first ``rotary_dim`` channels, 0 elsewhere."""
+    half = rotary_dim // 2
+    mat = torch.zeros(head_dim, head_dim)
+    index = torch.arange(half)
+    mat[index + half, index] = -1.0  # out[i]        = -x[i + half]
+    mat[index, index + half] = 1.0  # out[i + half] =  x[i]
+    return mat
+
+
+def _rope_by_matmul(hidden_states, cos, sin, rotate):
+    """``_apply_rotary_emb`` for ``[..., S, N, D]``, with ``cos``/``sin`` ``(S, rotary_dim)``."""
+    head_dim = hidden_states.shape[-1]
+    pad = head_dim - cos.shape[-1]
+    dtype = hidden_states.dtype
+    cos = torch.cat([cos, cos.new_ones(cos.shape[0], pad)], dim=-1).to(dtype)[:, None, :]
+    sin = torch.cat([sin, sin.new_zeros(sin.shape[0], pad)], dim=-1).to(dtype)[:, None, :]
+    flat = hidden_states.reshape(-1, head_dim)
+    rotate = rotate.to(dtype)
+    rotated = torch.cat(
+        [torch.matmul(piece, rotate) for piece in torch.split(flat, _ROPE_CHUNK_ROWS, dim=0)],
+        dim=0,
+    ).reshape(hidden_states.shape)
+    return hidden_states * cos + rotated * sin
 
 
 class MiniMaxH3Attention(nn.Module):
@@ -196,6 +255,15 @@ class MiniMaxH3Attention(nn.Module):
 
         self.scale = 1.0 / (head_dim**0.5)
         self.ring_bound_holds = True
+        self.heads_per_call = 0  # attention_heads_per_call; set by the model
+        # rope_by_matmul's rotate matrix (see use_rope_by_matmul); None keeps the slice/cat RoPE.
+        self.register_buffer("rope_rotate", None, persistent=False)
+
+    def use_rope_by_matmul(self, rotary_dim: int) -> None:
+        """``rope_by_matmul``: a ``(D, D)`` buffer, so every block graph takes it as an input."""
+        self.register_buffer(
+            "rope_rotate", _rope_rotate_matrix(self.head_dim, rotary_dim), persistent=False
+        )
 
     def update_ring_bound(self) -> None:
         g_q = self.norm_q.weight.detach().to("cpu", torch.float32).abs().max()
@@ -228,11 +296,29 @@ class MiniMaxH3Attention(nn.Module):
 
         if rotary_emb is not None:
             cos, sin = rotary_emb
-            q = _apply_rotary_emb(q, cos, sin)
-            k = _apply_rotary_emb(k, cos, sin)
+            if self.rope_rotate is not None:
+                q = _rope_by_matmul(q, cos, sin, self.rope_rotate)
+                k = _rope_by_matmul(k, cos, sin, self.rope_rotate)
+            else:
+                q = _apply_rotary_emb(q, cos, sin)
+                k = _apply_rotary_emb(k, cos, sin)
 
-        # Both paths return d-major [B, N, D, S], the layout o_proj takes.
-        if self.ring_bound_holds:
+        # Both paths return d-major [B, N, D, S], the layout o_proj takes. Without CP they are the
+        # same attention, and one path keeps every block on one graph (compile_per_block).
+        if self.cp_size == 1 and self.heads_per_call and self.heads_per_call < q.shape[2]:
+            # [B, S, N, D] -> [B, N, S, D], one kernel launch per head group.
+            q, k, v = (t.transpose(1, 2) for t in (q, k, v))
+            group = self.heads_per_call
+            attn = torch.cat(
+                [
+                    nki_attention(
+                        q[:, i : i + group], k[:, i : i + group], v[:, i : i + group], self.scale
+                    )
+                    for i in range(0, q.shape[1], group)
+                ],
+                dim=1,
+            )
+        elif self.ring_bound_holds or self.cp_size == 1:
             attn = cp_ring_self_attention(
                 q,
                 k,
@@ -471,6 +557,28 @@ class _TokenRefiner(nn.Module):
         return self.final_norm(hidden_states)
 
 
+#: compile_per_block: block graphs launched before the oldest one's probe is read back (see
+#: ``_Probed``). Each launch in flight keeps its input and output hidden states (0.4 GB each at
+#: 768p on one device), so stay close to one.
+_MAX_BLOCKS_IN_FLIGHT = 2
+
+
+class _Probed(nn.Module):
+    """``block``'s output plus one element of it, for the host to read back (see
+    ``MiniMaxH3Transformer3DModel._compile_stages``).
+
+    Takes the block's gathered modulation tensor whole and splits it inside the graph: a graph
+    input must be a contiguous device tensor, which ``split``'s chunks are not."""
+
+    def __init__(self, block: nn.Module):
+        super().__init__()
+        self.block = block
+
+    def forward(self, hidden_states, modulation, *args):
+        out = self.block(hidden_states, self.block.adaln_proj.split(modulation), *args)
+        return out, out.reshape(-1)[:1] * 1
+
+
 class MiniMaxH3Transformer3DModel(nn.Module):
     """Neuron MiniMax-H3 DiT (the checkpoint's ``transformer``)."""
 
@@ -516,12 +624,20 @@ class MiniMaxH3Transformer3DModel(nn.Module):
         self.transformer_blocks = nn.ModuleList(
             [MiniMaxH3Block(cfg) for _ in range(cfg.num_layers)]
         )
+        if cfg.rope_by_matmul:
+            rotary_dim = 2 * MINIMAX_H3_MODALITY_NUM * cfg.rope_freq_dim
+            for block in self.transformer_blocks:
+                block.attn.use_rope_by_matmul(rotary_dim)
+        for block in self.transformer_blocks:
+            block.attn.heads_per_call = int(cfg.attention_heads_per_call or 0)
 
         self.norm_out = MiniMaxH3AdaLayerNormOut(
             hidden_size=dim, time_embed_dim=cfg.time_embed_dim, eps=cfg.final_norm_eps
         )
         self.proj_out = nn.Linear(dim, video_in, bias=True)
         self.audio_proj_out = nn.Linear(dim, cfg.audio_in_channels, bias=True)
+        # compile_per_block's compiled stages (see _compile_stages).
+        self._stages = None
 
     def forward(
         self,
@@ -548,10 +664,81 @@ class MiniMaxH3Transformer3DModel(nn.Module):
             raise ValueError(
                 f"`position_ids` must be (seq_len, 3), got {list(position_ids.shape)}."
             )
-        seq_len = position_ids.shape[0]
+        num_pad, sp_lengths = self._static_geometry(position_ids.shape[0])
+        if self._stages is not None:
+            return self._forward_staged(
+                hidden_states,
+                audio_hidden_states,
+                encoder_hidden_states,
+                timestep,
+                timestep_indices,
+                token_tags,
+                position_ids,
+                video_indices,
+                audio_indices,
+                text_indices,
+                block_modulations,
+                num_pad,
+                sp_lengths,
+                return_dict,
+            )
+        hidden_states, temb, adaln_indices, timestep_indices, rotary_emb, kv_valid = self._prologue(
+            hidden_states,
+            audio_hidden_states,
+            encoder_hidden_states,
+            timestep,
+            timestep_indices,
+            token_tags,
+            position_ids,
+            video_indices,
+            audio_indices,
+            text_indices,
+        )
+        for block, modulation in zip(self.transformer_blocks, block_modulations, strict=True):
+            hidden_states = block(
+                hidden_states,
+                block.adaln_proj.split(modulation),
+                adaln_indices,
+                rotary_emb,
+                kv_valid,
+                num_pad,
+                sp_lengths,
+            )
+        return self._finish(
+            self._epilogue(
+                hidden_states, temb, timestep_indices, video_indices, audio_indices, sp_lengths
+            ),
+            return_dict,
+        )
+
+    def _static_geometry(self, seq_len: int) -> tuple[int, tuple[int, int] | None]:
+        """The pad count and, under SP, the CP slice's ``(real, padded)`` length: Python values
+        of the sequence length alone, which every stage specializes on."""
         # Pad the packed sequence to a multiple of CP x LNC, so each rank's slice splits evenly
         # over its LNC cores. Rows past seq_len are zero, at position 0, and never keys.
         num_pad = -seq_len % (self.cp_size * (get_logical_nc_config() if self.cp_size > 1 else 1))
+        if not self.sequence_parallel:
+            return num_pad, None
+        cp_len = (seq_len + num_pad) // self.cp_size
+        return num_pad, (cp_len, sp_padded_len(cp_len, self.tp_size))
+
+    def _prologue(
+        self,
+        hidden_states,
+        audio_hidden_states,
+        encoder_hidden_states,
+        timestep,
+        timestep_indices,
+        token_tags,
+        position_ids,
+        video_indices,
+        audio_indices,
+        text_indices,
+    ):
+        """Everything before the block stack: the rows this rank keeps, RoPE, the text refiner,
+        the patch projections and ``temb``."""
+        seq_len = position_ids.shape[0]
+        num_pad, _ = self._static_geometry(seq_len)
         if num_pad:
             position_ids = F.pad(position_ids, (0, 0, 0, num_pad))
         # Rank tensors, not ints, so every rank traces the same graph.
@@ -562,7 +749,7 @@ class MiniMaxH3Transformer3DModel(nn.Module):
         if self.sequence_parallel:
             tp_rank = self.tp_coord.rank_in_group_tensor.to(torch.int64)
         # RoPE covers the CP slice attention runs on; the blocks carry `rows`, 1/TP of it under SP.
-        cp_rows, rows, sp_lengths = _local_rows(
+        cp_rows, rows, _ = _local_rows(
             position_ids.shape[0], position_ids.device, self.cp_size, cp_rank, self.tp_size, tp_rank
         )
         kv_valid = None
@@ -590,18 +777,12 @@ class MiniMaxH3Transformer3DModel(nn.Module):
         adaln_indices = timestep_indices * MINIMAX_H3_MODALITY_NUM + token_tags.index_select(
             0, real_rows
         )
+        return hidden_states, temb, adaln_indices, timestep_indices, rotary_emb, kv_valid
 
-        for block, modulation in zip(self.transformer_blocks, block_modulations, strict=True):
-            hidden_states = block(
-                hidden_states,
-                block.adaln_proj.split(modulation),
-                adaln_indices,
-                rotary_emb,
-                kv_valid,
-                num_pad,
-                sp_lengths,
-            )
-
+    def _epilogue(
+        self, hidden_states, temb, timestep_indices, video_indices, audio_indices, sp_lengths=None
+    ):
+        """``norm_out``, the output heads and the gathers back to the full sequence."""
         # norm_out and the heads are per row, so the ranks gather the heads' outputs rather
         # than the 42x wider hidden states.
         hidden_states = self.norm_out(hidden_states, temb, timestep_indices).to(
@@ -617,12 +798,98 @@ class MiniMaxH3Transformer3DModel(nn.Module):
         video_output, audio_output = output.split(
             [self.proj_out.out_features, self.audio_proj_out.out_features], dim=-1
         )
-        video_output = video_output.index_select(1, video_indices)
-        audio_output = audio_output.index_select(1, audio_indices)
+        return video_output.index_select(1, video_indices), audio_output.index_select(
+            1, audio_indices
+        )
 
+    @staticmethod
+    def _finish(outputs, return_dict: bool):
+        video_output, audio_output = outputs
         if not return_dict:
             return (video_output, audio_output)
         return {"sample": video_output, "audio_sample": audio_output}
+
+    def _compile_stages(self, *args, options=None, **kwargs) -> None:
+        """``compile_per_block``: the prologue, each block and the epilogue as their own graphs.
+
+        The blocks are structurally identical and their weights are graph inputs, so all of them
+        compile to one NEFF. Each block launch returns a one-element probe the host reads back a
+        few launches behind, which bounds how many block launches are in flight at once and so
+        how many blocks' hidden states the device holds."""
+        import torch._dynamo.config as dynamo_config
+
+        options = options or {}
+        model_name = options.get("model_name", "minimax_h3_transformer")
+        # One trace per block module; the default cache limit per code object is 8.
+        dynamo_config.recompile_limit = max(
+            dynamo_config.recompile_limit, 4 * len(self.transformer_blocks)
+        )
+
+        def named(fn, suffix):
+            return torch.compile(
+                fn, *args, options={**options, "model_name": f"{model_name}_{suffix}"}, **kwargs
+            )
+
+        self._stages = {
+            "prologue": named(self._prologue, "prologue"),
+            "blocks": [named(_Probed(block), "block") for block in self.transformer_blocks],
+            "epilogue": named(self._epilogue, "epilogue"),
+        }
+
+    def _forward_staged(
+        self,
+        hidden_states,
+        audio_hidden_states,
+        encoder_hidden_states,
+        timestep,
+        timestep_indices,
+        token_tags,
+        position_ids,
+        video_indices,
+        audio_indices,
+        text_indices,
+        block_modulations,
+        num_pad,
+        sp_lengths,
+        return_dict,
+    ):
+        stages = self._stages
+        hidden_states, temb, adaln_indices, timestep_indices, rotary_emb, kv_valid = stages[
+            "prologue"
+        ](
+            hidden_states,
+            audio_hidden_states,
+            encoder_hidden_states,
+            timestep,
+            timestep_indices,
+            token_tags,
+            position_ids,
+            video_indices,
+            audio_indices,
+            text_indices,
+        )
+        pending = []
+        for run, modulation in zip(stages["blocks"], block_modulations, strict=True):
+            hidden_states, probe = run(
+                hidden_states,
+                modulation,
+                adaln_indices,
+                rotary_emb,
+                kv_valid,
+                num_pad,
+                sp_lengths,
+            )
+            pending.append(probe)
+            while len(pending) > _MAX_BLOCKS_IN_FLIGHT:
+                pending.pop(0).cpu()
+        for probe in pending:
+            probe.cpu()
+        return self._finish(
+            stages["epilogue"](
+                hidden_states, temb, timestep_indices, video_indices, audio_indices, sp_lengths
+            ),
+            return_dict,
+        )
 
     def _embed_rows(self, sources, text_embeds, video, audio) -> torch.Tensor:
         """``cat([text_embeds, proj_in(video), audio_proj_in(audio)], dim=1)[:, sources]``,
@@ -652,7 +919,12 @@ class MiniMaxH3Transformer3DModel(nn.Module):
         corrupts the result (NaN, no error). One tensor per block: slicing one tensor inside
         the DiT graph gives each block its own offsets, so the blocks do not share one compiled
         body and the NEFF grows ~10x, past what fits in HBM next to the VAE.
+
+        With ``adaln_on_host`` it runs on the host instead (see ``host_block_modulations``) and
+        returns host tensors; the caller moves them to the device.
         """
+        if self.config.adaln_on_host:
+            return self.host_block_modulations(timestep)
         temb = self.time_proj(timestep)
         temb = self.time_embedder(temb.to(self.time_embedder.linear_1.weight.dtype))
         adalns = [block.adaln_proj for block in self.transformer_blocks]
@@ -664,13 +936,67 @@ class MiniMaxH3Transformer3DModel(nn.Module):
         # Own buffers, not views of one.
         return tuple(per_block[:, index].contiguous() for index in range(len(adalns)))
 
+    @torch.no_grad()
+    def host_block_modulations(self, timestep: torch.Tensor) -> tuple[torch.Tensor, ...]:
+        """``block_modulations`` on the host, from the AdaLN weights ``adaln_on_host`` keeps there.
+
+        Each rank computes its column shard of every block, in the device graph's precision (the
+        activation in ``temb``'s, the projection in BF16), and the shards are all-gathered over
+        the TP group's, then the CP group's, gloo group. Returns host tensors in the device
+        graph's layout."""
+        timestep = timestep.cpu()
+        temb = self.time_proj(timestep)
+        # ``to`` takes the host copy on a device; on CPU (no move) the module is already there.
+        embedder = getattr(self, "_host_time_embedder", self.time_embedder)
+        temb = embedder(temb.to(embedder.linear_1.weight.dtype))
+        adalns = [block.adaln_proj for block in self.transformer_blocks]
+        local = torch.cat([adaln.local(temb) for adaln in adalns], dim=-1)
+        if adalns[0].num_shards > 1:
+            # The device graph's shard order (over TP, then CP), on each group's gloo group.
+            for coord in (adalns[0].tp_coord, adalns[0].cp_coord):
+                if coord.world_size > 1:
+                    parts = [torch.empty_like(local) for _ in range(coord.world_size)]
+                    dist.all_gather(parts, local, group=coord.cpu_group)
+                    local = torch.cat(parts)
+            return _regroup_block_columns(local, adalns[0].num_shards, len(adalns))
+        per_block = local.reshape(local.shape[0], len(adalns), -1)
+        return tuple(per_block[:, index].contiguous() for index in range(len(adalns)))
+
+    def to(self, *args, **kwargs):
+        """``nn.Module.to``, except that ``adaln_on_host`` leaves the AdaLN projections (and a
+        copy of the timestep embedder they read) on the host."""
+        device = torch._C._nn._parse_to(*args, **kwargs)[0]
+        if not self.config.adaln_on_host or device is None or device.type == "cpu":
+            return super().to(*args, **kwargs)
+        if "_host_time_embedder" not in self.__dict__:
+            # Not a submodule: it must not follow the module to the device.
+            object.__setattr__(self, "_host_time_embedder", copy.deepcopy(self.time_embedder))
+        adalns = [block.adaln_proj for block in self.transformer_blocks]
+        for block in self.transformer_blocks:
+            del block._modules["adaln_proj"]
+        try:
+            super().to(*args, **kwargs)
+        finally:
+            for block, adaln in zip(self.transformer_blocks, adalns, strict=True):
+                block._modules["adaln_proj"] = adaln
+        return self
+
     def compile(self, *args, **kwargs):
         """``nn.Module.compile``, plus ``block_modulations`` as its own ``<model_name>_adaln``
-        graph, whose outputs callers pass to ``forward``."""
-        super().compile(*args, **kwargs)
+        graph, whose outputs callers pass to ``forward``.
+
+        ``compile_per_block`` compiles a prologue, the transformer blocks (one graph, shared by
+        all of them) and an epilogue instead of the whole model; ``adaln_on_host`` does not
+        compile ``block_modulations``, which then runs on the host."""
         kwargs = dict(kwargs)
         options = kwargs.pop("options", None) or {}
         model_name = options.get("model_name", "minimax_h3_transformer")
+        if self.config.compile_per_block:
+            self._compile_stages(*args, options=options, **kwargs)
+        else:
+            super().compile(*args, options=options, **kwargs)
+        if self.config.adaln_on_host:
+            return
         # From the class's method, so compiling twice does not wrap the compiled graph again.
         self.block_modulations = torch.compile(
             type(self).block_modulations.__get__(self),

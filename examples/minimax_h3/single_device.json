@@ -1,0 +1,13 @@
+{
+  "transformer_overrides": {
+    "adaln_on_host": true,
+    "compile_per_block": true,
+    "rope_by_matmul": true,
+    "attention_heads_per_call": 2,
+    "adaln_cache": true,
+    "text_encoder_stream_layers": 4,
+    "vae_swap_dit_blocks": 50,
+    "vae_fused_vit": true,
+    "host_weights_dir": "/mnt/nvme/minimax_h3"
+  }
+}

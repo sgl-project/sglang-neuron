@@ -5,6 +5,7 @@
 guidance-distilled, so every step is one DiT forward.
 """
 
+import contextlib
 import itertools
 import logging
 import math
@@ -240,15 +241,33 @@ class NeuronMiniMaxH3Model(nn.Module):
                 model, subfolder="processor", local_files_only=local_files_only
             )
         self._resize_keyframes = MiniMaxH3ModularPipeline(blocks=MiniMaxH3ResizeStep())
+        model_config = dict(model_config or {})
+        # Pipeline-level single-device options (not DiT config fields); see the module notes in
+        # minimax_h3_transformer and NeuronQwen3VLTextModel.
+        stream_layers = int(model_config.pop("text_encoder_stream_layers", 0) or 0)
+        host_weights_dir = model_config.pop("host_weights_dir", None)
+        self._host_weights_dir = host_weights_dir
+        # One device: the video decoder (4.85 GB, replicated) does not fit beside the DiT and
+        # its per-block graphs' DMA rings, so it lives on the host and the last
+        # ``vae_swap_dit_blocks`` DiT blocks move out while it runs (see _swap_for_decode).
+        self._vae_swap_dit_blocks = int(model_config.pop("vae_swap_dit_blocks", 0) or 0)
+        self._swap = None
+        # The video decoder's 36 ViT blocks on fused NKI kernels (qkv_cte with QK RMSNorm and
+        # RoPE, attention_cte, output_projection_cte, the MLP kernel); see minimax_h3_vit_block.
+        self._vae_fused_vit = bool(model_config.pop("vae_fused_vit", False))
         # The TP group, not WORLD: the vision tower's 16 heads cannot split over tp * cp ranks.
         self.text_encoder = NeuronQwen3VLTextEncoder(
-            model_path=model, dtype=self.dtype, tp_group=get_tp_group().device_group
+            model_path=model,
+            dtype=self.dtype,
+            tp_group=get_tp_group().device_group,
+            stream_layers=stream_layers,
+            host_weights_dir=host_weights_dir,
         )
 
         cfg = DiffusersMiniMaxH3Transformer3DModel.load_config(
             model, subfolder="transformer", local_files_only=local_files_only
         )
-        cfg.update(model_config or {})
+        cfg.update(model_config)
         # Not cast: a cast would round the FP32 rope.inv_freq buffer to BF16.
         self.transformer = MiniMaxH3Transformer3DModel(**cfg)
         # ((conditioned, video timesteps, audio timesteps), each step's block_modulations).
@@ -284,8 +303,12 @@ class NeuronMiniMaxH3Model(nn.Module):
             if vae_group is not None:
                 self.vae.init_distributed(group=vae_group, error_group=vae_error_group)
                 self.vae.set_parallel_size(vae_ranks)
-                # The device merge returns the frames already quantized.
-                self.vae.frame_fn = _quantize_frames
+                if self._vae_swap_dit_blocks:
+                    # One device: rank 0 stitches the tiles on the host (see merge_on_device).
+                    self.vae.merge_on_device = False
+                else:
+                    # The device merge returns the frames already quantized.
+                    self.vae.frame_fn = _quantize_frames
         self._vae_ranks = vae_ranks
         # Off rank 0 when there are other ranks: rank 0's HBM goes to the video VAE merge.
         num_audio_ranks = min(dist.get_world_size() - 1, MAX_AUDIO_WINDOWS)
@@ -306,11 +329,37 @@ class NeuronMiniMaxH3Model(nn.Module):
             self.audio_vae = NeuronAutoencoderKLMiniMaxH3Audio.from_config(audio_vae_config)
 
     def to(self, *args, **kwargs):
-        """Move the text encoder, transformer and, where this rank holds them, the VAEs."""
-        for module in (self.text_encoder, self.transformer, self.vae, self.audio_vae):
+        """Move the text encoder, transformer and, where this rank holds them, the VAEs. With
+        ``vae_swap_dit_blocks`` the video VAE stays on the host until it runs (see
+        ``_swap_for_decode``)."""
+        modules = [self.text_encoder, self.transformer, self.audio_vae]
+        if not self._vae_swap_dit_blocks:
+            modules.append(self.vae)
+        for module in modules:
             if module is not None:
                 module.to(*args, **kwargs)
         return self
+
+    def _swap_for_decode(self):
+        """``vae_swap_dit_blocks``: a context that moves the DiT's last blocks out and the video
+        VAE in, and back after. Both directions read from host copies taken once (file-backed
+        with ``host_weights_dir``), so leaving the device copies nothing back."""
+        from sglang_neuron.diffusion.models.minimax_h3.host_weights import HostSwap
+
+        if self._swap is None:
+            blocks = list(self.transformer.transformer_blocks)[-self._vae_swap_dit_blocks :]
+            rank, world = dist.get_rank(), dist.get_world_size()
+            tag = os.path.basename(os.path.abspath(self.model_path))
+            directory = self._host_weights_dir
+            dit = HostSwap(blocks, self.device, directory, f"minimax_h3_dit_{tag}_r{rank}of{world}")
+            vae = None
+            if self.vae is not None:
+                # Replicated: every rank maps the same file.
+                vae = HostSwap(
+                    [self.vae], self.device, directory, f"minimax_h3_vae_{tag}", on_device=False
+                )
+            self._swap = (dit, vae)
+        return HostSwap.exchange(*self._swap)
 
     def load_weights(self):
         """Load the conditioner, DiT and VAE weights."""
@@ -319,6 +368,13 @@ class NeuronMiniMaxH3Model(nn.Module):
         self.transformer.load_weights(os.path.join(model_path, "transformer"))
         if self.vae is not None:
             self.vae.load_weights(os.path.join(model_path, "vae"))
+            if self._vae_fused_vit:
+                from sglang_neuron.diffusion.distributed.autoencoders.minimax_h3_vit_block import (
+                    fuse_decoder,
+                )
+
+                with torch.no_grad():
+                    fuse_decoder(self.vae.decoder)
         if self.audio_vae is not None:
             self.audio_vae.load_weights(os.path.join(model_path, "audio_vae"))
 
@@ -496,7 +552,8 @@ class NeuronMiniMaxH3Model(nn.Module):
         return condition
 
     def block_modulations(self, timestep: torch.Tensor) -> tuple[torch.Tensor, ...]:
-        """The DiT's ``block_modulations`` for ``timestep``."""
+        """The DiT's ``block_modulations`` for ``timestep``. With ``adaln_on_host`` they are
+        computed on the host and returned there."""
         return self.transformer.block_modulations(timestep)
 
     def _step_timestep(self, t, audio_t, conditioned: bool) -> torch.Tensor:
@@ -537,6 +594,8 @@ class NeuronMiniMaxH3Model(nn.Module):
         self._adaln_cache = None
         if timesteps is None:
             timesteps = self._step_timesteps(conditioned)
+        # With adaln_on_host the tables stay on the host (0.87 GB per rank that one device
+        # cannot spare); denoise copies each step's to the device.
         tables = [self.block_modulations(timestep) for timestep in timesteps]
         self._adaln_cache = (key, tables)
         return tables
@@ -596,10 +655,20 @@ class NeuronMiniMaxH3Model(nn.Module):
         )
         coefficients = [step.to(self.device) for step in coefficients]
         marks = marks or StageMarks(device_events=False)
+        # One device runs within ~1 GB of HBM: one step in flight, from an emptied cache.
+        one_in_flight = bool(self._vae_swap_dit_blocks)
+        if one_in_flight:
+            from sglang_neuron.diffusion.models.minimax_h3.host_weights import (
+                release_device_cache,
+            )
+
+            release_device_cache()
         step_marks = [marks.mark()]
         for index, timestep in enumerate(timesteps):
-            block_modulations = (
-                cached[index] if cached is not None else self.block_modulations(timestep)
+            # adaln_on_host computes them on the host; to(device) is a no-op otherwise.
+            block_modulations = tuple(
+                m.to(self.device)
+                for m in (cached[index] if cached is not None else self.block_modulations(timestep))
             )
             noise_pred, audio_noise_pred = self.transformer(
                 hidden_states=hidden_states,
@@ -618,6 +687,10 @@ class NeuronMiniMaxH3Model(nn.Module):
                 condition_rows,
                 self.dtype,
             )
+            if one_in_flight:
+                # Wait for this step before queuing the next: its activations and the next
+                # step's would not both fit.
+                video_rows.reshape(-1)[:1].cpu()
             step_marks.append(marks.mark())
         video_rows, audio_rows = video_rows.cpu(), audio_rows.cpu()
         return video_rows, audio_rows, step_marks
@@ -737,6 +810,19 @@ class NeuronMiniMaxH3Model(nn.Module):
             return video
         return _to_uint8_frames(video)
 
+    def _decode_frames_swapped(self, latents):
+        """``decode_frames`` around ``_swap_for_decode``; every rank swaps (the DiT is sharded).
+
+        The decoded video is copied to the host inside the swap, and the cache emptied after it,
+        so the decode's activations do not stay behind in the caching allocator and fragment the
+        HBM the next denoise needs."""
+        from sglang_neuron.diffusion.models.minimax_h3.host_weights import release_device_cache
+
+        with self._swap_for_decode():
+            frames = self.decode_frames(latents)
+        release_device_cache()
+        return frames
+
     @torch.no_grad()
     def generate(
         self,
@@ -801,9 +887,17 @@ class NeuronMiniMaxH3Model(nn.Module):
         text_start = marks.mark()
         prompt_embeds, text_token_tags = self.encode_prompt(prompt, keyframes)
         vae_encode_start = marks.mark()
-        conditions = [
-            self.encode_keyframe(keyframe, latent_height, latent_width) for keyframe in keyframes
-        ]
+        # With vae_swap_dit_blocks the video VAE is on the host; swap it in once for every keyframe.
+        swap = (
+            self._swap_for_decode()
+            if keyframes and self._vae_swap_dit_blocks
+            else contextlib.nullcontext()
+        )
+        with swap:
+            conditions = [
+                self.encode_keyframe(keyframe, latent_height, latent_width)
+                for keyframe in keyframes
+            ]
         vae_encode_end = marks.mark()
 
         layout = MiniMaxH3PrepareLayoutStep.build_packed_sequence(
@@ -880,7 +974,8 @@ class NeuronMiniMaxH3Model(nn.Module):
         if self._decode_audio_first(latent_shape):
             audio_pieces, audio_error = self._try_decode_audio_windows(audio_rows, num_audio_latents)
         vae_decode_start = marks.mark()
-        video = self.decode_frames(
+        decode = self._decode_frames_swapped if self._vae_swap_dit_blocks else self.decode_frames
+        video = decode(
             self.unpack_video(video_rows, num_latent_frames, latent_height, latent_width)
         )
         audio_decode_start = marks.mark()
@@ -891,6 +986,14 @@ class NeuronMiniMaxH3Model(nn.Module):
         self._raise_on_any_rank(audio_error, "audio decode")
         audio = self.decode_audio(audio_rows, num_audio_latents, audio_pieces)
         audio_decode_end = marks.mark()
+        if self._vae_swap_dit_blocks:
+            from sglang_neuron.diffusion.models.minimax_h3.host_weights import (
+                release_device_cache,
+            )
+
+            # One device: the audio decode's cached activations would leave the next request's
+            # denoise short of HBM.
+            release_device_cache()
 
         e2e_forward_seconds = time.perf_counter() - t_start
         # Read after the output rank's host copies, when its device events are complete.

@@ -52,7 +52,7 @@ runtime. In the container image each recipe's "In the container image" section g
 | Pipeline | Checkpoint | Parallelism | Hardware | Notes |
 |---|---|---|---|---|
 | `FluxPipeline` (text-to-image) | `black-forest-labs/FLUX.1-dev` | TP8 x CP8 (64 logical cores) | trn2.48xlarge | [FLUX.1-dev](docs/model-recipes/flux1-dev.md) |
-| `MiniMaxH3ModularPipeline` (text and keyframes to video and audio) | `MiniMaxAI/MiniMax-H3` | TP8 x CP8 (64 logical cores) | trn2.48xlarge | [MiniMax-H3](docs/model-recipes/minimax-h3.md) |
+| `MiniMaxH3ModularPipeline` (text and keyframes to video and audio) | `MiniMaxAI/MiniMax-H3` | TP8 x CP8 (64 logical cores); TP4 on one device | trn2.48xlarge; trn2.3xlarge | [MiniMax-H3](docs/model-recipes/minimax-h3.md) |
 | `WanPipeline` (text-to-video), `WanImageToVideoPipeline` (image-to-video) | `Wan-AI/Wan2.2-T2V-A14B-Diffusers`, `Wan-AI/Wan2.2-I2V-A14B-Diffusers` | TP4 x CP8 x CFG2 (64 logical cores) | trn2.48xlarge | BF16, 81 frames at 480 x 832, 720 x 1280 and 1072 x 1920, gated by SSIM against reference goldens ([Wan2.2 A14B](docs/model-recipes/wan22.md)) |
 | `Flux3ActionPipeline` (robot actions from camera frames, state and an instruction) | `black-forest-labs/flux-3-action-droid` | `sd` and `gd` at TP4 and TP4 x CP2, `base` at TP4 x CFG2 (4 or 8 logical cores) | trn2.48xlarge | BF16, served over SGLang's OpenPI WebSocket and HTTP action API ([FLUX.3-Action](docs/model-recipes/flux3-action.md)) |
 | `LingBotWorldCausalDMDPipeline` (real-time image-to-world) | `robbyant/lingbot-world-v2-14b-causal-fast-diffusers` | DiT TP8 x CP8 at LNC 1 (64 cores) + 16 cores for UMT5 and the VAE | trn2.48xlarge | BF16 at 480 x 832 over `/v1/realtime_video/generate` ([LingBot-World-V2](docs/model-recipes/lingbot-world-v2.md)) |

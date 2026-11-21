@@ -3,8 +3,9 @@
 
 Requests are SGLang's MiniMax-H3 requests (``task``, ``conditions``, ``target``), resolved by its
 admission before the queue. One stage runs ``NeuronMiniMaxH3Model.generate`` on every rank in
-lockstep. Launch with ``--num-gpus 64 --tp-size 8`` on trn2.48xlarge; the model builds its own
-TP x CP groups.
+lockstep. Launch with ``--num-gpus 64 --tp-size 8`` on trn2.48xlarge, or with ``--num-gpus 4
+--tp-size 4`` and ``examples/minimax_h3/single_device.json`` on one trn2 device; the model builds
+its own TP x CP groups.
 """
 
 from __future__ import annotations
@@ -54,7 +55,11 @@ MINIMAX_H3_ALLOW_PATTERNS = (
 class NeuronMiniMaxH3PipelineConfig(PipelineConfig):
     """Text (+ keyframes) to video; the Neuron model owns its components.
 
-    ``transformer_overrides`` (``--pipeline-config``) update the DiT's checkpoint config.
+    ``transformer_overrides`` (in a ``--pipeline-config-path`` JSON file) update the DiT's
+    checkpoint config. It also carries the pipeline-level single-device options, which
+    ``NeuronMiniMaxH3Model`` takes out before the rest reaches the DiT:
+    ``text_encoder_stream_layers``, ``vae_swap_dit_blocks``, ``vae_fused_vit`` and
+    ``host_weights_dir``. See ``examples/minimax_h3/single_device.json``.
     """
 
     task_type: ModelTaskType = ModelTaskType.TI2V
