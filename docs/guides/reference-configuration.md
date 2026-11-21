@@ -20,6 +20,7 @@ flowchart TD
 | --- | --- |
 | `SGLANG_PLATFORM` | `neuron` selects the platform; the plugin installs its hooks only under it, and a launch that resolves the Neuron platform without it is refused. |
 | `NEURON_RT_VISIBLE_CORES` (or `NEURON_VISIBLE_DEVICES`, which wins when both are set) | The server's NeuronCores, a range list such as `4-7`; rank i runs on the i-th, and each rank then sees only its own core. Without either the server takes the node's first cores, and each replica of a plain `--dp-size` launch its own block of them. `--base-gpu-id` and `--gpu-id-step` are refused in its favour. |
+| `NEURON_PARALLEL_COMPILE_WORKERS`, `NEURON_COMPILE_SERVICE_WORKERS` | torch-neuronx's caps on concurrent graph compiles: the compiles one process keeps in flight (default 16, at most 64) and the workers of its compile service (default a quarter of the host's CPUs, at least 4, at most 128). The warm-up queues every shape's compile at once ([Warm-up and the SPMD check](../design/runtime.md#warm-up-and-the-spmd-check)); `NEURON_PARALLEL_COMPILE_WORKERS=1` compiles one graph at a time, for a host short of memory, CPU or `/tmp` space. |
 
 ## Environment variables the runtime reads
 

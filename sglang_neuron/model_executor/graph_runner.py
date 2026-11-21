@@ -37,7 +37,10 @@ from sglang.srt.model_executor.runner.base_runner import BaseRunner
 
 from sglang_neuron import envs
 from sglang_neuron.attention.backend import NeuronForwardMetadata
+from sglang_neuron.backend import device_io, executor_cache, spmd_check, stack
+from sglang_neuron.backend import envs as backend_envs
 from sglang_neuron.model_executor.runtime_init import SCRATCHPAD_PAGE_MB, neuron_device
+from sglang_neuron.parallel.state import tp_barrier, world_barrier
 
 logger = logging.getLogger(__name__)
 
@@ -701,10 +704,6 @@ class NeuronModelRuntime:
             self._warmup_all()
 
     def _warmup_all(self):
-        from sglang_neuron.backend import envs as backend_envs
-        from sglang_neuron.backend import executor_cache, spmd_check, stack
-        from sglang_neuron.parallel.state import tp_barrier, world_barrier
-
         t0 = time.time()
         shapes = self._warm_shapes()
         if self.sgl_model.segmented_prefill:
@@ -716,31 +715,10 @@ class NeuronModelRuntime:
             from sglang.srt.distributed import parallel_state as sgl_ps
 
             group = sgl_ps.get_tp_group().cpu_group
-        for kind, bucket, context in shapes:
-            logger.info("[neuron] warm %s bucket=%d%s", kind, bucket, f" context={context}" if context else "")
-            kwargs = self._synthetic_inputs(kind, bucket, context)
-            # torch-neuronx compiles the shape's graph at this call; its executors' NEFFs belong to the shape
-            with stack.compile_scope(self.compiler_args), \
-                    spmd_check.warming(f"{self.graphs}:{kind}:{bucket}:{context}", group, self.tp_size):
-                # the direct submit's first bind call (the first serving step is its second)
-                direct = getattr(self, "direct_submit", None)
-                slots = ({k: v for k, v in kwargs.items() if k.endswith("_out")}
-                         if getattr(self, "pp_active", False) else None)
-                targets = declared_in_place_targets(getattr(self, "model_graph", None))
-                armed = bool(slots or targets) and not backend_envs.SGLANG_NEURON_CPU_MODE
-                if armed:
-                    executor_cache.arm_writeback()  # the warm call's own record (_check_boundary_in_slots)
-                out = self.compiled(**kwargs) if direct is None else direct.full(self.compiled, kwargs)
-                # the first execution (its NEFF load on torch-neuronx's runtime worker) finishes under the compiler
-                # environment that compiled it, and the scope restores the environment with nothing in flight
-                _ = _output_tensor(out).cpu()
-            written = executor_cache.take_writeback() if armed else None
-            if slots:
-                # the stage graph writes its boundary into the seam slots in place: refused at warm-up, not serving
-                self._check_boundary_in_slots(out, slots, kind, written=written)
-            if targets and armed:
-                # and the tensors the graph declares it writes (a model's KV caches beside its kernels' outputs)
-                check_in_place(written, targets, kind)
+        with stack.compile_scope(self.compiler_args):
+            if self._trace_ahead(shapes):
+                self._trace_all(shapes, group)
+            self._warm_each(shapes, group)
         if group is not None:
             # every shape warmed with a recorded NEFF on every rank, one program per shape on all of them
             spmd_check.check(group, self.tp_size)
@@ -755,6 +733,52 @@ class NeuronModelRuntime:
             world_barrier()
         self._warmed = True
         logger.info("[neuron] warmup done in %.1fs (%d shapes)", time.time() - t0, len(shapes))
+
+    def _trace_ahead(self, shapes) -> bool:
+        """Whether the warm-up traces every shape before it runs any: on a device, for a runtime of several shapes,
+        unless the runtime submits outside the compiled graph (a direct submit) or across pipeline stages."""
+        return (len(shapes) > 1 and not backend_envs.SGLANG_NEURON_CPU_MODE
+                and getattr(self, "direct_submit", None) is None and not getattr(self, "pp_active", False))
+
+    def _trace_all(self, shapes, group) -> None:
+        """Trace and lower every shape with nothing submitted (device_io.unsubmitted), so their compiles run
+        concurrently in torch-neuronx's compile service while the next shapes trace; each shape's NEFF is compared
+        across the ranks (spmd_check) as it would be at its first warm call."""
+        t0 = time.time()
+        for kind, bucket, context in shapes:
+            logger.info("[neuron] trace %s bucket=%d%s", kind, bucket, f" context={context}" if context else "")
+            kwargs = self._synthetic_inputs(kind, bucket, context)
+            with spmd_check.warming(f"{self.graphs}:{kind}:{bucket}:{context}", group, self.tp_size), \
+                    device_io.unsubmitted():
+                self.compiled(**kwargs)
+        logger.info("[neuron] traced %d shapes in %.1fs; their compiles run in parallel", len(shapes),
+                    time.time() - t0)
+
+    def _warm_each(self, shapes, group) -> None:
+        for kind, bucket, context in shapes:
+            logger.info("[neuron] warm %s bucket=%d%s", kind, bucket, f" context={context}" if context else "")
+            kwargs = self._synthetic_inputs(kind, bucket, context)
+            # a shape the trace ahead skipped compiles at this call; its executors' NEFFs belong to the shape
+            with spmd_check.warming(f"{self.graphs}:{kind}:{bucket}:{context}", group, self.tp_size):
+                # the direct submit's first bind call (the first serving step is its second)
+                direct = getattr(self, "direct_submit", None)
+                slots = ({k: v for k, v in kwargs.items() if k.endswith("_out")}
+                         if getattr(self, "pp_active", False) else None)
+                targets = declared_in_place_targets(getattr(self, "model_graph", None))
+                armed = bool(slots or targets) and not backend_envs.SGLANG_NEURON_CPU_MODE
+                if armed:
+                    executor_cache.arm_writeback()  # the warm call's own record (_check_boundary_in_slots)
+                out = self.compiled(**kwargs) if direct is None else direct.full(self.compiled, kwargs)
+                # the first execution (its NEFF load on torch-neuronx's runtime worker) finishes under the compiler
+                # environment that compiled it, and _warmup_all's scope restores the environment with nothing in flight
+                _ = _output_tensor(out).cpu()
+            written = executor_cache.take_writeback() if armed else None
+            if slots:
+                # the stage graph writes its boundary into the seam slots in place: refused at warm-up, not serving
+                self._check_boundary_in_slots(out, slots, kind, written=written)
+            if targets and armed:
+                # and the tensors the graph declares it writes (a model's KV caches beside its kernels' outputs)
+                check_in_place(written, targets, kind)
 
     def _synthetic_inputs(self, kind: str, bucket: int, context: Optional[int] = None) -> dict:
         """Warm-up and idle-rank dummy inputs. KV writes land only in SGLang's reserved page 0 (slot 0) and reads only

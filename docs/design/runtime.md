@@ -650,7 +650,7 @@ the defaults. A host overrides the arguments for each family; a whole-model kern
 
 torch-neuronx ignores a graph's own compiler arguments. It reads `NEURON_COMPILER_OPT_LEVEL` and `NEURON_CC_FLAGS` from
 the environment at the call that compiles a graph, and both are part of the NEFF's persistent cache key. The plugin
-therefore sets them around each warm-up call, under a lock, and restores the previous values afterwards
+therefore sets them around a family's warm-up, under a lock, and restores the previous values afterwards
 (`compile_scope`, `sglang_neuron/backend/stack.py`). The optimisation level goes into `NEURON_COMPILER_OPT_LEVEL` and
 the other arguments into `NEURON_CC_FLAGS`, with two changes to torch-neuronx's defaults, each made only when the
 argument list states no choice of its own:
@@ -681,15 +681,17 @@ is then wrapped by the program-switch fence where one is installed.
 
 ### Warm-up and the SPMD check
 
-`warmup_all` runs under SGLang's grad mode, so dynamo's guards match the serving loop:
+`warmup_all` runs under SGLang's grad mode, so dynamo's guards match the serving loop, and the whole of it under the
+family's compile scope:
 
 ```mermaid
 flowchart TD
     A["segmented prefill: refuse a bucket outside the kernel's tiles"] --> B["TP barrier"]
-    B --> C["next shape: synthetic inputs, call the graph under its compile scope"]
-    C --> D{"each executor's first call: the same NEFF key on every rank?"}
-    D -->|no| X["refused before any rank submits it"]
-    D -->|yes| E["submit, read the sampled tokens back"]
+    B --> T["trace ahead: call every shape with nothing submitted"]
+    T --> TD{"each executor's first call: the same NEFF key on every rank?"}
+    TD -->|no| X["refused before any rank submits it"]
+    TD -->|"yes: its compile is queued, the next shape traces"| C
+    C["next shape: synthetic inputs, call the graph"] --> E["submit, read the sampled tokens back"]
     E -->|"more shapes"| C
     E -->|"last shape"| F
     F{"spmd_check.check: every shape warmed on every rank, each with a NEFF recorded and the same NEFF set?"}
@@ -699,10 +701,32 @@ flowchart TD
     H -->|yes| G["TP barrier, warmup done"]
 ```
 
-Each shape logs `[neuron] warm <kind> bucket=<n>` (with ` context=<c>` for a decode shape). Its synthetic inputs touch
-only page 0 ([Page 0 and padding](#page-0-and-padding)). The sampled tokens are read back inside the compile scope, so
-the first execution, the NEFF load on torch-neuronx's runtime worker, also finishes under the compiler environment that
-compiled it. `[neuron] warmup done in <s>s (<n> shapes)` ends the warm-up.
+torch-neuronx's backend hands each traced graph to its compile service and returns at once; the compile finishes on a
+worker while the caller goes on, and the graph's first execution waits for it. A shape's warm call executes it,
+though, and the program-switch fence before the next shape's execution waits for that execution
+([The program-switch fence](#the-program-switch-fence)), so a loop of warm calls compiles one graph at a time. The trace
+ahead breaks that chain (`_trace_all`, `sglang_neuron/model_executor/graph_runner.py`): it calls every shape once inside
+`device_io.unsubmitted()`, where the plugin's submit wrapper returns before the runtime gets the graph and the executor
+binding cache copies no output into an input, so each call traces, lowers and queues its compile, records its executors
+in dynamo's cache and their NEFF keys in the SPMD check, and runs nothing. Every shape's compile then runs concurrently
+while the later shapes trace. Each logs `[neuron] trace <kind> bucket=<n>`, and `[neuron] traced <n> shapes in <s>s`
+ends the pass. The warm calls that follow hit dynamo's cache, wait for their own compile at their first execution, and
+run under the fence as before. A runtime of one shape, a direct submit (which never reaches the submit wrapper), a
+pipeline stage and CPU mode skip the trace ahead.
+
+The ranks of a server, and its `--dp-size` replicas, compile each NEFF once: torch-neuronx's per-key compile lock
+holds the others until it is cached. So the concurrency is in the shapes, up to torch-neuronx's caps
+(`NEURON_PARALLEL_COMPILE_WORKERS`, default 16 compiles in flight per process; `NEURON_COMPILE_SERVICE_WORKERS`). On a
+trn3.48xlarge, Qwen3-30B-A3B's cold TP4 warm-up of 25 shapes peaked at 15 `neuronx-cc` processes holding 3.4 GB of
+host memory and 231 MB of compile directories. A host short of either sets `NEURON_PARALLEL_COMPILE_WORKERS=1`, which
+compiles one graph at a time while the shapes still trace ahead: the 4-layer warm-up of 9 decode shapes took 114 s,
+between the 69 s of the default and the 158 s of a warm-up that traces each shape after the last one compiled.
+
+Each shape's warm call logs `[neuron] warm <kind> bucket=<n>` (with ` context=<c>` for a decode shape). Its synthetic
+inputs touch only page 0 ([Page 0 and padding](#page-0-and-padding)). The sampled tokens are read back inside the
+compile scope, so the first execution, the NEFF load on torch-neuronx's runtime worker, also finishes under the compiler
+environment that compiled it, and so does every compile the trace ahead queued. `[neuron] warmup done in <s>s (<n>
+shapes)` ends the warm-up.
 
 Each rank lowers its graph from its own trace, and nothing in torch-neuronx checks that the ranks compiled the same
 program. A rank-dependent constant reaching a trace would compile a different NEFF on one rank, whose collectives
