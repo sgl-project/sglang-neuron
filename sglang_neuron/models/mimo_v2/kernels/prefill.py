@@ -283,8 +283,8 @@ def prefill_route(hn, router_wT, expert_bias, ep_rank, positions, top_k=8, route
     tok_out = nl.ndarray((NB,), dtype=nl.int32, buffer=nl.shared_hbm, name="prefill_route_tokens")
     b2e_out = nl.ndarray((num_blocks, 1), dtype=nl.int32, buffer=nl.shared_hbm, name="prefill_route_b2e")
     cond_out = nl.ndarray((num_blocks + 2,), dtype=nl.int32, buffer=nl.shared_hbm, name="prefill_route_cond")
-    # the slots plus a sink past them, which the unselected (token, expert) pairs write
-    scratch = nl.ndarray((NB + 1, 1), dtype=nl.int32, buffer=nl.shared_hbm, name="prefill_route_scratch")
+    # the slots plus a tile of room past them, which the last window's -1 tail writes
+    scratch = nl.ndarray((NB + P, 1), dtype=nl.int32, buffer=nl.shared_hbm, name="prefill_route_scratch")
     # both programs compute (an idle program fails the compiler's allocation); the first writes
     w0 = n_prg == 1 or pid == 0
 
@@ -312,10 +312,9 @@ def prefill_route(hn, router_wT, expert_bias, ep_rank, positions, top_k=8, route
     part_f = nl.ndarray((P, 1), dtype=nl.float32, buffer=nl.sbuf)
     nisa.iota(part_f[0:P, 0:1], pattern=[[0, 1]], offset=0, channel_multiplier=1)
 
-    # each tile's selected pairs and their ranks, for the second pass; the tiles run in runtime loops (one copy of the
+    # each tile's selected pairs, for the second pass; the tiles run in runtime loops (one copy of the
     # body), the first tile's own copy reading no position before it
     sel_h = nl.ndarray((T, E), dtype=nl.float32, buffer=nl.shared_hbm, name="prefill_route_sel")
-    rank_h = nl.ndarray((T, E), dtype=nl.float32, buffer=nl.shared_hbm, name="prefill_route_rank")
     aff2d = aff_out.reshape((T, E))
     carry = nl.ndarray((P, E), dtype=nl.float32, buffer=nl.sbuf)
     nisa.memset(dst=carry[0:P, 0:E], value=0.0)
@@ -376,7 +375,7 @@ def prefill_route(hn, router_wT, expert_bias, ep_rank, positions, top_k=8, route
         nisa.tensor_copy(dst=pvf[0:P, 0:1], src=pv[0:P, 0:1])
         real = nl.ndarray((P, 1), dtype=nl.float32, buffer=nl.sbuf)
         nisa.tensor_tensor(dst=real[0:P, 0:1], data1=pcf[0:P, 0:1], data2=pvf[0:P, 0:1], op=nl.not_equal)
-        # ---- selected pairs and their inclusive rank among the expert's tokens so far ----
+        # ---- selected pairs, and the expert's count so far ----
         ab = nl.ndarray((P, E), dtype=nl.float32, buffer=nl.sbuf)
         nisa.tensor_copy(dst=ab[0:P, 0:E], src=aff_b[0:P, 0:E])
         s_f = nl.ndarray((P, E), dtype=nl.float32, buffer=nl.sbuf)
@@ -386,12 +385,6 @@ def prefill_route(hn, router_wT, expert_bias, ep_rank, positions, top_k=8, route
             nisa.dma_copy(dst=sel_h[nl.ds(t0, P), 0:E], src=s_f[0:P, 0:E])
         s_b = nl.ndarray((P, E), dtype=nl.bfloat16, buffer=nl.sbuf)
         nisa.tensor_copy(dst=s_b[0:P, 0:E], src=s_f[0:P, 0:E])
-        pre = nl.ndarray((P, E), dtype=nl.float32, buffer=nl.psum)
-        nisa.nc_matmul(dst=pre[0:P, 0:E], stationary=tri[0:P, 0:P], moving=s_b[0:P, 0:E])
-        rk = nl.ndarray((P, E), dtype=nl.float32, buffer=nl.sbuf)
-        nisa.tensor_tensor(dst=rk[0:P, 0:E], data1=pre[0:P, 0:E], data2=carry[0:P, 0:E], op=nl.add)
-        if w0:
-            nisa.dma_copy(dst=rank_h[nl.ds(t0, P), 0:E], src=rk[0:P, 0:E])
         tot = nl.ndarray((P, E), dtype=nl.float32, buffer=nl.psum)
         nisa.nc_matmul(dst=tot[0:P, 0:E], stationary=ones[0:P, 0:P], moving=s_b[0:P, 0:E])
         nisa.tensor_tensor(dst=carry[0:P, 0:E], data1=carry[0:P, 0:E], data2=tot[0:P, 0:E], op=nl.add)
@@ -416,39 +409,65 @@ def prefill_route(hn, router_wT, expert_bias, ep_rank, positions, top_k=8, route
     base = nl.ndarray((P, E), dtype=nl.float32, buffer=nl.sbuf)
     nisa.tensor_scalar(dst=base[0:P, 0:E], data=first[0:P, 0:E], op0=nl.multiply, operand0=float(block_size))
 
-    # ---- the slots: -1 everywhere, then each selected pair's token id at its slot (the rest at the sink) ----
-    neg = nl.ndarray((P, (NB + P) // P), dtype=nl.int32, buffer=nl.sbuf)
-    nisa.memset(dst=neg[0:P, 0:(NB + P) // P], value=-1)
-    full_rows = NB // P
-    rest = NB + 1 - full_rows * P
+    # ---- the slots: -1 everywhere, then each (tile, expert)'s selected tokens as one contiguous window ----
+    # Within a tile, an expert's selected tokens take consecutive slots from base + the expert's count before the tile,
+    # so a one-hot matmul packs them (window place j = the token's inclusive prefix in the tile - 1) and one contiguous
+    # 128-slot write lands them, -1 past them. That -1 tail spills into the slots after, which the next tile's window
+    # (or the next expert's: experts go in order) overwrites; the scratch keeps a tile of room past the last slot. A
+    # scattered write a pair, 128 descriptors of 4 bytes a DMA, took 5.5 ms of a 14 ms layer at an 8K chunk.
+    R = NB // P + 1
+    neg = nl.ndarray((P, R), dtype=nl.int32, buffer=nl.sbuf)
+    nisa.memset(dst=neg[0:P, 0:R], value=-1)
     if w0:
-        if full_rows:
-            nisa.dma_copy(dst=scratch.ap(pattern=[[full_rows, P], [1, full_rows]], offset=0),
-                          src=neg[0:P, 0:full_rows])
-        nisa.dma_copy(dst=scratch.ap(pattern=[[1, rest], [1, 1]], offset=full_rows * P), src=neg[0:rest, 0:1])
-    sink = float(NB)
-    if w0:
-        tid_f = nl.ndarray((P, 1), dtype=nl.float32, buffer=nl.sbuf)
-        nisa.tensor_copy(dst=tid_f[0:P, 0:1], src=part_f[0:P, 0:1])
-        for t in nl.sequential_range(NT):
-            t0 = t * P
-            tid = nl.ndarray((P, 1), dtype=nl.int32, buffer=nl.sbuf)
-            nisa.tensor_copy(dst=tid[0:P, 0:1], src=tid_f[0:P, 0:1])
-            st_t = nl.ndarray((P, E), dtype=nl.float32, buffer=nl.sbuf)
-            nisa.dma_copy(dst=st_t[0:P, 0:E], src=sel_h[nl.ds(t0, P), 0:E])
-            # slot = sel x (base + rank - 1 - sink) + sink
-            sl = nl.ndarray((P, E), dtype=nl.float32, buffer=nl.sbuf)
-            nisa.dma_copy(dst=sl[0:P, 0:E], src=rank_h[nl.ds(t0, P), 0:E])
-            nisa.tensor_tensor(dst=sl[0:P, 0:E], data1=sl[0:P, 0:E], data2=base[0:P, 0:E], op=nl.add)
-            nisa.tensor_scalar(dst=sl[0:P, 0:E], data=sl[0:P, 0:E], op0=nl.add, operand0=-1.0 - sink)
-            nisa.tensor_tensor(dst=sl[0:P, 0:E], data1=sl[0:P, 0:E], data2=st_t[0:P, 0:E], op=nl.multiply)
-            nisa.tensor_scalar(dst=sl[0:P, 0:E], data=sl[0:P, 0:E], op0=nl.add, operand0=sink)
-            sl_i = nl.ndarray((P, E), dtype=nl.int32, buffer=nl.sbuf)
-            nisa.tensor_copy(dst=sl_i[0:P, 0:E], src=sl[0:P, 0:E])
-            for e in range(E):
-                nisa.dma_copy(dst=scratch.ap(pattern=[[1, P], [1, 1]], offset=0, vector_offset=sl_i[0:P, e:e + 1],
-                                             indirect_dim=0), src=tid[0:P, 0:1])
-            nisa.tensor_scalar(dst=tid_f[0:P, 0:1], data=tid_f[0:P, 0:1], op0=nl.add, operand0=float(P))
+        nisa.dma_copy(dst=scratch.ap(pattern=[[R, P], [1, R]], offset=0), src=neg[0:P, 0:R])
+        io = nl.ndarray((P, P), dtype=nl.float32, buffer=nl.sbuf)
+        nisa.iota(io[0:P, 0:P], pattern=[[1, P]], offset=0, channel_multiplier=0)  # the window place, every row
+        pp_f = nl.ndarray((P, 1), dtype=nl.float32, buffer=nl.sbuf)
+        nisa.iota(pp_f[0:P, 0:1], pattern=[[0, 1]], offset=1, channel_multiplier=1)  # 1 + the row
+        pp1 = nl.ndarray((P, 1), dtype=nl.bfloat16, buffer=nl.sbuf)
+        nisa.tensor_copy(dst=pp1[0:P, 0:1], src=pp_f[0:P, 0:1])
+        for e in range(E):
+            before = nl.ndarray((1, 1), dtype=nl.float32, buffer=nl.sbuf)  # the expert's selected pairs so far
+            nisa.memset(dst=before[0:1, 0:1], value=0.0)
+            t0f = nl.ndarray((1, 1), dtype=nl.float32, buffer=nl.sbuf)  # the tile's first token id
+            nisa.memset(dst=t0f[0:1, 0:1], value=0.0)
+            for t in nl.sequential_range(NT):
+                t0 = t * P
+                st_t = nl.ndarray((P, 1), dtype=nl.float32, buffer=nl.sbuf)
+                nisa.dma_copy(dst=st_t[0:P, 0:1], src=sel_h[nl.ds(t0, P), e:e + 1])
+                st_b = nl.ndarray((P, 1), dtype=nl.bfloat16, buffer=nl.sbuf)
+                nisa.tensor_copy(dst=st_b[0:P, 0:1], src=st_t[0:P, 0:1])
+                pre = nl.ndarray((P, 1), dtype=nl.float32, buffer=nl.psum)
+                nisa.nc_matmul(dst=pre[0:P, 0:1], stationary=tri[0:P, 0:P], moving=st_b[0:P, 0:1])
+                # j = selected x inclusive prefix - 1: the window place, -1 for an unselected token
+                jj = nl.ndarray((P, 1), dtype=nl.float32, buffer=nl.sbuf)
+                nisa.tensor_tensor(dst=jj[0:P, 0:1], data1=pre[0:P, 0:1], data2=st_t[0:P, 0:1], op=nl.multiply)
+                nisa.tensor_scalar(dst=jj[0:P, 0:1], data=jj[0:P, 0:1], op0=nl.add, operand0=-1.0)
+                oh = nl.ndarray((P, P), dtype=nl.bfloat16, buffer=nl.sbuf)
+                nisa.tensor_scalar(dst=oh[0:P, 0:P], data=io[0:P, 0:P], op0=nl.equal, operand0=jj[0:P, 0:1])
+                # v[j] = 1 + the row whose place is j, 0 for an empty place; and the tile's count
+                v = nl.ndarray((1, P), dtype=nl.float32, buffer=nl.psum)
+                nisa.nc_matmul(dst=v[0:1, 0:P], stationary=pp1[0:P, 0:1], moving=oh[0:P, 0:P])
+                cnt = nl.ndarray((1, 1), dtype=nl.float32, buffer=nl.psum)
+                nisa.nc_matmul(dst=cnt[0:1, 0:1], stationary=ones[0:P, 0:1], moving=st_b[0:P, 0:1])
+                # the token id (t0 + row) at a filled place, -1 at an empty one
+                mk = nl.ndarray((1, P), dtype=nl.float32, buffer=nl.sbuf)
+                nisa.tensor_scalar(dst=mk[0:1, 0:P], data=v[0:1, 0:P], op0=nl.greater, operand0=0.5,
+                                   op1=nl.multiply, operand1=t0f[0:1, 0:1])
+                val = nl.ndarray((1, P), dtype=nl.float32, buffer=nl.sbuf)
+                nisa.tensor_tensor(dst=val[0:1, 0:P], data1=mk[0:1, 0:P], data2=v[0:1, 0:P], op=nl.add)
+                nisa.tensor_scalar(dst=val[0:1, 0:P], data=val[0:1, 0:P], op0=nl.add, operand0=-1.0)
+                val_i = nl.ndarray((1, P), dtype=nl.int32, buffer=nl.sbuf)
+                nisa.tensor_copy(dst=val_i[0:1, 0:P], src=val[0:1, 0:P])
+                # the window's first slot: the expert's base + its pairs before the tile
+                w_f = nl.ndarray((1, 1), dtype=nl.float32, buffer=nl.sbuf)
+                nisa.tensor_tensor(dst=w_f[0:1, 0:1], data1=before[0:1, 0:1], data2=base[0:1, e:e + 1], op=nl.add)
+                w_i = nl.ndarray((1, 1), dtype=nl.int32, buffer=nl.sbuf)
+                nisa.tensor_copy(dst=w_i[0:1, 0:1], src=w_f[0:1, 0:1])
+                nisa.dma_copy(dst=scratch.ap(pattern=[[1, 1], [1, P]], offset=0, vector_offset=w_i[0:1, 0:1],
+                                             indirect_dim=0), src=val_i[0:1, 0:P])
+                nisa.tensor_tensor(dst=before[0:1, 0:1], data1=before[0:1, 0:1], data2=cnt[0:1, 0:1], op=nl.add)
+                nisa.tensor_scalar(dst=t0f[0:1, 0:1], data=t0f[0:1, 0:1], op0=nl.add, operand0=float(P))
     if w0:
         nisa.dma_copy(dst=tok_out.reshape((NB, 1)), src=scratch.ap(pattern=[[1, NB], [1, 1]], offset=0))
 
