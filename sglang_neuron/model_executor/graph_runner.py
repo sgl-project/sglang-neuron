@@ -62,6 +62,30 @@ def _output_tensor(out):
     return out["token_ids"] if "token_ids" in out else next(iter(out.values()))
 
 
+@contextlib.contextmanager
+def _traced_unsubmitted():
+    """Graph calls inside trace and lower each new shape, which hands its NEFF to torch-neuronx's asynchronous compile
+    and leaves the Executor in dynamo's cache, but submit nothing: the Executor prepares its inputs and allocates its
+    outputs, and neither its device execution nor its copy-back of outputs into inputs runs. The outputs are
+    unwritten."""
+    import torch_neuronx
+    from torch_neuronx.neuron_dynamo_backend.executor import Executor
+
+    submit, writeback = torch_neuronx._C.execute_compiled_graph, Executor._writeback_shadowed_aliases
+
+    def unsubmitted(*args, **kwargs):
+        return None
+
+    # device_io.upload's install check: the uploads enqueued here are awaited by the next real submit
+    unsubmitted._sgn_submit = getattr(submit, "_sgn_submit", False)
+    torch_neuronx._C.execute_compiled_graph = unsubmitted
+    Executor._writeback_shadowed_aliases = lambda self, inputs, tensors: tensors
+    try:
+        yield
+    finally:
+        torch_neuronx._C.execute_compiled_graph, Executor._writeback_shadowed_aliases = submit, writeback
+
+
 def _effective_temperatures(fb) -> Optional[torch.Tensor]:
     """Per-request temperature with greedy requests (SGLang: top_k == 1) mapped to 0."""
     si = getattr(fb, "sampling_info", None)
@@ -702,7 +726,7 @@ class NeuronModelRuntime:
 
     def _warmup_all(self):
         from sglang_neuron.backend import envs as backend_envs
-        from sglang_neuron.backend import executor_cache, spmd_check, stack
+        from sglang_neuron.backend import spmd_check, stack
         from sglang_neuron.parallel.state import tp_barrier, world_barrier
 
         t0 = time.time()
@@ -716,6 +740,55 @@ class NeuronModelRuntime:
             from sglang.srt.distributed import parallel_state as sgl_ps
 
             group = sgl_ps.get_tp_group().cpu_group
+        with stack.compile_scope(self.compiler_args):
+            if self._trace_ahead(shapes):
+                self._trace_all(shapes, group)
+            self._warm_each(shapes, group)
+        if group is not None:
+            # every shape warmed with a recorded NEFF on every rank, one program per shape on all of them
+            spmd_check.check(group, self.tp_size)
+            after_warmup = getattr(self.sgl_model, "neuron_after_warmup", None)
+            if after_warmup is not None:
+                after_warmup(self.graphs, spmd_check.warmed_keys())
+        tp_barrier()
+        if getattr(self, "pp_active", False):
+            # Each stage warms its own graphs, some for minutes longer than others. A stage done first would block in
+            # its scheduler loop on the stage before it with SGLang's 300 s watchdog armed, so every stage starts
+            # serving together.
+            world_barrier()
+        self._warmed = True
+        logger.info("[neuron] warmup done in %.1fs (%d shapes)", time.time() - t0, len(shapes))
+
+    def _trace_ahead(self, shapes) -> bool:
+        """Whether the warm-up traces every shape before it runs any: on a device, for a runtime of several shapes,
+        unless SGLANG_NEURON_SERIAL_WARMUP is set or the runtime submits outside the compiled graph (a direct submit)
+        or across pipeline stages."""
+        from sglang_neuron import env_registry
+        from sglang_neuron.backend import envs as backend_envs
+
+        return (len(shapes) > 1 and not backend_envs.SGLANG_NEURON_CPU_MODE
+                and not env_registry.zero_or_one("SGLANG_NEURON_SERIAL_WARMUP")
+                and getattr(self, "direct_submit", None) is None and not getattr(self, "pp_active", False))
+
+    def _trace_all(self, shapes, group) -> None:
+        """Trace and lower every shape with nothing submitted (_traced_unsubmitted), so their compiles run
+        concurrently in torch-neuronx's compile service while the next shapes trace; each shape's NEFF is compared
+        across the ranks (spmd_check) as it would be at its first warm call."""
+        from sglang_neuron.backend import spmd_check
+
+        t0 = time.time()
+        with _traced_unsubmitted():
+            for kind, bucket, context in shapes:
+                logger.info("[neuron] trace %s bucket=%d%s", kind, bucket, f" context={context}" if context else "")
+                with spmd_check.warming(f"{self.graphs}:{kind}:{bucket}:{context}", group, self.tp_size):
+                    self.compiled(**self._synthetic_inputs(kind, bucket, context))
+        logger.info("[neuron] traced %d shapes in %.1fs; their compiles run in parallel", len(shapes),
+                    time.time() - t0)
+
+    def _warm_each(self, shapes, group) -> None:
+        from sglang_neuron.backend import envs as backend_envs
+        from sglang_neuron.backend import executor_cache, spmd_check, stack
+
         for kind, bucket, context in shapes:
             logger.info("[neuron] warm %s bucket=%d%s", kind, bucket, f" context={context}" if context else "")
             kwargs = self._synthetic_inputs(kind, bucket, context)
@@ -741,20 +814,6 @@ class NeuronModelRuntime:
             if targets and armed:
                 # and the tensors the graph declares it writes (a model's KV caches beside its kernels' outputs)
                 check_in_place(written, targets, kind)
-        if group is not None:
-            # every shape warmed with a recorded NEFF on every rank, one program per shape on all of them
-            spmd_check.check(group, self.tp_size)
-            after_warmup = getattr(self.sgl_model, "neuron_after_warmup", None)
-            if after_warmup is not None:
-                after_warmup(self.graphs, spmd_check.warmed_keys())
-        tp_barrier()
-        if getattr(self, "pp_active", False):
-            # Each stage warms its own graphs, some for minutes longer than others. A stage done first would block in
-            # its scheduler loop on the stage before it with SGLang's 300 s watchdog armed, so every stage starts
-            # serving together.
-            world_barrier()
-        self._warmed = True
-        logger.info("[neuron] warmup done in %.1fs (%d shapes)", time.time() - t0, len(shapes))
 
     def _synthetic_inputs(self, kind: str, bucket: int, context: Optional[int] = None) -> dict:
         """Warm-up and idle-rank dummy inputs. KV writes land only in SGLang's reserved page 0 (slot 0) and reads only
