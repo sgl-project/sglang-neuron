@@ -745,11 +745,12 @@ class NeuronModelRuntime:
         concurrently in torch-neuronx's compile service while the next shapes trace; each shape's NEFF is compared
         across the ranks (spmd_check) as it would be at its first warm call."""
         t0 = time.time()
-        with device_io.unsubmitted():
-            for kind, bucket, context in shapes:
-                logger.info("[neuron] trace %s bucket=%d%s", kind, bucket, f" context={context}" if context else "")
-                with spmd_check.warming(f"{self.graphs}:{kind}:{bucket}:{context}", group, self.tp_size):
-                    self.compiled(**self._synthetic_inputs(kind, bucket, context))
+        for kind, bucket, context in shapes:
+            logger.info("[neuron] trace %s bucket=%d%s", kind, bucket, f" context={context}" if context else "")
+            kwargs = self._synthetic_inputs(kind, bucket, context)
+            with spmd_check.warming(f"{self.graphs}:{kind}:{bucket}:{context}", group, self.tp_size), \
+                    device_io.unsubmitted():
+                self.compiled(**kwargs)
         logger.info("[neuron] traced %d shapes in %.1fs; their compiles run in parallel", len(shapes),
                     time.time() - t0)
 

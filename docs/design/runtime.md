@@ -714,6 +714,14 @@ ends the pass. The warm calls that follow hit dynamo's cache, wait for their own
 run under the fence as before. A runtime of one shape, a direct submit (which never reaches the submit wrapper), a
 pipeline stage and CPU mode skip the trace ahead.
 
+The ranks of a server, and its `--dp-size` replicas, compile each NEFF once: torch-neuronx's per-key compile lock
+holds the others until it is cached. So the concurrency is in the shapes, up to torch-neuronx's caps
+(`NEURON_PARALLEL_COMPILE_WORKERS`, default 16 compiles in flight per process; `NEURON_COMPILE_SERVICE_WORKERS`). On a
+trn3.48xlarge, Qwen3-30B-A3B's cold TP4 warm-up of 25 shapes peaked at 15 `neuronx-cc` processes holding 3.4 GB of
+host memory and 231 MB of compile directories. A host short of either sets `NEURON_PARALLEL_COMPILE_WORKERS=1`, which
+compiles one graph at a time while the shapes still trace ahead: the 4-layer warm-up of 9 decode shapes took 114 s,
+between the 69 s of the default and the 158 s of a warm-up that traces each shape after the last one compiled.
+
 Each shape's warm call logs `[neuron] warm <kind> bucket=<n>` (with ` context=<c>` for a decode shape). Its synthetic
 inputs touch only page 0 ([Page 0 and padding](#page-0-and-padding)). The sampled tokens are read back inside the
 compile scope, so the first execution, the NEFF load on torch-neuronx's runtime worker, also finishes under the compiler

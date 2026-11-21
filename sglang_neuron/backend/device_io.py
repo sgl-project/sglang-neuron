@@ -119,8 +119,9 @@ def pre_execute_scope():
 def unsubmitted():
     """The graph executions this thread starts inside are prepared and not submitted: a compiled graph called inside
     still traces, lowers and queues its compile, and its executor prepares its inputs and allocates its outputs, but
-    the submit returns before the runtime gets it (its uploads stay pending for the next real submit) and the
-    executor copies no unwritten output into its inputs (executor_cache)."""
+    the submit returns before the runtime gets it (its uploads stay pending for the next real submit), the executor
+    hands no NEFF key to a submit and copies no unwritten output into its inputs (executor_cache). torch-neuronx's eager
+    kernels submit through the same wrapper, so they are dropped too: hold the scope around the graph call alone."""
     outer = unsubmitting()
     _STATE.unsubmitted = True
     try:

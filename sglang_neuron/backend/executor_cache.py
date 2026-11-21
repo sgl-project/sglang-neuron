@@ -185,7 +185,8 @@ def _prepare_inputs(original):
 def _announcing(prepare):
     def announce(self, inputs, device_id):
         prepared = prepare(self, inputs, device_id)
-        _SUBMITTING.key = self.cache_key
+        if not device_io.unsubmitting():
+            _SUBMITTING.key = self.cache_key
         return prepared
 
     return announce
