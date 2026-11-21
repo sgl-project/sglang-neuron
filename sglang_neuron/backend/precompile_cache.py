@@ -51,7 +51,11 @@ _IGNORED_SERVER_ARGS = frozenset({
     "collect_tokens_histogram",
     "disaggregation_bootstrap_port", "disaggregation_ib_device", "file_storage_path", "crash_dump_folder",
     "watchdog_timeout", "random_seed", "prompt_tokens_details", "enable_request_time_stats_logging",
+    # the scheduler's policy alone: which batch runs next, not what a graph computes
+    "prefill_decode_interval", "prefill_decode_interval_min_bs", "schedule_policy", "schedule_conservativeness",
 })
+# environment switches of the same kind: the scheduler's choices and what a launch records (SGLANG_NEURON_PROFILE_*)
+_IGNORED_ENV_PREFIXES = ("SGLANG_NEURON_PROFILE_", "SGLANG_NEURON_PREFILL_YIELD", "SGLANG_NEURON_HOST_TRACE")
 
 _enabled = False
 _configured: Optional[str] = None
@@ -176,7 +180,8 @@ def fingerprint_inputs(environ: Mapping[str, str] = os.environ) -> Dict[str, Any
         "server_args": _server_args(),
         # the internal ones name this launch's ports and rendezvous, not its graphs
         "env": {k: v for k, v in sorted(environ.items())
-                if k.startswith("SGLANG_NEURON_") and env_registry.KNOBS.get(k) != env_registry.INTERNAL},
+                if k.startswith("SGLANG_NEURON_") and env_registry.KNOBS.get(k) != env_registry.INTERNAL
+                and not k.startswith(_IGNORED_ENV_PREFIXES)},
         "versions": {"torch": torch.__version__, "torch-neuronx": _version("torch-neuronx"), "nki": _version("nki"),
                      "neuronx-cc": _version("neuronx-cc")},
     }
