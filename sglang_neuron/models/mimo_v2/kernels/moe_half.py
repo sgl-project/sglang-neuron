@@ -151,23 +151,27 @@ def _experts_by_program(xq, inv_xs, aff, gate_up_w, down_w, gate_up_scale, down_
             # out of PSUM: back to the activations' scale, times the weights' per-row scales, in one op
             nisa.scalar_tensor_tensor(dst=gu[0:T, g, c0:c0 + cs], data=ps[ci][0:T, 0:cs], op0=nl.multiply,
                                       operand0=inv_xs[0:T, 0:1], op1=nl.multiply, operand1=gus[0:T, g, c0:c0 + cs])
-        g_sb = nl.ndarray((P, I), dtype=nl.float32, buffer=nl.sbuf)
-        nisa.activation(dst=g_sb[0:T, 0:I], op=nl.silu, data=gu[0:T, 0, 0:I])
-        it = nl.ndarray((P, I), dtype=nl.bfloat16, buffer=nl.sbuf)
-        nisa.tensor_tensor(it[0:T, 0:I], gu[0:T, 1, 0:I], g_sb[0:T, 0:I], nl.multiply)
-        # the down input in FP8, each token's row times 240 / its absolute max
-        ds_, inv_ds = _token_scales(it, T, I)
-        nisa.tensor_scalar(dst=it[0:T, 0:I], data=it[0:T, 0:I], op0=nl.multiply, operand0=ds_[0:T, 0:1],
-                           op1=nl.minimum, operand1=FP8_MAX)
-        nisa.tensor_scalar(dst=it[0:T, 0:I], data=it[0:T, 0:I], op0=nl.maximum, operand0=-FP8_MAX)
-        # the expert's weight on each row, its activation scale folded in
-        col = nl.ndarray((P, 1), dtype=nl.float32, buffer=nl.sbuf)
-        nisa.tensor_tensor(col[0:T, 0:1], aff[0:T, e:e + 1], inv_ds[0:T, 0:1], nl.multiply)
         itT = nl.ndarray((P, n_ic, P), dtype=nl.float8_e4m3, buffer=nl.sbuf)
-        for c in range(n_ic):
-            tp2 = nl.ndarray((P, P), dtype=nl.bfloat16, buffer=nl.psum)
-            nisa.nc_transpose(dst=tp2[0:P, 0:T], data=it[0:T, c * P:(c + 1) * P])
-            nisa.tensor_copy(dst=itT[0:P, c, 0:T], src=tp2[0:P, 0:T])
+        col = nl.ndarray((P, 1), dtype=nl.float32, buffer=nl.sbuf)
+        # gate and up with I on the partitions, then the activation and the FP8 down input there
+        guT = nl.ndarray((P, 2 * n_ic, T), dtype=nl.float32, buffer=nl.psum)
+        for g in range(2):
+            for c in range(n_ic):
+                nisa.nc_transpose(dst=guT[0:P, g * n_ic + c, 0:T], data=gu[0:T, g, c * P:(c + 1) * P])
+        sg = nl.ndarray((P, n_ic, T), dtype=nl.float32, buffer=nl.sbuf)
+        nisa.activation(dst=sg[0:P, 0:n_ic, 0:T], op=nl.silu, data=guT[0:P, 0:n_ic, 0:T])
+        itb = nl.ndarray((P, n_ic, T), dtype=nl.bfloat16, buffer=nl.sbuf)
+        nisa.tensor_tensor(itb[0:P, 0:n_ic, 0:T], guT[0:P, n_ic:2 * n_ic, 0:T], sg[0:P, 0:n_ic, 0:T],
+                           nl.multiply)
+        ds_, inv_ds = _colmax_scales(itb, T, n_ic)
+        ds_b = _bcast_rows(ds_, T, n_ic, f"dn_scale_bcast_{j}")
+        nqd = nl.ndarray((P, n_ic, T), dtype=nl.float32, buffer=nl.sbuf)
+        nisa.tensor_tensor(nqd[0:P, 0:n_ic, 0:T], itb[0:P, 0:n_ic, 0:T],
+                           ds_b.reshape((P, n_ic, T))[0:P, 0:n_ic, 0:T], nl.multiply)
+        nisa.tensor_scalar(dst=itT[0:P, 0:n_ic, 0:T], data=nqd[0:P, 0:n_ic, 0:T], op0=nl.minimum,
+                           operand0=FP8_MAX, op1=nl.maximum, operand1=-FP8_MAX)
+        # the expert's weight on each row, its activation scale folded in
+        nisa.tensor_tensor(col[0:T, 0:1], aff[0:T, e:e + 1], inv_ds[0:T, 0:1], nl.multiply)
         base = e * (I * H)
         for hq in range(H // dn_cols):
             pd = [nl.ndarray((P, 512), dtype=nl.float32, buffer=nl.psum) for _ in range(dn_cols // 512)]
@@ -230,6 +234,24 @@ def _tree(x, n: int, T: int, op, dtype):
     return cur.reshape((P, T))
 
 
+def _colmax_scales(xT, T: int, n: int):
+    """(scale, 1 / scale) [128, 1] fp32 of each token of ``xT`` [128, n, T] (a token's values down the partitions and
+    the n tiles: its column t): 240 / its absolute max, as _token_scales over the token's row."""
+    ab = nl.ndarray((P, n, T), dtype=nl.float32, buffer=nl.sbuf)
+    nisa.activation(dst=ab[0:P, 0:n, 0:T], op=nl.abs, data=xT[0:P, 0:n, 0:T])
+    hi = _tree(ab, n, T, nl.maximum, nl.float32)
+    hiT = nl.ndarray((P, P), dtype=nl.float32, buffer=nl.psum)
+    nisa.nc_transpose(dst=hiT[0:T, 0:P], data=hi[0:P, 0:T])
+    amax = nl.ndarray((P, 1), dtype=nl.float32, buffer=nl.sbuf)
+    nisa.tensor_reduce(amax[0:T, 0:1], op=nl.maximum, data=hiT[0:T, 0:P], axis=1, keepdims=True)
+    nisa.tensor_scalar(dst=amax[0:T, 0:1], data=amax[0:T, 0:1], op0=nl.maximum, operand0=1e-30)
+    inv = nl.ndarray((P, 1), dtype=nl.float32, buffer=nl.sbuf)
+    nisa.tensor_scalar(dst=inv[0:T, 0:1], data=amax[0:T, 0:1], op0=nl.multiply, operand0=1.0 / FP8_MAX)
+    sc = nl.ndarray((P, 1), dtype=nl.float32, buffer=nl.sbuf)
+    nisa.reciprocal(dst=sc[0:T, 0:1], data=inv[0:T, 0:1])
+    return sc, inv
+
+
 def _prologue_transposed(hsrc, ln_w, T: int, H: int, eps, fp8_act: bool):
     """moe_half's RMSNorm and FP8 input with H on the partitions: (nT [128, H / 128, 128] bf16, xq [128, H / 128, 128]
     fp8 or None, xs, inv_xs [128, 1] fp32 the per-token scales), every elementwise op over [128, H / 128 x T] instead of
@@ -266,18 +288,7 @@ def _prologue_transposed(hsrc, ln_w, T: int, H: int, eps, fp8_act: bool):
     if not fp8_act:
         return nT, None, None, None
     # each token's absolute max: over the tiles, then over the partitions through a transpose
-    ab = nl.ndarray((P, H1, T), dtype=nl.float32, buffer=nl.sbuf)
-    nisa.activation(dst=ab[0:P, 0:H1, 0:T], op=nl.abs, data=nT[0:P, 0:H1, 0:T])
-    hi = _tree(ab, H1, T, nl.maximum, nl.float32)
-    hiT = nl.ndarray((P, P), dtype=nl.float32, buffer=nl.psum)
-    nisa.nc_transpose(dst=hiT[0:T, 0:P], data=hi[0:P, 0:T])
-    amax = nl.ndarray((P, 1), dtype=nl.float32, buffer=nl.sbuf)
-    nisa.tensor_reduce(amax[0:T, 0:1], op=nl.maximum, data=hiT[0:T, 0:P], axis=1, keepdims=True)
-    nisa.tensor_scalar(dst=amax[0:T, 0:1], data=amax[0:T, 0:1], op0=nl.maximum, operand0=1e-30)
-    inv_xs = nl.ndarray((P, 1), dtype=nl.float32, buffer=nl.sbuf)
-    nisa.tensor_scalar(dst=inv_xs[0:T, 0:1], data=amax[0:T, 0:1], op0=nl.multiply, operand0=1.0 / FP8_MAX)
-    xs = nl.ndarray((P, 1), dtype=nl.float32, buffer=nl.sbuf)
-    nisa.reciprocal(dst=xs[0:T, 0:1], data=inv_xs[0:T, 0:1])
+    xs, inv_xs = _colmax_scales(nT, T, H1)
     xs_b = _bcast_rows(xs, T, H1, "pro_xs_bcast")
     nq = nl.ndarray((P, H1, T), dtype=nl.float32, buffer=nl.sbuf)
     nisa.tensor_tensor(nq[0:P, 0:H1, 0:T], nT[0:P, 0:H1, 0:T], xs_b.reshape((P, H1, T))[0:P, 0:H1, 0:T], nl.multiply)
