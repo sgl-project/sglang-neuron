@@ -83,6 +83,13 @@ def router_prefetch(router_wT):
     return rw
 
 
+def _load_rows(hidden, T: int, H: int):
+    """``hidden`` [T, H]'s rows in SBUF, [128, H] rows 0 .. T - 1."""
+    hf = nl.ndarray((P, H), dtype=hidden.dtype, buffer=nl.sbuf)
+    nisa.dma_copy(dst=hf[0:T, 0:H], src=hidden.ap(pattern=[[H, T], [1, H]], offset=0))
+    return hf
+
+
 def _token_scales(x, T: int, n: int):
     """(scale, 1 / scale) [128, 1] fp32 of each row 0 .. T - 1 of ``x`` [128, n]: 240 / its absolute max (a zero row
     gets a scale of 1)."""
@@ -192,6 +199,94 @@ def _experts_by_program(xq, inv_xs, aff, gate_up_w, down_w, gate_up_scale, down_
     return acc
 
 
+def _bcast_rows(col, T: int, n: int, name: str):
+    """[128, n x T] fp32 in PSUM: column t of every n-block the per-token scalar ``col`` [T, 1] fp32 (rows
+    0 .. T - 1), the same on every partition: ones [T, 128]^T times the scalar on a token mask (one matmul a 512
+    columns)."""
+    W = n * T
+    mask = nl.ndarray((P, n, T), dtype=nl.float32, buffer=nl.sbuf)
+    nisa.iota(mask[0:T, 0:n, 0:T], pattern=[[0, n], [1, T]], offset=0, channel_multiplier=-1)
+    nisa.tensor_scalar(dst=mask[0:T, 0:n, 0:T], data=mask[0:T, 0:n, 0:T], op0=nl.equal, operand0=0.0,
+                       op1=nl.multiply, operand1=1.0)
+    nisa.tensor_scalar(dst=mask[0:T, 0:n, 0:T], data=mask[0:T, 0:n, 0:T], op0=nl.multiply, operand0=col[0:T, 0:1])
+    ones = nl.ndarray((P, P), dtype=nl.float32, buffer=nl.sbuf)
+    nisa.memset(dst=ones[0:T, 0:P], value=1.0)
+    out = nl.ndarray((P, W), dtype=nl.float32, buffer=nl.psum, name=name)
+    flat = mask.reshape((P, W))
+    for c0 in range(0, W, 512):
+        cs = min(512, W - c0)
+        nisa.nc_matmul(dst=out[0:P, c0:c0 + cs], stationary=ones[0:T, 0:P], moving=flat[0:T, c0:c0 + cs])
+    return out
+
+
+def _tree(x, n: int, T: int, op, dtype):
+    """``x`` [128, n, T] (n a power of two) reduced over its middle axis by halves: [128, T] (rows 0 .. 127)."""
+    cur, m = x, n
+    while m > 1:
+        m //= 2
+        nxt = nl.ndarray((P, m, T), dtype=dtype, buffer=nl.sbuf)
+        nisa.tensor_tensor(nxt[0:P, 0:m, 0:T], cur[0:P, 0:m, 0:T], cur[0:P, m:2 * m, 0:T], op)
+        cur = nxt
+    return cur.reshape((P, T))
+
+
+def _prologue_transposed(hsrc, ln_w, T: int, H: int, eps, fp8_act: bool):
+    """moe_half's RMSNorm and FP8 input with H on the partitions: (nT [128, H / 128, 128] bf16, xq [128, H / 128, 128]
+    fp8 or None, xs, inv_xs [128, 1] fp32 the per-token scales), every elementwise op over [128, H / 128 x T] instead of
+    [T, H] (a decode's T rows use T of the 128 lanes). The same values as the row-major form: x * rsqrt(mean(x^2) +
+    eps) rounded to bf16, times the weight rounded to bf16; the FP8 input each token's row times 240 / its absolute
+    max."""
+    H1 = H // P
+    W = H1 * T
+    # the rows transposed, every 128-column tile into one PSUM tile
+    pT = nl.ndarray((P, H1, T), dtype=nl.bfloat16, buffer=nl.psum)
+    for h1 in range(H1):
+        nisa.nc_transpose(dst=pT[0:P, h1, 0:T], data=hsrc[0:T, h1 * P:(h1 + 1) * P])
+    hT = nl.ndarray((P, H1, T), dtype=nl.bfloat16, buffer=nl.sbuf)
+    nisa.tensor_copy(dst=hT[0:P, 0:H1, 0:T], src=pT[0:P, 0:H1, 0:T])
+    # sum of squares: over the tiles, then over the partitions by a matmul against ones
+    sq = nl.ndarray((P, H1, T), dtype=nl.float32, buffer=nl.sbuf)
+    nisa.activation(dst=sq[0:P, 0:H1, 0:T], op=nl.square, data=hT[0:P, 0:H1, 0:T])
+    s1 = _tree(sq, H1, T, nl.add, nl.float32)
+    onec = nl.ndarray((P, 1), dtype=nl.float32, buffer=nl.sbuf)
+    nisa.memset(dst=onec[0:P, 0:1], value=1.0)
+    ssp = nl.ndarray((P, 1), dtype=nl.float32, buffer=nl.psum)
+    nisa.nc_matmul(dst=ssp[0:T, 0:1], stationary=s1[0:P, 0:T], moving=onec[0:P, 0:1])
+    rr = nl.ndarray((P, 1), dtype=nl.float32, buffer=nl.sbuf)
+    nisa.activation(dst=rr[0:T, 0:1], op=nl.rsqrt, data=ssp[0:T, 0:1], scale=1.0 / H, bias=eps)
+    rr_b = _bcast_rows(rr, T, H1, "pro_rr_bcast")
+    nb = nl.ndarray((P, H1, T), dtype=nl.bfloat16, buffer=nl.sbuf)
+    nisa.tensor_tensor(nb[0:P, 0:H1, 0:T], hT[0:P, 0:H1, 0:T], rr_b.reshape((P, H1, T))[0:P, 0:H1, 0:T], nl.multiply)
+    # the weight with H on the partitions: element (p, h1) is ln_w[h1 x 128 + p]
+    gT = nl.ndarray((P, H1), dtype=nl.float32, buffer=nl.sbuf)
+    nisa.dma_copy(dst=gT[0:P, 0:H1], src=ln_w.ap(pattern=[[1, P], [P, H1]], offset=0))
+    nT = nl.ndarray((P, H1, P), dtype=nl.bfloat16, buffer=nl.sbuf)
+    for h1 in range(H1):
+        nisa.tensor_scalar(dst=nT[0:P, h1, 0:T], data=nb[0:P, h1, 0:T], op0=nl.multiply, operand0=gT[0:P, h1:h1 + 1])
+    if not fp8_act:
+        return nT, None, None, None
+    # each token's absolute max: over the tiles, then over the partitions through a transpose
+    ab = nl.ndarray((P, H1, T), dtype=nl.float32, buffer=nl.sbuf)
+    nisa.activation(dst=ab[0:P, 0:H1, 0:T], op=nl.abs, data=nT[0:P, 0:H1, 0:T])
+    hi = _tree(ab, H1, T, nl.maximum, nl.float32)
+    hiT = nl.ndarray((P, P), dtype=nl.float32, buffer=nl.psum)
+    nisa.nc_transpose(dst=hiT[0:T, 0:P], data=hi[0:P, 0:T])
+    amax = nl.ndarray((P, 1), dtype=nl.float32, buffer=nl.sbuf)
+    nisa.tensor_reduce(amax[0:T, 0:1], op=nl.maximum, data=hiT[0:T, 0:P], axis=1, keepdims=True)
+    nisa.tensor_scalar(dst=amax[0:T, 0:1], data=amax[0:T, 0:1], op0=nl.maximum, operand0=1e-30)
+    inv_xs = nl.ndarray((P, 1), dtype=nl.float32, buffer=nl.sbuf)
+    nisa.tensor_scalar(dst=inv_xs[0:T, 0:1], data=amax[0:T, 0:1], op0=nl.multiply, operand0=1.0 / FP8_MAX)
+    xs = nl.ndarray((P, 1), dtype=nl.float32, buffer=nl.sbuf)
+    nisa.reciprocal(dst=xs[0:T, 0:1], data=inv_xs[0:T, 0:1])
+    xs_b = _bcast_rows(xs, T, H1, "pro_xs_bcast")
+    nq = nl.ndarray((P, H1, T), dtype=nl.float32, buffer=nl.sbuf)
+    nisa.tensor_tensor(nq[0:P, 0:H1, 0:T], nT[0:P, 0:H1, 0:T], xs_b.reshape((P, H1, T))[0:P, 0:H1, 0:T], nl.multiply)
+    xq = nl.ndarray((P, H1, P), dtype=nl.float8_e4m3, buffer=nl.sbuf)
+    nisa.tensor_scalar(dst=xq[0:P, 0:H1, 0:T], data=nq[0:P, 0:H1, 0:T], op0=nl.minimum, operand0=FP8_MAX,
+                       op1=nl.maximum, operand1=-FP8_MAX)
+    return nT, xq, xs, inv_xs
+
+
 @nki.jit
 def moe_half(hidden, ln_w, router_wT, expert_bias, ebase, gate_up_w, down_w, gate_up_scale, down_scale, eps=1e-6,
              route_scale=1.0, top_k=8, hidden_sb=None, out_in_sbuf=False, fp8_act=True, pre=None, router_sb=None):
@@ -215,43 +310,9 @@ def moe_half(hidden, ln_w, router_wT, expert_bias, ebase, gate_up_w, down_w, gat
     ILe = I // n_prg
     n_ic = ILe // P
 
-    # ---- RMSNorm (fp32 math, bf16 result like the torch path) ----
-    hf = nl.ndarray((P, H), dtype=nl.bfloat16, buffer=nl.sbuf)
-    if hidden_sb is None:
-        nisa.dma_copy(dst=hf[0:T, 0:H], src=hidden.ap(pattern=[[H, T], [1, H]], offset=0))
-    else:
-        nisa.tensor_copy(dst=hf[0:T, 0:H], src=hidden_sb[0:T, 0:H])
-    gam = nl.ndarray((P, H), dtype=nl.bfloat16, buffer=nl.sbuf)
-    nisa.dma_copy(dst=gam[0:T, 0:H], src=ln_w.ap(pattern=[[0, T], [1, H]], offset=0))
-    sq = nl.ndarray((P, H), dtype=nl.float32, buffer=nl.sbuf)
-    ss = nl.ndarray((P, 1), dtype=nl.float32, buffer=nl.sbuf)
-    nisa.activation(dst=sq[0:T, 0:H], op=nl.square, data=hf[0:T, 0:H], reduce_op=nl.add,
-                    reduce_res=ss[0:T, 0:1], reduce_cmd=nisa.reduce_cmd.reset_reduce)
-    rr = nl.ndarray((P, 1), dtype=nl.float32, buffer=nl.sbuf)
-    nisa.activation(dst=rr[0:T, 0:1], op=nl.rsqrt, data=ss[0:T, 0:1], scale=1.0 / H, bias=eps)
-    nb = nl.ndarray((P, H), dtype=nl.bfloat16, buffer=nl.sbuf)
-    # x * rsqrt(mean(x^2) + eps) rounded to bf16, then times the weight (models/transformer/model.RMSNorm)
-    nisa.tensor_scalar(dst=nb[0:T, 0:H], data=hf[0:T, 0:H], op0=nl.multiply, operand0=rr[0:T, 0:1])
-    nrm = nl.ndarray((P, H), dtype=nl.bfloat16, buffer=nl.sbuf)
-    nisa.tensor_tensor(nrm[0:T, 0:H], nb[0:T, 0:H], gam[0:T, 0:H], nl.multiply)
-    nT = nl.ndarray((P, H1, P), dtype=nl.bfloat16, buffer=nl.sbuf)
-    for h1 in range(H1):
-        tp = nl.ndarray((P, P), dtype=nl.bfloat16, buffer=nl.psum)
-        nisa.nc_transpose(dst=tp[0:P, 0:T], data=nrm[0:T, h1 * P : (h1 + 1) * P])
-        nisa.tensor_copy(dst=nT[0:P, h1, 0:T], src=tp[0:P, 0:T])
-
-    if fp8_act:
-        # the experts' input: each token's row times 240 / its absolute max, in FP8, transposed like nT
-        xs, inv_xs = _token_scales(nrm, T, H)
-        nq = nl.ndarray((P, H), dtype=nl.bfloat16, buffer=nl.sbuf)
-        nisa.tensor_scalar(dst=nq[0:T, 0:H], data=nrm[0:T, 0:H], op0=nl.multiply, operand0=xs[0:T, 0:1],
-                           op1=nl.minimum, operand1=FP8_MAX)
-        nisa.tensor_scalar(dst=nq[0:T, 0:H], data=nq[0:T, 0:H], op0=nl.maximum, operand0=-FP8_MAX)
-        xq = nl.ndarray((P, H1, P), dtype=nl.float8_e4m3, buffer=nl.sbuf)
-        for h1 in range(H1):
-            tq = nl.ndarray((P, P), dtype=nl.bfloat16, buffer=nl.psum)
-            nisa.nc_transpose(dst=tq[0:P, 0:T], data=nq[0:T, h1 * P : (h1 + 1) * P])
-            nisa.tensor_copy(dst=xq[0:P, h1, 0:T], src=tq[0:P, 0:T])
+    # ---- RMSNorm and the experts' FP8 input, H on the partitions (_prologue_transposed) ----
+    nT, xq, xs, inv_xs = _prologue_transposed(hidden_sb if hidden_sb is not None else _load_rows(hidden, T, H),
+                                              ln_w, T, H, eps, fp8_act)
 
     # ---- router: logits [T, EA] = normed @ W^T (bf16 x bf16, fp32 accumulate) ----
     rw = router_sb if router_sb is not None else router_prefetch(router_wT)
