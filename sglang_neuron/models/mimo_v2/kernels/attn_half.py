@@ -150,6 +150,26 @@ def _attention_dcp(X, H, eps, gamma, W_qkv, cos, sin, table, K_cache, V_cache, a
 
 
 @nki.jit
+def prior_mask(pos, start, active, s_prior: int, block_len: int, q_head: int, d_head: int, fp8_kv: bool):
+    """One decode step's full attention mask for a layer kind, in the layout attn_half's mask path reads (nkilib's
+    gen_mask_tkg_hbm, QK-swapped where nkilib's is_qk_swapped takes that path for the shape): ``pos`` [B, S] fp32 each
+    token's prior length, ``start`` [B, S] fp32 or None its window start, ``active`` [S, B, q_head, S] uint8 the span's
+    active part. Every sliding layer of the step reads the one mask (model.MiMoV2Graph._layer_call), where the
+    position path builds it again inside each layer's attention: 32 small instructions a row at a batch of 8 MTP rows,
+    ~0.9 ms a decode step."""
+    from nkilib.core.attention.attention_tkg_utils import is_qk_swapped
+    from nkilib.core.attention.gen_mask_tkg import gen_mask_tkg_hbm
+
+    B, S = pos.shape
+    swapped = is_qk_swapped(bs=B, q_head=q_head, d_head=d_head, s_active=S, curr_sprior=s_prior,
+                            lnc=nl.num_programs(axes=0), p_max=P, is_block_kv=block_len > 0, is_2byte_kv=not fp8_kv,
+                            fp8_packed=False, fuse_rope=False)
+    return gen_mask_tkg_hbm(pos.reshape((1, B * S)), B, q_head, S, s_prior,
+                            start_pos_hbm=None if start is None else start.reshape((1, B * S)), block_len=block_len,
+                            active_mask=active, transposed_out=swapped)
+
+
+@nki.jit
 def attn_half(X, rmsnorm_X_gamma, W_qkv, cos, sin, active_blocks_table, K_cache, V_cache, attention_mask, sink,
               slots, W_o, k_scale=None, v_scale=None, rmsnorm_X_eps=1e-6, softmax_scale=1.0, v_head_dim=128,
               out_in_sbuf=False, pos=None, rank=None, kvdp=1, kvdp_mesh=None, start=None, dcp=1, dcp_mesh=None,
