@@ -14,9 +14,14 @@ Per layer and rank, for T <= 128 decode tokens:
      experts_fp8.py applied after each matmul
 The output is the rank's partial [T, H]; the caller all-reduces it.
 
-The two programs of the logical NeuronCore each contract one half of H for gate / up and exchange the halves of their
-partial sums (``sendrecv``); each keeps one half of I for the activation and the down projection, and a last exchange
-sums the two halves of the output, as the Hy3 kernel does.
+Under W8A8 (the default) the two programs of the logical NeuronCore split the local experts: each runs E / 2 of them
+over the whole of H (_experts_by_program) and a last exchange (``sendrecv``) sums the two programs' outputs, each
+program keeping one half of H. Each program streams the same weight bytes as a split over H would, without the split's
+exchange inside every expert, with half its PSUM evacuation and its down weights in whole rows
+(tools/mimo_v2/bench_moe_half.py: 259 -> 201 us a layer at 4 rows). Otherwise (bf16 activations, or an odd E) each
+program contracts one half of H for gate / up and the two exchange the halves of their partial sums; each keeps one
+half of I for the activation and the down projection, and the last exchange sums the two halves of the output, as the
+Hy3 kernel does.
 
 Inputs:
   hidden         [T, H] bf16, the residual stream after attention, before the norm
@@ -50,20 +55,32 @@ def moe_prefetch(gate_up_w, n: int):
     E, H, _, I = gate_up_w.shape  # noqa: E741
     n_prg = nl.num_programs(axes=0)
     pid = nl.program_id(axis=0)
-    n_k = H // P // n_prg
-    h0 = pid * (H // n_prg)
+    by_program = E % n_prg == 0  # moe_half's W8A8 path: this program's experts over the whole of H
+    n_k = H // P if by_program else H // P // n_prg
     tiles = []
     for t in range(n):
-        e, k = t // (n_k // 2), t % (n_k // 2)
-        if e >= E:
+        j, k = t // (n_k // 2), t % (n_k // 2)
+        if j >= (E // n_prg if by_program else E):
             break
+        e = pid * (E // n_prg) + j if by_program else j
+        row = 2 * k * P if by_program else pid * (H // n_prg) + 2 * k * P
         buf = nl.ndarray((P, 2, 2 * I), dtype=gate_up_w.dtype, buffer=nl.sbuf)
-        row = h0 + 2 * k * P
         nisa.dma_copy(dst=buf[0:P, 0:2, 0 : 2 * I],
                       src=gate_up_w.ap(pattern=[[2 * I, P], [P * 2 * I, 2], [1, 2 * I]],
                                        offset=e * (H * 2 * I) + row * 2 * I), dge_mode=nisa.dge_mode.hwdge)
         tiles.append(buf)
     return tiles
+
+
+def router_prefetch(router_wT):
+    """The router weight [H, EA] in SBUF as moe_half reads it ([128, H / 128, EA]), DMA'd now: a caller issues this
+    before the attention (layer.py, beside moe_prefetch) and hands it to moe_half (``router_sb``), so the router's
+    2 MB a layer is not loaded between the attention's all-reduce and the router matmul."""
+    H, EA = router_wT.shape
+    rw = nl.ndarray((P, H // P, EA), dtype=router_wT.dtype, buffer=nl.sbuf)
+    nisa.dma_copy(dst=rw[0:P, 0:H // P, 0:EA], src=router_wT.ap(pattern=[[EA, P], [P * EA, H // P], [1, EA]], offset=0),
+                  dge_mode=nisa.dge_mode.hwdge)
+    return rw
 
 
 def _token_scales(x, T: int, n: int):
@@ -85,9 +102,99 @@ def _token_scales(x, T: int, n: int):
     return sc, inv
 
 
+def _experts_by_program(xq, inv_xs, aff, gate_up_w, down_w, gate_up_scale, down_scale, T: int, H: int, I: int,
+                        E: int, pid, n_prg: int, pre=None):
+    """moe_half's W8A8 experts split between the programs: this program's E / programs local experts over the whole of
+    H (``xq`` [128, H / 128, 128] the FP8 input, transposed; ``inv_xs`` its per-token scales' inverse; ``aff`` [128, E]
+    the affinities), no exchange inside an expert. Returns their weighted sum, [128, H] fp32, rows 0 .. T - 1."""
+    H1 = H // P
+    EP = E // n_prg
+    # the down weights a whole row of H a tile (4 KB runs; 1 KB runs measured 219 against 201 us a layer)
+    dn_cols = H if H <= 4096 else 4096
+    n_ic = I // P
+    gu2_ring = [nl.ndarray((P, 2, 2 * I), dtype=gate_up_w.dtype, buffer=nl.sbuf) for _ in range(RING)]
+    dn2_ring = [nl.ndarray((P, 2, dn_cols), dtype=down_w.dtype, buffer=nl.sbuf) for _ in range(RING)]
+    acc = nl.ndarray((P, H), dtype=nl.float32, buffer=nl.sbuf)
+    slots = [0, 0]
+    chunks = [(g, c0, min(512, I - c0)) for g in range(2) for c0 in range(0, I, 512)]
+    for j in range(EP):
+        e = pid * EP + j
+        # gate / up: two 128-row tiles of H a pass (double row)
+        ps = [nl.ndarray((P, 512), dtype=nl.float32, buffer=nl.psum) for _ in chunks]
+        for k in range(H1 // 2):
+            tile = j * (H1 // 2) + k
+            if pre is not None and tile < len(pre):
+                buf = pre[tile]  # loaded ahead (moe_prefetch)
+            else:
+                buf = gu2_ring[slots[0] % RING]
+                slots[0] += 1
+                nisa.dma_copy(dst=buf[0:P, 0:2, 0:2 * I],
+                              src=gate_up_w.ap(pattern=[[2 * I, P], [P * 2 * I, 2], [1, 2 * I]],
+                                               offset=e * (H * 2 * I) + 2 * k * P * 2 * I),
+                              dge_mode=nisa.dge_mode.hwdge)
+            for ci, (g, c0, cs) in enumerate(chunks):
+                nisa.nc_matmul(dst=ps[ci][0:T, 0:cs], stationary=xq[0:P, 2 * k:2 * k + 2, 0:T],
+                               moving=buf[0:P, 0:2, g * I + c0:g * I + c0 + cs],
+                               perf_mode=nisa.matmul_perf_mode.double_row)
+        gus = nl.ndarray((P, 2, I), dtype=nl.float32, buffer=nl.sbuf)
+        nisa.dma_copy(dst=gus[0:T, 0:2, 0:I], src=gate_up_scale.ap(pattern=[[0, T], [I, 2], [1, I]], offset=e * 2 * I),
+                      dge_mode=nisa.dge_mode.hwdge)
+        gu = nl.ndarray((P, 2, I), dtype=nl.float32, buffer=nl.sbuf)
+        for ci, (g, c0, cs) in enumerate(chunks):
+            # out of PSUM: back to the activations' scale, times the weights' per-row scales, in one op
+            nisa.scalar_tensor_tensor(dst=gu[0:T, g, c0:c0 + cs], data=ps[ci][0:T, 0:cs], op0=nl.multiply,
+                                      operand0=inv_xs[0:T, 0:1], op1=nl.multiply, operand1=gus[0:T, g, c0:c0 + cs])
+        g_sb = nl.ndarray((P, I), dtype=nl.float32, buffer=nl.sbuf)
+        nisa.activation(dst=g_sb[0:T, 0:I], op=nl.silu, data=gu[0:T, 0, 0:I])
+        it = nl.ndarray((P, I), dtype=nl.bfloat16, buffer=nl.sbuf)
+        nisa.tensor_tensor(it[0:T, 0:I], gu[0:T, 1, 0:I], g_sb[0:T, 0:I], nl.multiply)
+        # the down input in FP8, each token's row times 240 / its absolute max
+        ds_, inv_ds = _token_scales(it, T, I)
+        nisa.tensor_scalar(dst=it[0:T, 0:I], data=it[0:T, 0:I], op0=nl.multiply, operand0=ds_[0:T, 0:1],
+                           op1=nl.minimum, operand1=FP8_MAX)
+        nisa.tensor_scalar(dst=it[0:T, 0:I], data=it[0:T, 0:I], op0=nl.maximum, operand0=-FP8_MAX)
+        # the expert's weight on each row, its activation scale folded in
+        col = nl.ndarray((P, 1), dtype=nl.float32, buffer=nl.sbuf)
+        nisa.tensor_tensor(col[0:T, 0:1], aff[0:T, e:e + 1], inv_ds[0:T, 0:1], nl.multiply)
+        itT = nl.ndarray((P, n_ic, P), dtype=nl.float8_e4m3, buffer=nl.sbuf)
+        for c in range(n_ic):
+            tp2 = nl.ndarray((P, P), dtype=nl.bfloat16, buffer=nl.psum)
+            nisa.nc_transpose(dst=tp2[0:P, 0:T], data=it[0:T, c * P:(c + 1) * P])
+            nisa.tensor_copy(dst=itT[0:P, c, 0:T], src=tp2[0:P, 0:T])
+        base = e * (I * H)
+        for hq in range(H // dn_cols):
+            pd = [nl.ndarray((P, 512), dtype=nl.float32, buffer=nl.psum) for _ in range(dn_cols // 512)]
+            for jj in range(n_ic // 2):
+                db = dn2_ring[slots[1] % RING]
+                slots[1] += 1
+                nisa.dma_copy(dst=db[0:P, 0:2, 0:dn_cols],
+                              src=down_w.ap(pattern=[[H, P], [P * H, 2], [1, dn_cols]],
+                                            offset=base + 2 * jj * P * H + hq * dn_cols), dge_mode=nisa.dge_mode.hwdge)
+                for b in range(dn_cols // 512):
+                    nisa.nc_matmul(dst=pd[b][0:T, 0:512], stationary=itT[0:P, 2 * jj:2 * jj + 2, 0:T],
+                                   moving=db[0:P, 0:2, b * 512:(b + 1) * 512],
+                                   perf_mode=nisa.matmul_perf_mode.double_row)
+            ds = nl.ndarray((P, dn_cols), dtype=nl.float32, buffer=nl.sbuf)
+            nisa.dma_copy(dst=ds[0:T, 0:dn_cols], src=down_scale.ap(pattern=[[0, T], [1, dn_cols]],
+                                                                    offset=e * H + hq * dn_cols),
+                          dge_mode=nisa.dge_mode.hwdge)
+            for b in range(dn_cols // 512):
+                c0 = hq * dn_cols + b * 512
+                scaled = nl.ndarray((P, 512), dtype=nl.float32, buffer=nl.sbuf)
+                nisa.tensor_tensor(scaled[0:T, 0:512], pd[b][0:T, 0:512], ds[0:T, b * 512:(b + 1) * 512],
+                                   nl.multiply)
+                if j == 0:
+                    nisa.tensor_scalar(dst=acc[0:T, c0:c0 + 512], data=scaled[0:T, 0:512], op0=nl.multiply,
+                                       operand0=col[0:T, 0:1])
+                else:
+                    nisa.scalar_tensor_tensor(dst=acc[0:T, c0:c0 + 512], data=scaled[0:T, 0:512], op0=nl.multiply,
+                                              operand0=col[0:T, 0:1], op1=nl.add, operand1=acc[0:T, c0:c0 + 512])
+    return acc
+
+
 @nki.jit
 def moe_half(hidden, ln_w, router_wT, expert_bias, ebase, gate_up_w, down_w, gate_up_scale, down_scale, eps=1e-6,
-             route_scale=1.0, top_k=8, hidden_sb=None, out_in_sbuf=False, fp8_act=True, pre=None):
+             route_scale=1.0, top_k=8, hidden_sb=None, out_in_sbuf=False, fp8_act=True, pre=None, router_sb=None):
     """Inside another kernel (layer.py) ``hidden_sb`` holds the rows in SBUF (``hidden`` then gives the shape only),
     and ``out_in_sbuf`` returns this program's half of H of the partial in SBUF (rows 0 .. T - 1 of a [128, H /
     programs] tile) in place of the HBM output. ``fp8_act`` (the default) quantizes each token's activations to FP8
@@ -147,8 +254,7 @@ def moe_half(hidden, ln_w, router_wT, expert_bias, ebase, gate_up_w, down_w, gat
             nisa.tensor_copy(dst=xq[0:P, h1, 0:T], src=tq[0:P, 0:T])
 
     # ---- router: logits [T, EA] = normed @ W^T (bf16 x bf16, fp32 accumulate) ----
-    rw = nl.ndarray((P, H1, EA), dtype=router_wT.dtype, buffer=nl.sbuf)
-    nisa.dma_copy(dst=rw[0:P, 0:H1, 0:EA], src=router_wT.ap(pattern=[[EA, P], [P * EA, H1], [1, EA]], offset=0), dge_mode=nisa.dge_mode.hwdge)
+    rw = router_sb if router_sb is not None else router_prefetch(router_wT)
     lg = nl.ndarray((P, EA), dtype=nl.float32, buffer=nl.psum)
     for h1 in range(H1):
         nisa.nc_matmul(dst=lg[0:T, 0:EA], stationary=nT[0:P, h1, 0:T], moving=rw[0:P, h1, 0:EA])
@@ -207,8 +313,13 @@ def moe_half(hidden, ln_w, router_wT, expert_bias, ebase, gate_up_w, down_w, gat
     acc = nl.ndarray((P, H), dtype=nl.float32, buffer=nl.sbuf)
     slots = [0, 0]
     chunks = [(g, c0, min(512, I - c0)) for g in range(2) for c0 in range(0, I, 512)]
+    by_program = fp8_act and E % n_prg == 0
+    if by_program:
+        acc = _experts_by_program(xq, inv_xs, aff, gate_up_w, down_w, gate_up_scale, down_scale, T, H, I, E, pid,
+                                  n_prg, pre=pre)
 
-    for e in range(E):
+    # the split over H (bf16 activations, or an odd E)
+    for e in (range(E) if not by_program else ()):
         # gate / up over this program's half of H: one 128-row pass per row tile
         ps = [nl.ndarray((P, 512), dtype=nl.float32, buffer=nl.psum) for _ in chunks]
         if fp8_act:
