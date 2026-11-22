@@ -182,6 +182,14 @@ def attn_half(X, rmsnorm_X_gamma, W_qkv, cos, sin, active_blocks_table, K_cache,
     HH = H // n_prg
     h0 = pid * HH
 
+    # the output projection's weights for this program's half of H, loading while the attention runs (each one's
+    # load sat between the attention and its matmul)
+    w_all = nl.ndarray((P, heads, HH), dtype=W_o.dtype, buffer=nl.sbuf)
+    for h in range(heads):
+        nisa.dma_copy(dst=w_all[0:v_head_dim, h, 0:HH],
+                      src=W_o.ap(pattern=[[H, v_head_dim], [1, HH]], offset=h * v_head_dim * H + h0),
+                      dge_mode=nisa.dge_mode.hwdge)
+
     if dcp > 1:
         heads_out, k_new, v_new = _attention_dcp(X, H, rmsnorm_X_eps, rmsnorm_X_gamma, W_qkv, cos, sin,
                                                  active_blocks_table, K_cache, V_cache, attention_mask, sink,
@@ -199,12 +207,34 @@ def attn_half(X, rmsnorm_X_gamma, W_qkv, cos, sin, active_blocks_table, K_cache,
                                              active_blocks_table, K_cache, V_cache, attention_mask, sink,
                                              softmax_scale, k_scale, v_scale)
     # the two programs each wrote a share of the rows, and each reads them all below (nkilib's transformer_tkg fences
-    # its attention output the same way)
+    # its attention output the same way); the new K / V are fenced and written after the output projection, which
+    # does not read them, so their DMAs overlap its matmuls and the all-reduce after it
     if n_prg > 1:
         nisa.core_barrier(data=heads_out, cores=(0, 1))
+
+    # ---- the output projection of this program's half of H ----
+    # heads_out [B, heads, d, S]: head h's channel j of token s of row b at ((b x heads + h) x d + j) x S + s; lhsT's
+    # columns are the tokens, row-major (column b x S + s)
+    lhsT = nl.ndarray((P, heads, P), dtype=heads_out.dtype, buffer=nl.sbuf)
+    for h in range(heads):
+        if S == 1:
+            nisa.dma_copy(dst=lhsT[0:v_head_dim, h, 0:B],
+                          src=heads_out.ap(pattern=[[1, v_head_dim], [heads * d, B]], offset=h * d))
+        else:
+            for b in range(B):
+                nisa.dma_copy(dst=lhsT[0:v_head_dim, h, b * S:(b + 1) * S],
+                              src=heads_out.ap(pattern=[[S, v_head_dim], [1, S]], offset=(b * heads + h) * d * S))
+    o_sb = nl.ndarray((P, HH), dtype=X.dtype, buffer=nl.sbuf)
+    for c in range(HH // COLS):
+        ps = nl.ndarray((P, COLS), dtype=nl.float32, buffer=nl.psum)
+        for h in range(heads):
+            nisa.nc_matmul(dst=ps[0:R, 0:COLS], stationary=lhsT[0:v_head_dim, h, 0:R],
+                           moving=w_all[0:v_head_dim, h, c * COLS:(c + 1) * COLS])
+        nisa.tensor_copy(dst=o_sb[0:R, c * COLS:(c + 1) * COLS], src=ps[0:R, 0:COLS])
+
+    if n_prg > 1:
         nisa.core_barrier(data=k_new, cores=(0, 1))
         nisa.core_barrier(data=v_new, cores=(0, 1))
-
     # ---- the new tokens' K / V into their slots: program 0 writes V, program 1 K (both on one program at LNC1) ----
     # K [d, B, S]: token r = b x S + s, channel j at j x R + r; V [B, 1, S, d]: token r at r x d
     idx = nl.ndarray((P, 1), dtype=slots.dtype, buffer=nl.sbuf)
@@ -223,27 +253,6 @@ def attn_half(X, rmsnorm_X_gamma, W_qkv, cos, sin, active_blocks_table, K_cache,
         nisa.dma_copy(dst=k_flat.ap(pattern=[[d, R], [1, d]], offset=0, vector_offset=idx[0:R, 0:1], indirect_dim=0),
                       src=k_rows[0:R, 0:d], oob_mode=oob_mode.skip)
 
-    # ---- the output projection of this program's half of H ----
-    # heads_out [B, heads, d, S]: head h's channel j of token s of row b at ((b x heads + h) x d + j) x S + s; lhsT's
-    # columns are the tokens, row-major (column b x S + s)
-    lhsT = nl.ndarray((P, heads, P), dtype=heads_out.dtype, buffer=nl.sbuf)
-    for h in range(heads):
-        if S == 1:
-            nisa.dma_copy(dst=lhsT[0:v_head_dim, h, 0:B],
-                          src=heads_out.ap(pattern=[[1, v_head_dim], [heads * d, B]], offset=h * d))
-        else:
-            for b in range(B):
-                nisa.dma_copy(dst=lhsT[0:v_head_dim, h, b * S:(b + 1) * S],
-                              src=heads_out.ap(pattern=[[S, v_head_dim], [1, S]], offset=(b * heads + h) * d * S))
-    o_sb = nl.ndarray((P, HH), dtype=X.dtype, buffer=nl.sbuf)
-    for c in range(HH // COLS):
-        ps = nl.ndarray((P, COLS), dtype=nl.float32, buffer=nl.psum)
-        for h in range(heads):
-            w = nl.ndarray((P, COLS), dtype=W_o.dtype, buffer=nl.sbuf)
-            nisa.dma_copy(dst=w[0:v_head_dim, 0:COLS],
-                          src=W_o.ap(pattern=[[H, v_head_dim], [1, COLS]], offset=h * v_head_dim * H + h0 + c * COLS), dge_mode=nisa.dge_mode.hwdge)
-            nisa.nc_matmul(dst=ps[0:R, 0:COLS], stationary=lhsT[0:v_head_dim, h, 0:R], moving=w[0:v_head_dim, 0:COLS])
-        nisa.tensor_copy(dst=o_sb[0:R, c * COLS:(c + 1) * COLS], src=ps[0:R, 0:COLS])
     if out_in_sbuf:
         return o_sb, K_cache, V_cache
     out = nl.ndarray((R, H), dtype=X.dtype, buffer=nl.shared_hbm, name="attn_half_out")
