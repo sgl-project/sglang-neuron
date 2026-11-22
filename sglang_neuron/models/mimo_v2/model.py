@@ -749,8 +749,10 @@ class MiMoV2Graph(nn.Module):
 
     def _swa_step_mask(self, layer, active, table, step):
         """The sliding layers' full decode mask for this step (kernels/attn_half.prior_mask), built once and kept in
-        ``step`` for every sliding layer after; None under SGLANG_NEURON_MIMO_SWA_STEP_MASK=0 (each layer's attention
-        masks by position)."""
+        ``step`` for every sliding layer after, under SGLANG_NEURON_MIMO_SWA_STEP_MASK=1; None by default (each layer's
+        attention masks by position). Opt-in: on an 8K server it took c=8 20.75 -> 19.75 ms a step, but a 1M server
+        (SWA_RATIO 0.04) hung its first c=8 decode in a collective ("missing collectives status ... barrier END"),
+        not understood yet."""
         import os
 
         from sglang_neuron.backend.stack import wrap_nki
@@ -759,7 +761,7 @@ class MiMoV2Graph(nn.Module):
         from sglang_neuron.models.mimo_v2.kernels.attn_half import prior_mask
         from sglang_neuron.utils.hardware_config import get_logical_nc_config
 
-        if os.environ.get(SWA_MASK_ENV, "1").strip() == "0":
+        if os.environ.get(SWA_MASK_ENV, "0").strip() != "1":
             return None
         key = ("swa_step_mask", tuple(active.shape), tuple(table.shape))
         if key not in step:
