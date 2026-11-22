@@ -279,12 +279,16 @@ def _prologue_transposed(hsrc, ln_w, T: int, H: int, eps, fp8_act: bool):
     rr_b = _bcast_rows(rr, T, H1, "pro_rr_bcast")
     nb = nl.ndarray((P, H1, T), dtype=nl.bfloat16, buffer=nl.sbuf)
     nisa.tensor_tensor(nb[0:P, 0:H1, 0:T], hT[0:P, 0:H1, 0:T], rr_b.reshape((P, H1, T))[0:P, 0:H1, 0:T], nl.multiply)
-    # the weight with H on the partitions: element (p, h1) is ln_w[h1 x 128 + p]
-    gT = nl.ndarray((P, H1), dtype=nl.float32, buffer=nl.sbuf)
-    nisa.dma_copy(dst=gT[0:P, 0:H1], src=ln_w.ap(pattern=[[1, P], [P, H1]], offset=0))
+    # the weight with H on the partitions, element (p, h1) ln_w[h1 x 128 + p]: loaded in 128-element rows and
+    # transposed once (a transposing DMA moves it 2 bytes at a time, ~35 us on the prologue's critical path)
+    gR = nl.ndarray((P, P), dtype=ln_w.dtype, buffer=nl.sbuf)
+    nisa.dma_copy(dst=gR[0:H1, 0:P], src=ln_w.ap(pattern=[[P, H1], [1, P]], offset=0))
+    gTp = nl.ndarray((P, P), dtype=ln_w.dtype, buffer=nl.psum)
+    nisa.nc_transpose(dst=gTp[0:P, 0:H1], data=gR[0:H1, 0:P])
+    gT = nl.ndarray((P, H1, 1), dtype=nl.float32, buffer=nl.sbuf)
+    nisa.tensor_copy(dst=gT.reshape((P, H1))[0:P, 0:H1], src=gTp[0:P, 0:H1])
     nT = nl.ndarray((P, H1, P), dtype=nl.bfloat16, buffer=nl.sbuf)
-    for h1 in range(H1):
-        nisa.tensor_scalar(dst=nT[0:P, h1, 0:T], data=nb[0:P, h1, 0:T], op0=nl.multiply, operand0=gT[0:P, h1:h1 + 1])
+    nisa.tensor_tensor(nT[0:P, 0:H1, 0:T], nb[0:P, 0:H1, 0:T], gT[0:P, 0:H1, 0:1].broadcast(2, T), nl.multiply)
     if not fp8_act:
         return nT, None, None, None
     # each token's absolute max: over the tiles, then over the partitions through a transpose
