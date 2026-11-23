@@ -46,6 +46,7 @@ KNOBS: dict = {
     "SGLANG_NEURON_MIMO_KVDP": CONFIG,
     "SGLANG_NEURON_MIMO_SWA_STEP_MASK": CONFIG,
     "SGLANG_NEURON_MIMO_SWA_MASK_VEC": CONFIG,
+    "SGLANG_NEURON_MIMO_FA_EXIT": CONFIG,
     # MiMo-V2: the decode graphs' context rungs (models/mimo_v2/sglang_model.decode_context_ladder)
     "SGLANG_NEURON_MIMO_DECODE_CONTEXTS": CONFIG,
     # the Kimi-K3 prompt cache on the PD prefill (--radix-cache-backend kimi-prompt, mem_cache/kimi_prompt_backend):

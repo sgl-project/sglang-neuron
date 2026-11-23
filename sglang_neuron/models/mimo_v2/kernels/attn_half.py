@@ -79,6 +79,57 @@ def install_swa_mask_patch() -> bool:
 
 install_swa_mask_patch()
 
+
+def install_fa_exit_patch() -> bool:
+    """Fix nkilib attention_tkg's dynamic flash-attention early exit (``max_context_len``) for a resized block table:
+    _load_and_reshape_active_blk_table's resize_factor > 1 branch loads each FA tile's original blocks from
+    ``fold_start``, a static placeholder (0) on the dynamic path, so every dynamic tile re-read tile 0's blocks and its
+    attention came out wrong past the first 8K tile (sgl-project/sglang-neuron#4; tools probe: relative L2 1.3 at a
+    20K row of a 32K table, bit-equal with this). The patch shifts that load by the tile's runtime fold start
+    (``scalar_offset`` on the blocks dimension, as the resize_factor == 1 branch does). Rewrites the function's source
+    in nkilib's module and leaves it unchanged where the pattern is not found."""
+    import inspect
+
+    import nkilib.core.attention.attention_tkg as tkg
+
+    if getattr(tkg, "_mimo_fa_exit_patched", False):
+        return True
+    src = inspect.getsource(tkg._load_and_reshape_active_blk_table)
+    old = """            active_blk_table_slice = (
+                (active_blk_table)
+                .slice(0, start=batch_start + batch_offset, end=batch_start + batch_offset + cur_batch_chunk_sz)
+                .slice(1, start=orig_blk_start, end=orig_blk_end)
+            )"""
+    new = """            if is_dynamic:
+                # the dynamic path's fold_start is a placeholder: shift by the tile's runtime fold start, in blocks
+                dyn_blk_off = nl.ndarray((1, 1), dtype=nl.int32, buffer=nl.sbuf)
+                nisa.tensor_scalar(dst=dyn_blk_off, data=dynamic_fold_start_sbuf, op0=nl.multiply,
+                                   operand0=TC.p_max // resize_factor)
+                _dyn_view = (
+                    (active_blk_table)
+                    .slice(0, start=batch_start + batch_offset, end=batch_start + batch_offset + cur_batch_chunk_sz)
+                    .slice(1, start=0, end=orig_blks_this_tile)
+                )
+                active_blk_table_slice = _dyn_view.ap(pattern=_dyn_view.get_pattern(), scalar_offset=dyn_blk_off,
+                                                      indirect_dim=1)
+            else:
+                active_blk_table_slice = (
+                    (active_blk_table)
+                    .slice(0, start=batch_start + batch_offset, end=batch_start + batch_offset + cur_batch_chunk_sz)
+                    .slice(1, start=orig_blk_start, end=orig_blk_end)
+                )"""
+    if src.count(old) != 1:
+        return False
+    import textwrap
+
+    code = compile(textwrap.dedent(src.replace(old, new)), tkg.__file__, "exec")
+    exec(code, tkg.__dict__)
+    tkg._mimo_fa_exit_patched = True
+    return True
+
+
+install_fa_exit_patch()
+
 def _attention(X, X_hidden_dim_actual, rmsnorm_X_eps, rmsnorm_X_gamma, W_qkv, cos, sin, active_blocks_table, K_cache,
                V_cache, attention_mask, sink, softmax_scale, k_scale=None, v_scale=None):
     return attention_block_tkg(
@@ -95,11 +146,45 @@ def _attention(X, X_hidden_dim_actual, rmsnorm_X_eps, rmsnorm_X_gamma, W_qkv, co
     )
 
 
+
+def _fa_exit_enabled() -> bool:
+    """Pass nkilib's attention a ``max_context_len`` on the position path (SGLANG_NEURON_MIMO_FA_EXIT, default on; 0
+    reads the graph's whole table): its flash-attention loop then stops after the longest row's tiles, with
+    install_fa_exit_patch's fix."""
+    import os
+
+    return os.environ.get("SGLANG_NEURON_MIMO_FA_EXIT", "1").strip() != "0" and install_fa_exit_patch()
+
+
+def _max_context_len(p_sb, R: int, S: int, name: str):
+    """[1] int32 shared HBM: the longest prior of rows 0 .. R - 1 of ``p_sb`` [128, S] fp32 (each token's prior
+    length) plus the span S, for nkilib's flash-attention early exit (``max_context_len``)."""
+    m = nl.ndarray((P, 1), dtype=nl.float32, buffer=nl.sbuf)
+    nisa.tensor_reduce(m[0:R, 0:1], op=nl.maximum, data=p_sb[0:R, 0:S], axis=1, keepdims=True)
+    mt = nl.ndarray((P, P), dtype=nl.float32, buffer=nl.psum)
+    nisa.nc_transpose(dst=mt[0:1, 0:R], data=m[0:R, 0:1])
+    mx = nl.ndarray((1, 1), dtype=nl.float32, buffer=nl.sbuf)
+    nisa.tensor_reduce(mx[0:1, 0:1], op=nl.maximum, data=mt[0:1, 0:R], axis=1, keepdims=True)
+    nisa.tensor_scalar(dst=mx[0:1, 0:1], data=mx[0:1, 0:1], op0=nl.add, operand0=float(S))
+    mi = nl.ndarray((1, 1), dtype=nl.int32, buffer=nl.sbuf)
+    nisa.tensor_copy(dst=mi[0:1, 0:1], src=mx[0:1, 0:1])
+    out = nl.ndarray((1,), dtype=nl.int32, buffer=nl.shared_hbm, name=name)
+    nisa.dma_copy(dst=out.reshape((1, 1)), src=mi[0:1, 0:1])
+    return out
+
+
 def _attention_posid(X, H, eps, gamma, W_qkv, cos, sin, table, K_cache, V_cache, active_mask, sink, softmax_scale,
                      k_scale, v_scale, pos, start=None):
     """_attention masked by position: ``pos`` [B, S] fp32 each token's prior length (the prior mask is the kernel's
     own), ``start`` [B, S] fp32 or None each token's window start (a sliding layer's, in its trimmed table's frame),
-    ``active_mask`` [S, B, heads, S] uint8 the span's active part."""
+    ``active_mask`` [S, B, heads, S] uint8 the span's active part. A full layer's (no ``start``) passes
+    ``max_context_len`` (_fa_exit_enabled)."""
+    mcl = None
+    if start is None and _fa_exit_enabled():
+        B, S, _ = X.shape
+        p_sb = nl.ndarray((P, S), dtype=pos.dtype, buffer=nl.sbuf)
+        nisa.dma_copy(dst=p_sb[0:B, 0:S], src=pos.ap(pattern=[[S, B], [1, S]], offset=0))
+        mcl = _max_context_len(p_sb, B, S, "mimo_posid_max_context")
     return attention_block_tkg(
         X=X, X_hidden_dim_actual=H, rmsnorm_X_enabled=True, rmsnorm_X_eps=eps, rmsnorm_X_gamma=gamma, W_qkv=W_qkv,
         bias_qkv=None, quantization_type_qkv=QuantizationType.NONE, weight_dequant_scale_qkv=None,
@@ -110,7 +195,7 @@ def _attention_posid(X, H, eps, gamma, W_qkv, cos, sin, table, K_cache, V_cache,
         V_cache=V_cache, attention_mask=active_mask, sink=sink, update_cache=False, kv_cache_update_idx=None,
         W_out=None, bias_out=None, quantization_type_out=QuantizationType.NONE, weight_dequant_scale_out=None,
         input_dequant_scale_out=None, transposed_out=False, out_in_sb=False, softmax_scale=softmax_scale,
-        pos_ids=pos, swa_start_pos_ids=start, k_scale=k_scale, v_scale=v_scale,
+        pos_ids=pos, swa_start_pos_ids=start, k_scale=k_scale, v_scale=v_scale, max_context_len=mcl,
     )
 
 
@@ -155,6 +240,8 @@ def _attention_kvdp(X, H, eps, gamma, W_qkv, cos, sin, table, K_cache, V_cache, 
                   src=pos.ap(pattern=[[S, Ba], [1, S]], offset=0, vector_offset=row[0:Ba, 0:1], indirect_dim=0))
     pos_mine = nl.ndarray((Ba, S), dtype=pos.dtype, buffer=nl.shared_hbm, name="mimo_kvdp_pos")
     nisa.dma_copy(dst=pos_mine, src=p_sb[0:Ba, 0:S])
+    # this rank's own rows' longest prior: its flash-attention loop reads only that far (_fa_exit_enabled)
+    mcl = _max_context_len(p_sb, Ba, S, "mimo_kvdp_max_context") if _fa_exit_enabled() else None
     cells = []
     for cell in kvdp_mesh:  # NKI's tracer takes no list comprehension
         cells.append(list(cell))
@@ -169,7 +256,7 @@ def _attention_kvdp(X, H, eps, gamma, W_qkv, cos, sin, table, K_cache, V_cache, 
         W_out=None, bias_out=None, quantization_type_out=QuantizationType.NONE, weight_dequant_scale_out=None,
         input_dequant_scale_out=None, transposed_out=False, out_in_sb=False, softmax_scale=softmax_scale,
         pos_ids=pos_mine, k_scale=k_scale, v_scale=v_scale, KVDP=kvdp, KVDP_replica_group=nccl.ReplicaGroup(cells),
-        KVDP_collective_mode=KVDPCollectiveMode.ALL_TO_ALL, KVDP_rank=kvdp_rank,
+        KVDP_collective_mode=KVDPCollectiveMode.ALL_TO_ALL, KVDP_rank=kvdp_rank, max_context_len=mcl,
     )
 
 
