@@ -294,8 +294,9 @@ def gdn_prefill_tkg(
 
     out = nl.ndarray((T, N_out), dtype=nl.bfloat16, buffer=nl.shared_hbm)
     new_conv = nl.ndarray((B, Cc, Kh), dtype=nl.bfloat16, buffer=nl.shared_hbm)
-    new_rec = nl.ndarray((HEAD, B, vh, HEAD) if _KMAJOR else (B, HEAD, vh, HEAD), dtype=nl.float32,
-                         buffer=nl.shared_hbm)
+    # the stored state keeps rec_state's dtype (fp32, or bf16 for a bf16 state pool); the scan runs in fp32 SBUF
+    new_rec = nl.ndarray((HEAD, B, vh, HEAD) if _KMAJOR else (B, HEAD, vh, HEAD),
+                         dtype=rec_state.dtype if rec_state is not None else nl.float32, buffer=nl.shared_hbm)
 
     c = _consts(vh, NCH)
 

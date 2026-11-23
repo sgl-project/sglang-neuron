@@ -15,6 +15,8 @@ needs and what its launch refuses.
 - [Qwen3.5-397B PD](qwen35-pd.md): the giga megakernel as disaggregated prefill and decode, with a kv_cp=16 (DCP)
   decode for 256K context.
 - [Qwen3.5 radix](qwen35-radix.md): the giga megakernel with the radix cache.
+- [Qwen3.8](qwen38.md): Qwen3.8-27B (text), the dense Qwen3.5-family hybrid on the Qwen3.5 per-layer kernels, TP8 on a
+  trn2.3xlarge, paged KV and the radix cache.
 - [Kimi-K3](kimi-k3.md): the PD prefill, PP8 x TP16 with the MLA rows in DCP16 placement and the KDA state in SGLang's
   state pool, a chunk-keyed prefix cache with state checkpoints.
 - [FLUX.1-dev](flux1-dev.md): text-to-image on SGLang Diffusion's own runtime, not the LLM runtime above, TP8 x CP8 on

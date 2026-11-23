@@ -5,6 +5,7 @@ Neuron classes for the graph runner, attention backend, KV pools and allocator."
 
 from __future__ import annotations
 
+import importlib
 import json
 import logging
 import os
@@ -697,7 +698,17 @@ class NeuronSRTPlatform(SRTPlatform, NeuronDeviceMixin):
         every kind each time it builds the pools; None keeps SGLang's own class for the rest."""
         if kind == "mha":
             from sglang_neuron.mem_cache.memory_pool import NeuronMHATokenToKVPoolKind
+            from sglang_neuron.models import catalog
 
+            spec = catalog.served_spec()
+            declared = getattr(spec, "kv_pool_class", "") if spec is not None else ""
+            if declared:
+                # the served model's own pool in its kernels' layout (catalog.ModelSpec.kv_pool_class)
+                module, _, name = declared.partition(":")
+                cls = getattr(importlib.import_module(module), name)
+                if not issubclass(cls, NeuronMHATokenToKVPoolKind):
+                    raise TypeError(f"{declared} is not a NeuronMHATokenToKVPoolKind subclass")
+                return cls
             return NeuronMHATokenToKVPoolKind
         if kind == "mla":
             from sglang_neuron.envs import mla_pool_layout

@@ -97,7 +97,7 @@ def gdn_decode_tkg(
     a_log,  # [vh] fp32
     dt_bias,  # [vh] fp32
     norm_w,  # [128] fp32
-    rec_state,  # [B, 128, vh, 128] fp32 ([128, B, vh, 128] with QWEN35_GDN_KMAJOR=1)
+    rec_state,  # [B, 128, vh, 128] fp32 or bf16 ([128, B, vh, 128] with QWEN35_GDN_KMAJOR=1)
     w_out,  # [Vd, H] bf16 (or [Vd, H + extra] with folded extra output columns)
     rec_row0=0,  # first row of rec_state this call uses (row-blocked callers pass the full state tensor)
     inplace=False,  # write the new conv / recurrent states over the inputs (same rows) instead of new tensors
@@ -136,7 +136,7 @@ def gdn_decode_body(
     a_log,  # [vh] fp32
     dt_bias,  # [vh] fp32
     norm_w,  # [128] fp32
-    rec_state,  # [B, 128, vh, 128] fp32 ([128, B, vh, 128] with QWEN35_GDN_KMAJOR=1)
+    rec_state,  # [B, 128, vh, 128] fp32 or bf16 ([128, B, vh, 128] with QWEN35_GDN_KMAJOR=1)
     w_out,  # [Vd, H] bf16 (or [Vd, H + extra] with folded extra output columns)
     x_hbm=None,  # [B, H] bf16 HBM: used (DMA transpose) when x_sb is None
     rec_row0=0,  # rows rec_row0 .. rec_row0 + B of rec_state are this call's states
@@ -182,8 +182,10 @@ def gdn_decode_body(
         new_conv, new_rec, new_row0 = conv_state, rec_state, rec_row0
     else:
         new_conv = nl.ndarray((B, Cc, Kh), dtype=conv_state.dtype, buffer=nl.shared_hbm)
+        # the stored state keeps rec_state's dtype (fp32, or bf16 for a bf16 state pool); the recurrence runs in
+        # fp32 SBUF either way, the state DMAs casting on the way in and out
         new_rec = nl.ndarray(
-            (HEAD, B, vh, HEAD) if _KMAJOR else (B, HEAD, vh, HEAD), dtype=nl.float32, buffer=nl.shared_hbm
+            (HEAD, B, vh, HEAD) if _KMAJOR else (B, HEAD, vh, HEAD), dtype=rec_state.dtype, buffer=nl.shared_hbm
         )
         new_row0 = 0
 
