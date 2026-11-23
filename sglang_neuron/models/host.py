@@ -117,6 +117,21 @@ class ModelHost(NeuronModel):
             args.append(arg)
         return args
 
+    @property
+    def reloads_weights_in_place(self) -> bool:
+        """Whether ``reload_weights`` can serve an ``update_weights_from_disk``: the loaded graph copies a checkpoint
+        into its device parameters (a graph with packed or giga-kernel weights does not)."""
+        _, first = next(iter(self.model_graphs.items()))
+        return hasattr(first, "reload_weights") and int(getattr(sglang_tree.parallel_config(), "pp_size", 1) or 1) == 1
+
+    def reload_weights(self, path: str) -> None:
+        """Copy the checkpoint at ``path`` into the loaded parameters; an aggregated server's other graph shares them."""
+        if not self._weights_loaded:
+            raise RuntimeError(f"{self.name}: reload_weights before the first load")
+        (first_phase, first), *_ = self.model_graphs.items()
+        first.reload_weights(path)
+        logger.info("%s weights reloaded in place from %s", self.name, path)
+
     def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]]):
         """SGLang hands over a lazy iterator over the checkpoint, left unread: the first graph reads this rank's shards
         of the checkpoint, and an aggregated server's other graph shares its device copy."""

@@ -61,9 +61,11 @@ ATTN_BACKEND_NAME = "neuron"
 
 _TOKENIZER = "sglang.srt.managers.tokenizer_manager.TokenizerManager"
 _CONTROL = "sglang.srt.managers.tokenizer_control_mixin.TokenizerControlMixin"
-# the model's weights live in its compiled graphs, loaded once
+# the model's weights live in its compiled graphs; a model whose graph copies a checkpoint into its parameters
+# reloads from disk in place (_update_weights_from_disk), the other updates are refused
+_RUNNER_DISK_UPDATE = ("sglang.srt.model_executor.model_runner_components.weight_updater.WeightUpdater"
+                       ".update_weights_from_disk")
 _WEIGHT_UPDATES = (
-    f"{_TOKENIZER}.update_weights_from_disk",
     f"{_CONTROL}.update_weights_from_tensor",
     f"{_CONTROL}.update_weights_from_distributed",
     f"{_CONTROL}.update_weights_from_ipc",
@@ -84,6 +86,9 @@ _LAUNCH_SOURCES_MD5 = {
         "c01ade18185dfb7a995460013edecc1f",
 }
 _RUNTIME_SOURCES_MD5 = {
+    # copies the checkpoint into the compiled graphs' parameters instead of reloading the model
+    ("sglang.srt.model_executor.model_runner_components.weight_updater", "WeightUpdater.update_weights_from_disk"):
+        "76cf178e5ecde7f739c01439a1c64f65",
     # every use_* argument is a device communicator, turned off
     ("sglang.srt.distributed.parallel_state", "init_model_parallel_group"): "fe3cc1fab307a27a8e48c3ee6657bbec",
     # replaced by the NeuronCore's HBM, in the same units and with the same MIN over cpu_group
@@ -188,6 +193,21 @@ def _refuse_weight_update(original_fn, self, *args, **kwargs):
 
     raise HTTPException(status_code=400, detail=f"{original_fn.__name__} is not supported by sglang-neuron: the "
                                                 "model's weights are loaded into its compiled graphs once")
+
+
+def _update_weights_from_disk(original_fn, self, model_path: str, load_format: str, *args, **kwargs):
+    """AROUND WeightUpdater.update_weights_from_disk: copy the checkpoint into the compiled graphs' parameters in place;
+    a model that cannot (packed weights, pipeline parallel) refuses."""
+    model = self.get_model()
+    if not getattr(model, "reloads_weights_in_place", False):
+        return False, (f"update_weights_from_disk is not supported by sglang-neuron for {type(model).__name__}: its "
+                       "weights are packed into its compiled graphs once")
+    try:
+        model.reload_weights(model_path)
+    except Exception as e:
+        return False, f"Failed to update weights in place: {e}"
+    self.model_config.model_path = model_path
+    return True, "Succeeded to update model weights."
 
 
 def _refuse_pause_under_pp(original_fn, self, obj, *args, **kwargs):
@@ -308,6 +328,7 @@ def _register_launch_hooks() -> None:
     HookRegistry.register(f"{_TOKENIZER}.convert_logprob_style", convert_logprob_style, HookType.AROUND)
     for target in _WEIGHT_UPDATES:
         HookRegistry.register(target, _refuse_weight_update, HookType.AROUND)
+    HookRegistry.register(_RUNNER_DISK_UPDATE, _update_weights_from_disk, HookType.AROUND)
     HookRegistry.register(f"{_TOKENIZER}.pause_generation", _refuse_pause_under_pp, HookType.AROUND)
     HookRegistry.register(f"{_CONTROL}.flush_cache", _refuse_timed_flush_under_pp, HookType.AROUND)
     # the launching process checks its arguments against the backend choices

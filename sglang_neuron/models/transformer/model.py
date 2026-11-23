@@ -23,7 +23,7 @@ from sglang_neuron.ops.attention.qkv_paged import qkv_paged
 from sglang_neuron.parallel import collectives as neuron_collectives
 from sglang_neuron.parallel import groups
 from sglang_neuron.utils.checkpoints import SafetensorsCheckpoint
-from sglang_neuron.utils.weight_loader import set_weight_loader
+from sglang_neuron.utils.weight_loader import get_weight_loader, set_weight_loader
 
 
 class RMSNorm(nn.Module):
@@ -293,8 +293,33 @@ class TransformerForCausalLM(nn.Module):
     def load_weights(self, checkpoint_path: str, device: torch.device) -> None:
         """Read this rank's shard of every mapped parameter onto ``device``."""
         checkpoint = SafetensorsCheckpoint(checkpoint_path)
+        # assign=True replaces each parameter, dropping the loader attached to it; reload_weights needs them again
+        loaders = {name: get_weight_loader(param) for name, param in self.named_parameters(remove_duplicate=False)}
         state = checkpoint.load_sharded_pipelined(self.tp_group.rank_in_group, self.tp_group.world_size, self,
                                                   self.hf_weight_mappings(), device).state_dict
         self.load_state_dict(state, strict=False, assign=True)
+        for name, param in self.named_parameters(remove_duplicate=False):
+            if name in loaders:
+                set_weight_loader(param, loaders[name])
         if self.config.tie_word_embeddings:
             self.lm_head.weight = self.embed_tokens.weight
+
+    def reload_weights(self, checkpoint_path: str) -> None:
+        """Copy this rank's shard of every mapped parameter from ``checkpoint_path`` into the loaded device parameters,
+        which the compiled graphs hold, so no graph is rebuilt or recompiled. The shards are read on the host."""
+        checkpoint = SafetensorsCheckpoint(checkpoint_path)
+        state = checkpoint.load_sharded_pipelined(self.tp_group.rank_in_group, self.tp_group.world_size, self,
+                                                  self.hf_weight_mappings(), torch.device("cpu")).state_dict
+        params = dict(self.named_parameters(remove_duplicate=False))
+        # checked before the first copy, so a bad checkpoint leaves the served weights untouched
+        unknown = sorted(set(state) - set(params))
+        if unknown:
+            raise RuntimeError(f"the checkpoint loaded {len(unknown)} tensor(s) the graph has no parameter for: "
+                               f"{unknown[:8]}")
+        mismatched = [name for name, tensor in state.items() if tensor.shape != params[name].shape]
+        if mismatched:
+            raise RuntimeError(f"{len(mismatched)} checkpoint tensor(s) do not match their parameter's shape: "
+                               f"{[(n, tuple(state[n].shape), tuple(params[n].shape)) for n in mismatched[:4]]}")
+        with torch.no_grad():
+            for name, tensor in state.items():
+                params[name].copy_(tensor)
