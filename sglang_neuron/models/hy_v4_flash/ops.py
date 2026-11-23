@@ -202,7 +202,8 @@ def top_count_mask(scores: torch.Tensor, valid: torch.Tensor, count: int, iters:
     slot = torch.arange(ways - 1, device=scores.device)
     for _ in range(iters):
         t = lo + (hi - lo) * frac  # [R, ways - 1], increasing
-        above = ((s.unsqueeze(1) >= t.unsqueeze(-1)) & valid.unsqueeze(1)).sum(dim=-1)
+        # an invalid entry is -max, below every threshold (t >= lo, the least valid score): no mask a pass
+        above = (s.unsqueeze(1) >= t.unsqueeze(-1)).sum(dim=-1)
         # the counts fall as t rises: the thresholds that keep at least ``count`` are a prefix
         n_ok = (above >= count).sum(dim=-1, keepdim=True)
         new_lo = (t * (slot == n_ok - 1)).sum(dim=-1, keepdim=True)
