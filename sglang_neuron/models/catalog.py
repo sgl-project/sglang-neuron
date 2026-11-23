@@ -231,7 +231,7 @@ MODELS = {
     # halves in K and V), the sliding layers' in SGLang's window pool; its IndexPool and Engram state beside the pool,
     # the routed experts in Trn2 FP8
     "HYV4FlashForConditionalGeneration": ModelSpec(package="sglang_neuron.models.hy_v4_flash",
-                                                   kv_cache_dtypes=("auto", "bf16", "bfloat16"),
+                                                   kv_cache_dtypes=("auto", "bf16", "bfloat16", "fp8_e4m3"),
                                                    quantizations=("fp8",), hybrid_swa_memory=True,
                                                    launch_hooks="sglang_neuron.models.hy_v4_flash.launch"),
     "DeepseekV2ForCausalLM": ModelSpec(package="sglang_neuron.models.deepseek_v2",

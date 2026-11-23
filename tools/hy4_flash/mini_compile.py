@@ -20,6 +20,9 @@ import cpu_check as C  # noqa: E402
 PAGE = 128
 
 
+KV_DTYPES = {"bf16": torch.bfloat16, "fp8_e4m3": torch.float8_e4m3fn}
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--model", required=True)
@@ -27,6 +30,7 @@ def main():
     ap.add_argument("--tokens", type=int, default=2048)
     ap.add_argument("--context", type=int, default=9216)
     ap.add_argument("--layers", type=int, default=1)
+    ap.add_argument("--kv-dtype", default="bf16", choices=sorted(KV_DTYPES), help="the KV pool's element type")
     ap.add_argument("--tp", type=int, default=1, help="shard the weights as this TP's rank 0")
     ap.add_argument("--profile", default="", help="record the device profile of 2 calls into this directory")
     ap.add_argument("--bench", type=int, default=0,
@@ -72,7 +76,7 @@ def main():
     pages = args.context // PAGE
     slots = (pages + 2) * PAGE
     half = (cfg.kv_lora_rank + cfg.sparse.qk_rope_head_dim) // 2
-    caches = {layer.self_attn.name: [torch.zeros(pages + 2, 1, PAGE, half, dtype=torch.bfloat16, device=dev)
+    caches = {layer.self_attn.name: [torch.zeros(pages + 2, 1, PAGE, half, dtype=KV_DTYPES[args.kv_dtype], device=dev)
                                      for _ in range(2)] for layer in g.layers}
     g.bind_kv_cache(caches)
     g.bind_state(slots, dev)

@@ -164,15 +164,17 @@ class Hy4FlashGraph(nn.Module):
         return KVSpec(layers=[LayerSpec(name=layer.self_attn.name) for layer in self.layers])
 
     def bind_kv_cache(self, kv_caches: dict) -> None:
-        """Bind each layer's K and V pool buffers ([blocks, 1, block, 288]) as token rows; the host allocates the
-        per-slot state beside them once for both role graphs (bind_state), one row per slot of the full pool, which
-        the sparse layers and the token history address."""
+        """Bind each layer's K and V pool buffers ([blocks, 1, block, 288], bf16 or FP8) as token rows; the host
+        allocates the per-slot state beside them once for both role graphs (bind_state), one row per slot of the full
+        pool, which the sparse layers and the token history address."""
         for layer in self.layers:
             k, v = kv_caches[layer.self_attn.name]
-            if k.dim() != 4 or k.shape[1] != 1:
+            if v.dim() != 4 or v.shape[1] != 1 or k.numel() != v.numel():
                 raise ValueError(f"Hy4-Flash keeps one KV head a rank in the pool, not {tuple(k.shape)}: launch with "
                                  "--tp-size equal to the config's 32 KV heads")
-            layer.self_attn.k_cache = k.view(-1, k.shape[-1])
+            # an FP8 pool's K is laid out for the platform's kernels ([blocks, 1, block / 2, 288, 2]); the pool moves
+            # and zeroes whole blocks, so the graphs keep their own token rows inside each block, as in V
+            layer.self_attn.k_cache = k.view(-1, v.shape[-1])
             layer.self_attn.v_cache = v.view(-1, v.shape[-1])
         sparse = self.layers[self.config.sparse_layer_ids[0]].self_attn
         self.pool_slots = int(sparse.k_cache.shape[0])

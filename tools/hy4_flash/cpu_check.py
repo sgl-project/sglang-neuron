@@ -78,6 +78,9 @@ def metadata(graph, block_table, slot_mapping, cached: int, swa_offset=None) -> 
     return md
 
 
+KV_DTYPES = {"bf16": torch.bfloat16, "fp8_e4m3": torch.float8_e4m3fn}
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--model", required=True)
@@ -86,6 +89,7 @@ def main():
     ap.add_argument("--decode", type=int, default=0)
     ap.add_argument("--threads", type=int, default=64)
     ap.add_argument("--max-context", type=int, default=4096)
+    ap.add_argument("--kv-dtype", default="bf16", choices=sorted(KV_DTYPES), help="the KV pool's element type")
     args = ap.parse_args()
     torch.set_num_threads(args.threads)
     group = install_fakes()
@@ -120,7 +124,7 @@ def main():
             name = layer.self_attn.name
             if name not in caches:
                 half = (cfg.kv_lora_rank + cfg.sparse.qk_rope_head_dim) // 2
-                caches[name] = [torch.zeros(pages + 1, 1, PAGE, half, dtype=torch.bfloat16) for _ in range(2)]
+                caches[name] = [torch.zeros(pages + 1, 1, PAGE, half, dtype=KV_DTYPES[args.kv_dtype]) for _ in range(2)]
         g.bind_kv_cache(caches)
     state = None
     for g in graphs.values():

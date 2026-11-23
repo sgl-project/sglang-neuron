@@ -57,6 +57,9 @@ KERNEL_TOPK_MIN_ROWS = 4
 # and up to this many groups a row (the kernel's tested range is 151936; a 1M-token rung's table has 262144)
 KERNEL_TOPK_GROUPS = 128 * 1024
 TOPK_EMPTY = 3.0e38
+# an FP8 KV pool (--kv-cache-dtype fp8_e4m3): its element type and Trn2's e4m3 range
+KV_FP8 = torch.float8_e4m3fn
+KV_FP8_MAX = 240.0
 
 
 def write_rows(cache: torch.Tensor, rows: torch.Tensor, slots: torch.Tensor) -> None:
@@ -317,21 +320,28 @@ class Attention(nn.Module):
 
     def _write_kv(self, rows: torch.Tensor, slots: torch.Tensor) -> None:
         half = self.k_cache.shape[-1]
+        if self.k_cache.dtype == KV_FP8:
+            # Trn2's e4m3 tops out at 240 (the checkpoint's float8_e4m3fn type is compiled as it)
+            rows = rows.float().clamp(-KV_FP8_MAX, KV_FP8_MAX).to(KV_FP8)
         write_rows(self.k_cache, rows[:, :half], slots)
         write_rows(self.v_cache, rows[:, half:], slots)
 
+    @staticmethod
+    def _rows(k: torch.Tensor, v: torch.Tensor) -> torch.Tensor:
+        """The MLA rows of read K and V halves, in bf16 (an FP8 pool's widened: no scale, the latent is normed)."""
+        return torch.cat([k, v], dim=-1).to(DTYPE)
+
     def _read_kv(self, slots: torch.Tensor) -> torch.Tensor:
-        return torch.cat([read_rows(self.k_cache, slots), read_rows(self.v_cache, slots)], dim=-1)
+        return self._rows(read_rows(self.k_cache, slots), read_rows(self.v_cache, slots))
 
     def _read_kv_pages(self, table: torch.Tensor, block: int) -> torch.Tensor:
-        return torch.cat([read_pages(self.k_cache, table, block), read_pages(self.v_cache, table, block)], dim=-1)
+        return self._rows(read_pages(self.k_cache, table, block), read_pages(self.v_cache, table, block))
 
     def _read_kv_groups(self, groups: torch.Tensor, table: torch.Tensor, block: int) -> torch.Tensor:
         """The MLA rows of the 4-token ``groups`` [R, n] (an empty slot -1 reads group 0) through ``table``: a
         group's 4 slots are consecutive (pages are whole groups), one gather row a group."""
         first = token_slots(table, block, groups.clamp(min=0) * INDEX_RATIO)
-        return torch.cat([read_groups(self.k_cache, first, INDEX_RATIO),
-                          read_groups(self.v_cache, first, INDEX_RATIO)], dim=-1)
+        return self._rows(read_groups(self.k_cache, first, INDEX_RATIO), read_groups(self.v_cache, first, INDEX_RATIO))
 
     def _attend(self, q_latent, q_rope, keys, allowed):
         return ops.mla_attend(q_latent, q_rope, keys, allowed, self.sinks, self.kind.scaling,
