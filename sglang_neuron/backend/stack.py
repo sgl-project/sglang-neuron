@@ -16,7 +16,13 @@ from __future__ import annotations
 
 import contextlib
 import functools
+import importlib
+import importlib.machinery
+import linecache
+import sys
 import threading
+import traceback
+import types
 from typing import Any, Iterator, List
 
 from sglang_neuron.backend import envs
@@ -275,6 +281,81 @@ def disable_vocab_sharding_pass(environ=None) -> None:
                          "copied between graphs, which delays each graph until the one before it has retired; remove "
                          "it from the launch environment")
     environ[VOCAB_SHARDING_PASS] = "1"
+
+
+MLIR_BUILTIN_DIALECT = "torch_mlir.dialects.builtin"
+_MISSING_MLIR_EXTRAS = ("torch_mlir.extras.meta", "torch_mlir.extras")
+
+
+def cache_builtin_dialect_lookup() -> None:
+    """Install an empty module stub at ``torch_mlir.dialects.builtin`` when importing it fails on missing
+    ``torch_mlir.extras`` / ``torch_mlir.extras.meta``."""
+    if MLIR_BUILTIN_DIALECT in sys.modules:
+        return
+    try:
+        importlib.import_module(MLIR_BUILTIN_DIALECT)
+    except ImportError as exc:
+        if not isinstance(exc, ModuleNotFoundError) or exc.name not in _MISSING_MLIR_EXTRAS:
+            return
+        stub = types.ModuleType(MLIR_BUILTIN_DIALECT)
+        stub.__spec__ = importlib.machinery.ModuleSpec(MLIR_BUILTIN_DIALECT, loader=None)
+        sys.modules[MLIR_BUILTIN_DIALECT] = stub
+        dialects = sys.modules.get("torch_mlir.dialects")
+        if dialects is not None:
+            setattr(dialects, "builtin", stub)
+
+
+def cache_traceback_frame_formatting() -> None:
+    """Memoize ``traceback.StackSummary.format_frame_summary`` while Dynamo is tracing."""
+    original = getattr(traceback.StackSummary, "format_frame_summary", None)
+    if original is None or getattr(original, "_sgn_cached", False):
+        return
+    from torch._guards import TracingContext
+
+    line_attr = "_lines" if "_lines" in getattr(traceback.FrameSummary, "__slots__", ()) else "_line"
+    cache: dict = {}
+
+    def format_frame_summary(self, frame_summary, **kwargs):
+        if (
+            TracingContext.try_get() is None
+            or frame_summary.locals is not None
+            or getattr(frame_summary, "_code", None) is not None
+            or type(self) is not traceback.StackSummary
+            or (kwargs and (len(kwargs) != 1 or "colorize" not in kwargs))
+        ):
+            return original(self, frame_summary, **kwargs)
+        filename = frame_summary.filename
+        if filename.startswith("<") and filename.endswith(">"):
+            return original(self, frame_summary, **kwargs)
+        lc_entry = linecache.cache.get(filename)
+        lc_tag = lc_entry[:2] if lc_entry is not None and len(lc_entry) >= 2 else None
+        colorize = bool(kwargs.get("colorize", False))
+        key = (
+            filename,
+            frame_summary.lineno,
+            frame_summary.end_lineno,
+            frame_summary.colno,
+            frame_summary.end_colno,
+            frame_summary.name,
+            getattr(frame_summary, line_attr, None),
+            lc_tag,
+            colorize,
+        )
+        cached = cache.get(key)
+        if cached is not None:
+            return cached
+        result = original(self, frame_summary, **kwargs)
+        if lc_tag is None:
+            lc_entry = linecache.cache.get(filename)
+            lc_tag = lc_entry[:2] if lc_entry is not None and len(lc_entry) >= 2 else None
+            key = (*key[:7], lc_tag, colorize)
+        if len(cache) >= 16384:
+            cache.pop(next(iter(cache)), None)
+        cache[key] = result
+        return result
+
+    format_frame_summary._sgn_cached = True
+    traceback.StackSummary.format_frame_summary = format_frame_summary
 
 
 NKI_TRACE_CACHE_OFF = "NKI_DISABLE_TRACE_CACHE"
