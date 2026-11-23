@@ -111,8 +111,8 @@ def moe_tkg_hits(hidden, gate_up, down, slots, slot_aff, count, gate_up_scale, d
         process_down_projection(hidden=gate_up_out, output=down_sb, params=params, dims=dims, gate_tile_info=tiles,
                                 sbm=slot_sbm, use_dge=True)
         nisa.tensor_scalar(dst=down_sb, data=down_sb, op0=nl.multiply, operand0=aff_sb[:, 0:1])
-        nisa.tensor_tensor(dst=output_temp[0:dims.H0, 0:dims.H1_shard, 0], data1=output_temp[0:dims.H0, 0:dims.H1_shard, 0],
-                           data2=down_sb, op=nl.add)
+        acc = output_temp[0:dims.H0, 0:dims.H1_shard, 0]
+        nisa.tensor_tensor(dst=acc, data1=acc, data2=down_sb, op=nl.add)
         # the next slot to the front
         nisa.tensor_copy(dst=idx_tmp[0:1, 0:K - 1], src=idx_sb[0:1, 1:K])
         nisa.tensor_copy(dst=idx_sb[0:1, 0:K - 1], src=idx_tmp[0:1, 0:K - 1])

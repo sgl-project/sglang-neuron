@@ -6,9 +6,9 @@ routed experts over EP.
 
 The router (sigmoid, selection bias, renormalized, times ``routed_scaling_factor``) and the latent projections are
 replicated; each rank runs its ``E / ep`` experts on the latent rows (a one-token decode only the local experts it
-chose, moe_hits.py; a larger decode all of them in moe_tkg's FP8 row mode; a prefill in moe_cte, experts_cte.py), applies ``post_expert_proj`` to its partial sum (linear, so the sum over ranks commutes
-with it), adds its TP
-shard of the shared expert, and one all-reduce sums the ranks before the norm.
+chose, moe_hits.py; a larger decode all of them in moe_tkg's FP8 row mode; a prefill in moe_cte, experts_cte.py),
+applies ``post_expert_proj`` to its partial sum (linear, so the sum over ranks commutes with it), adds its TP shard
+of the shared expert, and one all-reduce sums the ranks before the norm.
 
 The experts load as Trn2 FP8 (e4m3, at most 240) with a power-of-two scale per output row, requantized from the
 checkpoint's 128 x 128 blocks (fp8.requant_rows), in moe_tkg's layout: gate/up [E, H, 2, I]
