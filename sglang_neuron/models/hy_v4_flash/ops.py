@@ -150,7 +150,9 @@ def index_scores(q: torch.Tensor, head_w: torch.Tensor, keys: torch.Tensor) -> t
         s = torch.relu(torch.einsum("rhd,gd->rhg", q.float(), keys.float()))
     else:
         s = torch.relu(torch.einsum("rhd,rgd->rhg", q.float(), keys.float()))
-    return torch.einsum("rh,rhg->rg", head_w.float(), s)
+    # an elementwise weighting and a sum over the heads: as an einsum it lowers to one [1, heads] x [heads, G] matmul a
+    # row
+    return (head_w.float().unsqueeze(-1) * s).sum(dim=1)
 
 
 def block_cumsum(x: torch.Tensor, block: int = 128) -> torch.Tensor:
