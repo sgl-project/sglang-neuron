@@ -113,7 +113,10 @@ def _experts_by_program(xq, inv_xs, aff, gate_up_w, down_w, gate_up_scale, down_
                         E: int, pid, n_prg: int, pre=None):
     """moe_half's W8A8 experts split between the programs: this program's E / programs local experts over the whole of
     H (``xq`` [128, H / 128, 128] the FP8 input, transposed; ``inv_xs`` its per-token scales' inverse; ``aff`` [128, E]
-    the affinities), no exchange inside an expert. Returns their weighted sum, [128, H] fp32, rows 0 .. T - 1."""
+    the affinities), no exchange inside an expert. Returns (their weighted sum [128, H] fp32 rows 0 .. T - 1, the other
+    program's half of its sum or None): the last expert scales the other program's half of H first and sends it
+    (``sendrecv``) while it scales its own, so the exchange overlaps the kernel's tail (bench_moe_half 183 -> 177 us a
+    layer at 32 rows); the first expert's scaling goes straight into the sum in one op."""
     H1 = H // P
     EP = E // n_prg
     # the down weights a whole row of H a tile (4 KB runs; 1 KB runs measured 219 against 201 us a layer)
@@ -123,6 +126,7 @@ def _experts_by_program(xq, inv_xs, aff, gate_up_w, down_w, gate_up_scale, down_
     dn2_ring = [nl.ndarray((P, 2, dn_cols), dtype=down_w.dtype, buffer=nl.sbuf) for _ in range(RING)]
     acc = nl.ndarray((P, H), dtype=nl.float32, buffer=nl.sbuf)
     slots = [0, 0]
+    tail_recv = [None]
     chunks = [(g, c0, min(512, I - c0)) for g in range(2) for c0 in range(0, I, 512)]
     for j in range(EP):
         e = pid * EP + j
@@ -173,8 +177,13 @@ def _experts_by_program(xq, inv_xs, aff, gate_up_w, down_w, gate_up_scale, down_
         # the expert's weight on each row, its activation scale folded in
         nisa.tensor_tensor(col[0:T, 0:1], aff[0:T, e:e + 1], inv_ds[0:T, 0:1], nl.multiply)
         base = e * (I * H)
+        last = j == EP - 1
         for hq in range(H // dn_cols):
-            pd = [nl.ndarray((P, 512), dtype=nl.float32, buffer=nl.psum) for _ in range(dn_cols // 512)]
+            if dn_cols == H:
+                pd_all = nl.ndarray((P, H), dtype=nl.float32, buffer=nl.psum)
+                pd = [pd_all[0:P, b * 512:(b + 1) * 512] for b in range(H // 512)]
+            else:
+                pd = [nl.ndarray((P, 512), dtype=nl.float32, buffer=nl.psum) for _ in range(dn_cols // 512)]
             for jj in range(n_ic // 2):
                 db = dn2_ring[slots[1] % RING]
                 slots[1] += 1
@@ -189,6 +198,32 @@ def _experts_by_program(xq, inv_xs, aff, gate_up_w, down_w, gate_up_scale, down_
             nisa.dma_copy(dst=ds[0:T, 0:dn_cols], src=down_scale.ap(pattern=[[0, T], [1, dn_cols]],
                                                                     offset=e * H + hq * dn_cols),
                           dge_mode=nisa.dge_mode.hwdge)
+            if dn_cols == H:
+                HH = H // n_prg
+                other = 1 - pid
+                # the other program's half of H first, sent while this program's half is scaled
+                halves = [other, pid] if last else [0, 1]
+                for hi, half in enumerate(halves):
+                    for b in range(HH // 512):
+                        c0 = half * HH + b * 512
+                        if j == 0:
+                            # (pd x the row's weight) x the column scales, straight into the sum
+                            nisa.scalar_tensor_tensor(dst=acc[0:T, c0:c0 + 512], data=pd_all[0:T, c0:c0 + 512],
+                                                      op0=nl.multiply, operand0=col[0:T, 0:1], op1=nl.multiply,
+                                                      operand1=ds[0:T, c0:c0 + 512])
+                        else:
+                            scaled = nl.ndarray((P, 512), dtype=nl.float32, buffer=nl.sbuf)
+                            nisa.tensor_tensor(scaled[0:T, 0:512], pd_all[0:T, c0:c0 + 512], ds[0:T, c0:c0 + 512],
+                                               nl.multiply)
+                            nisa.scalar_tensor_tensor(dst=acc[0:T, c0:c0 + 512], data=scaled[0:T, 0:512],
+                                                      op0=nl.multiply, operand0=col[0:T, 0:1], op1=nl.add,
+                                                      operand1=acc[0:T, c0:c0 + 512])
+                    if last and hi == 0 and n_prg > 1:
+                        recv = nl.ndarray((P, HH), dtype=nl.float32, buffer=nl.sbuf)
+                        nisa.sendrecv(src=acc[0:T, other * HH:(other + 1) * HH], dst=recv[0:T, 0:HH],
+                                      send_to_rank=other, recv_from_rank=other, pipe_id=2)
+                        tail_recv[0] = recv
+                continue
             for b in range(dn_cols // 512):
                 c0 = hq * dn_cols + b * 512
                 scaled = nl.ndarray((P, 512), dtype=nl.float32, buffer=nl.sbuf)
@@ -200,7 +235,7 @@ def _experts_by_program(xq, inv_xs, aff, gate_up_w, down_w, gate_up_scale, down_
                 else:
                     nisa.scalar_tensor_tensor(dst=acc[0:T, c0:c0 + 512], data=scaled[0:T, 0:512], op0=nl.multiply,
                                               operand0=col[0:T, 0:1], op1=nl.add, operand1=acc[0:T, c0:c0 + 512])
-    return acc
+    return acc, tail_recv[0]
 
 
 def _bcast_rows(col, T: int, n: int):
@@ -387,8 +422,9 @@ def moe_half(hidden, ln_w, router_wT, expert_bias, ebase, gate_up_w, down_w, gat
     chunks = [(g, c0, min(512, I - c0)) for g in range(2) for c0 in range(0, I, 512)]
     by_program = fp8_act and E % n_prg == 0
     if by_program:
-        acc = _experts_by_program(xq, inv_xs, aff, gate_up_w, down_w, gate_up_scale, down_scale, T, H, I, E, pid,
+        got = _experts_by_program(xq, inv_xs, aff, gate_up_w, down_w, gate_up_scale, down_scale, T, H, I, E, pid,
                                   n_prg, pre=pre)
+        acc, tail_recv = got
 
     # the split over H (bf16 activations, or an odd E)
     for e in (range(E) if not by_program else ()):
@@ -510,6 +546,14 @@ def moe_half(hidden, ln_w, router_wT, expert_bias, ebase, gate_up_w, down_w, gat
                     )
 
     # sum the two programs' partials: each owns one half of H
+    if by_program and tail_recv is not None:
+        o_sb = nl.ndarray((P, HH), dtype=hidden.dtype, buffer=nl.sbuf)
+        nisa.tensor_tensor(o_sb[0:T, 0:HH], tail_recv[0:T, 0:HH], acc[0:T, h0 : h0 + HH], nl.add)
+        if out_in_sbuf:
+            return o_sb
+        out = nl.ndarray((T, H), dtype=hidden.dtype, buffer=nl.shared_hbm, name="moe_half_out")
+        nisa.dma_copy(dst=out.ap(pattern=[[H, T], [1, HH]], offset=h0), src=o_sb[0:T, 0:HH])
+        return out
     send_o = nl.ndarray((P, HH), dtype=nl.float32, buffer=nl.sbuf)
     recv_o = nl.ndarray((P, HH), dtype=nl.float32, buffer=nl.sbuf)
     nisa.tensor_copy(dst=send_o[0:T, 0:HH], src=acc[0:T, other * HH : (other + 1) * HH])
