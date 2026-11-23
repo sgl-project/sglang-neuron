@@ -308,6 +308,9 @@ def _register_launch_hooks() -> None:
     HookRegistry.register(f"{_TOKENIZER}.convert_logprob_style", convert_logprob_style, HookType.AROUND)
     for target in _WEIGHT_UPDATES:
         HookRegistry.register(target, _refuse_weight_update, HookType.AROUND)
+    from sglang_neuron.weight_sync import pull_weights
+
+    HookRegistry.register("sglang.srt.entrypoints.http_server.launch_server", pull_weights.add_route, HookType.AROUND)
     HookRegistry.register(f"{_TOKENIZER}.pause_generation", _refuse_pause_under_pp, HookType.AROUND)
     HookRegistry.register(f"{_CONTROL}.flush_cache", _refuse_timed_flush_under_pp, HookType.AROUND)
     # the launching process checks its arguments against the backend choices
