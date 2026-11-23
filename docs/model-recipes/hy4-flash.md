@@ -48,12 +48,14 @@ The commands below run inside the container with the checkpoint mounted at `/mod
 NEURON_RT_VISIBLE_CORES=0-31 SGLANG_NEURON_PRECOMPILE_CACHE=1 \
 python3 -m sglang.launch_server --model-path /models/Hy4-flash-FP8 --served-model-name hy4-flash \
   --tp-size 32 --ep-size 32 --context-length 9216 --chunked-prefill-size 2048 \
-  --max-running-requests 64 --max-total-tokens 200000 --cuda-graph-bs-decode 1 16 64 \
-  --disable-radix-cache --host 0.0.0.0 --port 30000
+  --max-running-requests 64 --max-total-tokens 600000 --kv-cache-dtype fp8_e4m3 \
+  --cuda-graph-bs-decode 1 16 64 --disable-radix-cache --host 0.0.0.0 --port 30000
 ```
 
 The launch fixes the layout: `--tp-size 32` (one KV head a rank) with `--ep-size` equal to it, no DP attention, PP or
-DCP, the text decoder only (`--enable-multimodal` and `--speculative-algorithm` are refused), a bf16 KV cache. Both
+DCP, the text decoder only (`--enable-multimodal` and `--speculative-algorithm` are refused). The KV cache is bf16 or
+FP8 (`--kv-cache-dtype fp8_e4m3`: each MLA row clamped to Trn2's e4m3 range, no scale, widened to bf16 as it is
+read; the IndexPool's keys stay bf16), which holds the 64 requests of 8K + 1K above in 600K tokens. Both
 graph families take the context in rungs (`SGLANG_NEURON_HY4F_CONTEXTS`, 16K, 64K, 256K and 1M by default, capped at
 `--context-length`): a short request on a long-context server runs the short graphs. A cold start compiles every
 token bucket and rung; rank 0 traces and queues each family's compiles before the other ranks trace
@@ -71,6 +73,13 @@ reference's first 32 tokens.
 ## Performance
 
 The random 8192 / 1024 benchmark (`python3 -m sglang.bench_serving --dataset-name random --random-input-len 8192
---random-output-len 1024 --random-range-ratio 1.0`) at concurrency 1, 10 prompts: TTFT 2292 ms, TPOT 51.75 ms, 167
-tokens/s. The graphs are still largely torch; the decode attention, the IndexPool and the norms are next to move to
-kernels.
+--random-output-len 1024 --random-range-ratio 1.0`) on the server above (FP8 KV):
+
+| concurrency (prompts) | TTFT mean | TPOT mean | total tokens/s |
+| --- | --- | --- | --- |
+| 1 (10) | 2574 ms | 42.2 ms | 202 |
+| 64 (320) | 37.9 s | 277 ms | 1803 |
+
+A decode of one token runs only the local experts it chose (`moe_hits.py`, about half an expert a rank against all
+16), and of 4 rows or more selects its IndexPool groups in nkilib's top-k. Most of what remains is the attention and
+iHC in torch: the gathered KV rows are transposed on the PE every layer, and the iHC mixes run on wide fp32 streams.
