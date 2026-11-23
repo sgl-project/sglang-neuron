@@ -52,6 +52,8 @@ ALL_HEADS_SCORES = 1 << 23
 # the IndexPool's selection runs nkilib's top-k kernel up to this many rows (a decode), the threshold search above (a
 # prefill chunk's 2048 rows take longer in the kernel); the score of an invalid group
 KERNEL_TOPK_ROWS = 128
+# and from this many (one row's threshold search takes 0.13 ms, the kernel 0.23; at 64 rows 1.18 and 0.29)
+KERNEL_TOPK_MIN_ROWS = 4
 # and up to this many groups a row (the kernel's tested range is 151936; a 1M-token rung's table has 262144)
 KERNEL_TOPK_GROUPS = 128 * 1024
 TOPK_EMPTY = 3.0e38
@@ -218,7 +220,8 @@ class IndexPool(nn.Module):
         gathers index_topk rows, not the context, and their tokens."""
         pos = positions.to(torch.int64)
         groups_n = table.shape[1] * block // INDEX_RATIO
-        if x.shape[0] <= KERNEL_TOPK_ROWS and groups_n <= KERNEL_TOPK_GROUPS and can_run_kernel(x):
+        if (KERNEL_TOPK_MIN_ROWS <= x.shape[0] <= KERNEL_TOPK_ROWS and groups_n <= KERNEL_TOPK_GROUPS
+                and can_run_kernel(x)):
             # a decode's few rows: nkilib's top-k hands back the groups themselves (in no order: the attention does
             # not care), which the threshold search and the compaction take four times as long to find
             scores, valid, own = self._group_scores(x, q_resid, pos, table, block)
