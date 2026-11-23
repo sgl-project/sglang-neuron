@@ -65,8 +65,9 @@ def _swa_masks_vectorized(iota, mask_out, pos_ids, start_pos, bs: int, q_head: i
 
 def install_swa_mask_patch() -> bool:
     """Route nkilib's sliding-window prior mask through _swa_masks_vectorized (the default;
-    SGLANG_NEURON_MIMO_SWA_MASK_VEC=0 keeps nkilib's). The attention keeps its position path, so this, unlike the
-    sliding layers' step mask (model.MiMoV2Graph._swa_step_mask), leaves the decode graph's structure as it is."""
+    SGLANG_NEURON_MIMO_SWA_MASK_VEC=0 keeps nkilib's). The attention keeps its position path and the decode graph its
+    structure (a mask built once a step for every sliding layer, through the mask path, hung long-context servers at
+    c >= 2)."""
     import os
 
     if os.environ.get("SGLANG_NEURON_MIMO_SWA_MASK_VEC", "1").strip() == "0":
@@ -286,26 +287,6 @@ def _attention_dcp(X, H, eps, gamma, W_qkv, cos, sin, table, K_cache, V_cache, a
         pos_ids=pos, swa_start_pos_ids=start, k_scale=k_scale, v_scale=v_scale, CP=dcp,
         CP_replica_group=nccl.ReplicaGroup(cells), CP_collective_mode=dcp_mode,
     )
-
-
-@nki.jit
-def prior_mask(pos, start, active, s_prior: int, block_len: int, q_head: int, d_head: int, fp8_kv: bool):
-    """One decode step's full attention mask for a layer kind, in the layout attn_half's mask path reads (nkilib's
-    gen_mask_tkg_hbm, QK-swapped where nkilib's is_qk_swapped takes that path for the shape): ``pos`` [B, S] fp32 each
-    token's prior length, ``start`` [B, S] fp32 or None its window start, ``active`` [S, B, q_head, S] uint8 the span's
-    active part. Every sliding layer of the step reads the one mask (model.MiMoV2Graph._layer_call), where the
-    position path builds it again inside each layer's attention: 32 small instructions a row at a batch of 8 MTP rows,
-    ~0.9 ms a decode step."""
-    from nkilib.core.attention.attention_tkg_utils import is_qk_swapped
-    from nkilib.core.attention.gen_mask_tkg import gen_mask_tkg_hbm
-
-    B, S = pos.shape
-    swapped = is_qk_swapped(bs=B, q_head=q_head, d_head=d_head, s_active=S, curr_sprior=s_prior,
-                            lnc=nl.num_programs(axes=0), p_max=P, is_block_kv=block_len > 0, is_2byte_kv=not fp8_kv,
-                            fp8_packed=False, fuse_rope=False)
-    return gen_mask_tkg_hbm(pos.reshape((1, B * S)), B, q_head, S, s_prior,
-                            start_pos_hbm=None if start is None else start.reshape((1, B * S)), block_len=block_len,
-                            active_mask=active, transposed_out=swapped)
 
 
 @nki.jit

@@ -44,7 +44,6 @@ KNOBS: dict = {
     "SGLANG_NEURON_MIMO_EXPERT_CACHE": CONFIG,
     # MiMo-V2: the decode MoE half kernel and the step's head kernels (models/mimo_v2/model.py)
     "SGLANG_NEURON_MIMO_KVDP": CONFIG,
-    "SGLANG_NEURON_MIMO_SWA_STEP_MASK": CONFIG,
     "SGLANG_NEURON_MIMO_SWA_MASK_VEC": CONFIG,
     "SGLANG_NEURON_MIMO_FA_EXIT": CONFIG,
     # MiMo-V2: the decode graphs' context rungs (models/mimo_v2/sglang_model.decode_context_ladder)

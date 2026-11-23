@@ -37,7 +37,6 @@ from sglang_neuron.utils.weight_loader import SafetensorsWeightLoader, set_weigh
 FP8_SCALE = "weight_scale_inv"
 # the full layers' decode attention over KV data parallelism (MiMoV2Graph._kvdp): 1 (the default) or 0
 KVDP_ENV = "SGLANG_NEURON_MIMO_KVDP"
-SWA_MASK_ENV = "SGLANG_NEURON_MIMO_SWA_STEP_MASK"
 
 
 
@@ -709,9 +708,6 @@ class MiMoV2Graph(nn.Module):
                 k_idx = torch.arange(span, device=x.device).reshape(span, 1, 1, 1)
                 q_idx = torch.arange(span, device=x.device).reshape(1, 1, 1, span)
                 mask = (k_idx <= q_idx).expand(span, rows // kvdp, heads_attn * kvdp, span).to(torch.uint8)
-        step_mask = None
-        if posid and layer.is_swa and dcp == 1 and kvdp == 1:
-            step_mask = self._swa_step_mask(layer, mask, table, step)
         sink = attn._sink_column() if dcp == 1 else (None if attn.dcp_sink is None else attn.dcp_sink.reshape(-1, 1))
         attn_args = (x, layer.input_norm_f32, attn.qkv_weight, cos, sin, table, attn.k_cache, attn.v_cache, mask,
                      sink, slots, attn._kernel_o_weight())
@@ -726,9 +722,6 @@ class MiMoV2Graph(nn.Module):
         elif kvdp > 1:
             common.update(pos=step[("pos", False)], rank=attn.attn_tp_group.rank_in_group_tensor, kvdp=kvdp,
                           kvdp_mesh=self._kvdp_mesh(layer, kvdp))
-        elif step_mask is not None:
-            # the step's sliding-window mask (_swa_step_mask): the mask path, no positions
-            attn_args = attn_args[:8] + (step_mask,) + attn_args[9:]
         elif posid:
             common.update(pos=step[("pos", layer.is_swa)], start=step.get(("start", layer.is_swa)))
         gamma = layer.post_attention_layernorm.weight.view(1, -1)
@@ -746,32 +739,6 @@ class MiMoV2Graph(nn.Module):
             *attn_args, gamma, mlp.router_wT, mlp.expert_bias.view(1, -1), step["ebase"], mlp.gate_up_weight,
             mlp.down_weight, mlp.gate_up_scale, mlp.down_scale, step["mesh"], route_scale=float(mlp.scaling),
             top_k=mlp.top_k, fp8_act=True, **common)
-
-    def _swa_step_mask(self, layer, active, table, step):
-        """The sliding layers' full decode mask for this step (kernels/attn_half.prior_mask), built once and kept in
-        ``step`` for every sliding layer after, under SGLANG_NEURON_MIMO_SWA_STEP_MASK=1; None by default (each layer's
-        attention masks by position). Opt-in: on an 8K server it took c=8 20.75 -> 19.75 ms a step, but a 1M server
-        (SWA_RATIO 0.04) hung its first c=8 decode in a collective ("missing collectives status ... barrier END"),
-        not understood yet."""
-        import os
-
-        from sglang_neuron.backend.stack import wrap_nki
-        from sglang_neuron.models.mimo_v2.attention import fp8_kv_cache
-        from sglang_neuron.models.mimo_v2.config import KV_HEAD_DIM
-        from sglang_neuron.models.mimo_v2.kernels.attn_half import prior_mask
-        from sglang_neuron.utils.hardware_config import get_logical_nc_config
-
-        if os.environ.get(SWA_MASK_ENV, "0").strip() != "1":
-            return None
-        key = ("swa_step_mask", tuple(active.shape), tuple(table.shape))
-        if key not in step:
-            page = layer.self_attn.k_cache.shape[2]
-            span, rows = int(active.shape[0]), int(active.shape[1])
-            step[key] = wrap_nki(prior_mask)[get_logical_nc_config()](
-                step[("pos", True)].reshape(rows, span), step.get(("start", True)), active,
-                s_prior=int(table.shape[1]) * page, block_len=page, q_head=int(active.shape[2]), d_head=KV_HEAD_DIM,
-                fp8_kv=fp8_kv_cache())
-        return step[key]
 
     def decoder_layers(self) -> list:
         """The target's decoder layers, then the MTP layers' under NEURON_MTP (the KV pool's layers after them)."""
