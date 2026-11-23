@@ -25,6 +25,8 @@ layer) or the runtime's table trimmed to the window (a sliding layer)."""
 
 from __future__ import annotations
 
+import nki
+import nki.language as nl
 import torch
 from sglang.srt.distributed.parallel_state import get_attn_tp_group
 from torch import nn
@@ -36,6 +38,7 @@ from sglang_neuron.models.transformer.config import DTYPE
 from sglang_neuron.models.transformer.model import RMSNorm
 from sglang_neuron.parallel import collectives as neuron_collectives
 from sglang_neuron.parallel import groups
+from sglang_neuron.utils.neuron_utils import can_run_kernel
 from sglang_neuron.utils.weight_loader import set_weight_loader
 
 
@@ -46,6 +49,12 @@ PREFILL_QUERY_BLOCK = 256
 # the IndexPool scores every head in one matmul up to this many [rows, heads, groups] scores, one head at a time above
 # (a prefill chunk's would be its largest tensor); a decode step's batch then is one matmul a row, not 16
 ALL_HEADS_SCORES = 1 << 23
+# the IndexPool's selection runs nkilib's top-k kernel up to this many rows (a decode), the threshold search above (a
+# prefill chunk's 2048 rows take longer in the kernel); the score of an invalid group
+KERNEL_TOPK_ROWS = 128
+# and up to this many groups a row (the kernel's tested range is 151936; a 1M-token rung's table has 262144)
+KERNEL_TOPK_GROUPS = 128 * 1024
+TOPK_EMPTY = 3.0e38
 
 
 def write_rows(cache: torch.Tensor, rows: torch.Tensor, slots: torch.Tensor) -> None:
@@ -75,6 +84,28 @@ def read_groups(cache: torch.Tensor, first_slots: torch.Tensor, ratio: int) -> t
     d = cache.shape[-1]
     rows = torch.div(first_slots.to(torch.int64), ratio, rounding_mode="floor")
     return cache.view(-1, ratio * d).index_select(0, rows.reshape(-1)).view(rows.shape[0], -1, d)
+
+
+@nki.jit
+def _rotational_topk(scores, k):
+    from nkilib.core.topk.rotational_topk import create_rotational_topk_config, rotational_topk
+    from nkilib.core.topk.rotational_topk_utils import create_topk_config
+
+    cfg = create_topk_config(inp_shape=scores.shape, inp_dtype=getattr(nl, str(scores.dtype).split(".")[-1]), k=k,
+                             sorted=False, num_programs=2)
+    return rotational_topk.func(inp=scores, config=create_rotational_topk_config(inp_shape=scores.shape,
+                                                                                 topk_config=cfg))
+
+
+def index_topk(scores: torch.Tensor, valid: torch.Tensor, k: int) -> torch.Tensor:
+    """[R, k] int64 the groups of each row's ``k`` best valid scores (nkilib's rotational top-k), -1 where a row has
+    fewer valid groups."""
+    from sglang_neuron.backend.stack import wrap_nki
+    from sglang_neuron.utils.hardware_config import get_logical_nc_config
+
+    masked = torch.where(valid, scores, torch.full_like(scores, -TOPK_EMPTY))
+    values, idx = wrap_nki(_rotational_topk)[get_logical_nc_config()](masked, k)
+    return torch.where(values > -TOPK_EMPTY / 2, idx.to(torch.int64), torch.full_like(idx, -1, dtype=torch.int64))
 
 
 class IndexPool(nn.Module):
@@ -145,9 +176,10 @@ class IndexPool(nn.Module):
                    torch.where(completes, torch.div(member_slots[:, 0], INDEX_RATIO, rounding_mode="floor"),
                                torch.zeros_like(first)))
 
-    def _chosen_groups(self, x, q_resid, pos, table, block):
-        """(chosen [R, G] bool: each query's best complete groups before its own, own [R]: its own group) over the
-        groups of ``table`` [R, blocks] (or one request's [1, blocks]), group g covering positions 4g .. 4g + 3."""
+    def _group_scores(self, x, q_resid, pos, table, block):
+        """(scores [R, G] fp32, valid [R, G]: the complete groups before the query's own, own [R]: its own group)
+        over the groups of ``table`` [R, blocks] (or one request's [1, blocks]), group g covering positions
+        4g .. 4g + 3."""
         rows = x.shape[0]
         q = (q_resid @ self.q_w).view(rows, self.heads, INDEX_DIM)
         q = self._rope_last(q, pos)
@@ -166,6 +198,11 @@ class IndexPool(nn.Module):
                 scores = s if scores is None else scores + s
         own = torch.div(pos, INDEX_RATIO, rounding_mode="floor")
         valid = torch.arange(groups_n, device=pos.device).unsqueeze(0) < own.unsqueeze(1)
+        return scores, valid, own
+
+    def _chosen_groups(self, x, q_resid, pos, table, block):
+        """(chosen [R, G] bool: each query's best complete groups before its own, own [R])."""
+        scores, valid, own = self._group_scores(x, q_resid, pos, table, block)
         return ops.top_count_mask(scores, valid, self.group_budget), own
 
     def selection(self, x: torch.Tensor, q_resid: torch.Tensor, positions: torch.Tensor, table: torch.Tensor,
@@ -180,6 +217,15 @@ class IndexPool(nn.Module):
         groups each query attends, its chosen ones then its own, compacted (ops.compact_groups) so the attention
         gathers index_topk rows, not the context, and their tokens."""
         pos = positions.to(torch.int64)
+        groups_n = table.shape[1] * block // INDEX_RATIO
+        if x.shape[0] <= KERNEL_TOPK_ROWS and groups_n <= KERNEL_TOPK_GROUPS and can_run_kernel(x):
+            # a decode's few rows: nkilib's top-k hands back the groups themselves (in no order: the attention does
+            # not care), which the threshold search and the compaction take four times as long to find
+            scores, valid, own = self._group_scores(x, q_resid, pos, table, block)
+            picked = index_topk(scores, valid, self.group_budget)
+            picked = torch.cat([picked, own.unsqueeze(1)], dim=1)
+            tokens = (picked.unsqueeze(-1) * INDEX_RATIO + torch.arange(INDEX_RATIO, device=pos.device)).flatten(1)
+            return picked, tokens, (tokens >= 0) & (tokens <= pos.unsqueeze(1))
         chosen, own = self._chosen_groups(x, q_resid, pos, table, block)
         return ops.compact_groups(chosen, own, pos, self.group_budget, INDEX_RATIO)
 
