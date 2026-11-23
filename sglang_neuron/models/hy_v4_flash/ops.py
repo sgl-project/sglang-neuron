@@ -174,24 +174,38 @@ def block_cumsum(x: torch.Tensor, block: int = 128) -> torch.Tensor:
     return out.to(x.dtype) if x.dtype != torch.bool else out.to(torch.int32)
 
 
-def top_count_mask(scores: torch.Tensor, valid: torch.Tensor, count: int, iters: int = 32) -> torch.Tensor:
-    """[R, G] bool: each row's ``count`` best valid entries (every valid one where a row has no more), by bisection
+def top_count_mask(scores: torch.Tensor, valid: torch.Tensor, count: int, iters: int = 8,
+                   ways: int = 16) -> torch.Tensor:
+    """[R, G] bool: each row's ``count`` best valid entries (every valid one where a row has no more), by a search
     on the threshold instead of a sort: ``count`` above about a hundred is beyond what torch.topk lowers to well on a
-    NeuronCore. Entries tied at the threshold (relu scores are often exactly 0) are kept in group order up to
-    ``count``, as the decode's compaction keeps them (compact_groups)."""
+    NeuronCore. Each step splits the row's interval into ``ways`` parts at once (``ways - 1`` thresholds compared in
+    one pass), so ``iters`` steps resolve as finely as ``iters x log2(ways)`` halvings (32 by default) in a quarter of
+    the passes. Entries tied at the threshold (relu scores are often exactly 0) are kept in group order up to
+    ``count`` after every entry above them (a group-order cap on all of them would drop a later positive score for an
+    earlier 0 where fewer than ``count`` scores are positive)."""
     big = torch.finfo(torch.float32).max
     s = torch.where(valid, scores, torch.full_like(scores, -big))
     lo = torch.where(valid, scores, torch.full_like(scores, big)).amin(dim=-1, keepdim=True)
     hi = s.amax(dim=-1, keepdim=True)
     n_valid = valid.sum(dim=-1, keepdim=True)
+    frac = torch.arange(1, ways, device=scores.device, dtype=torch.float32) / ways
+    slot = torch.arange(ways - 1, device=scores.device)
     for _ in range(iters):
-        mid = lo + (hi - lo) * 0.5
-        above = ((s >= mid) & valid).sum(dim=-1, keepdim=True)
-        ok = above >= count
-        lo = torch.where(ok, mid, lo)
-        hi = torch.where(ok, hi, mid)
-    keep = (s >= lo) & valid
-    keep = keep & (block_cumsum(keep.to(torch.int32)) <= count)
+        t = lo + (hi - lo) * frac  # [R, ways - 1], increasing
+        above = ((s.unsqueeze(1) >= t.unsqueeze(-1)) & valid.unsqueeze(1)).sum(dim=-1)
+        # the counts fall as t rises: the thresholds that keep at least ``count`` are a prefix
+        n_ok = (above >= count).sum(dim=-1, keepdim=True)
+        new_lo = (t * (slot == n_ok - 1)).sum(dim=-1, keepdim=True)
+        new_hi = (t * (slot == n_ok)).sum(dim=-1, keepdim=True)
+        lo = torch.where(n_ok > 0, new_lo, lo)
+        hi = torch.where(n_ok < ways - 1, new_hi, hi)
+    # s >= hi is fewer than ``count`` (unless hi never moved: ``count`` or more tied at the top), all kept; the band
+    # [lo, hi) is the ties at the threshold, kept in group order up to ``count``
+    n_hi = ((s >= hi) & valid).sum(dim=-1, keepdim=True)
+    strict = (s >= hi) & valid & (n_hi < count)
+    band = (s >= lo) & valid & ~strict
+    room = count - strict.sum(dim=-1, keepdim=True)
+    keep = strict | (band & (block_cumsum(band.to(torch.int32)) <= room))
     return torch.where(n_valid <= count, valid, keep)
 
 
@@ -208,29 +222,40 @@ def selected_table_tokens(group_mask: torch.Tensor, own_group: torch.Tensor, key
 
 
 def compact_groups(chosen: torch.Tensor, own_group: torch.Tensor, query_positions: torch.Tensor, budget: int,
-                   ratio: int, chunk: int = 128) -> tuple:
+                   ratio: int, block: int = 128) -> tuple:
     """(groups [R, budget + 1] int64, positions [R, (budget + 1) x ratio] int64, valid bool) of the tokens a query
     attends: its first ``budget`` chosen groups (chosen [R, G] bool) in group order, then its own group, each expanded
     to its ``ratio`` tokens; an empty group slot (-1), and a token after the query, is invalid.
 
-    The j-th chosen group is the number of groups whose inclusive count of chosen groups is at most j (the count is
-    non-decreasing and first reaches j + 1 there), a compare and a sum over the row, ``chunk`` slots at a time. A
-    scatter of each chosen group to its rank lowers to one software DMA an element (about 22 ms a layer at 64 rows)."""
+    The j-th chosen group is found in two levels. The groups split into blocks of ``block``; the j-th chosen lies in
+    the block whose count of chosen groups up to its end first exceeds j, and inside it at the number of groups whose
+    count within the block is at most j minus the chosen before the block. The block's counts are picked by a one-hot
+    matmul. This reads budget x (G / block + block) entries a row; the direct count of every group a slot (budget x
+    G) and a scatter of each chosen group to its rank (one software DMA an element) took about 20 ms a sparse layer
+    at 64 rows."""
     rows, groups = chosen.shape
-    counts = block_cumsum(chosen.to(torch.int32))
-    total = counts[:, -1:]
-    slots = torch.arange(budget, device=chosen.device, dtype=torch.int32)
-    parts = []
-    for lo in range(0, budget, chunk):
-        j = slots[lo:lo + chunk].view(1, -1, 1)
-        parts.append((counts.unsqueeze(1) <= j).to(torch.int32).sum(dim=-1))
-    picked = torch.cat(parts, dim=1)
-    picked = torch.where(slots.unsqueeze(0) < total, picked, torch.full_like(picked, -1)).to(torch.int64)
+    pad = (-groups) % block
+    nb = (groups + pad) // block
+    flags = F.pad(chosen.to(torch.float32), (0, pad)).view(rows, nb, block)
+    idx = torch.arange(block, device=chosen.device)
+    within = flags @ (idx.unsqueeze(1) <= idx.unsqueeze(0)).to(torch.float32)  # [R, nb, block] counts in a block
+    totals = within[..., -1]
+    bidx = torch.arange(nb, device=chosen.device)
+    ends = totals @ (bidx.unsqueeze(1) <= bidx.unsqueeze(0)).to(torch.float32)  # [R, nb] counts to a block's end
+    starts = ends - totals
+    slots = torch.arange(budget, device=chosen.device, dtype=torch.float32)
+    # the block of each slot: how many blocks end at or before it
+    b = (ends.unsqueeze(1) <= slots.view(1, -1, 1)).to(torch.float32).sum(dim=-1).clamp(max=nb - 1)  # [R, budget]
+    onehot = (b.unsqueeze(-1) == bidx.to(torch.float32)).to(torch.float32)  # [R, budget, nb]
+    local = onehot @ within  # [R, budget, block]
+    rank = slots.unsqueeze(0) - (onehot * starts.unsqueeze(1)).sum(dim=-1)  # [R, budget] rank within its block
+    inside = (local <= rank.unsqueeze(-1)).to(torch.float32).sum(dim=-1)
+    picked = (b * block + inside).to(torch.int64)
+    picked = torch.where(slots.unsqueeze(0) < ends[:, -1:], picked, torch.full_like(picked, -1))
     picked = torch.cat([picked, own_group.to(torch.int64).unsqueeze(1)], dim=1)
     tokens = (picked.unsqueeze(-1) * ratio + torch.arange(ratio, device=chosen.device)).flatten(1)
     valid = (tokens >= 0) & (tokens <= query_positions.to(torch.int64).unsqueeze(1))
     return picked, tokens, valid
-
 
 # ---------------------------------------------------------------------------------------------------------------------
 # experts
