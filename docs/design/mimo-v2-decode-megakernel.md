@@ -3,14 +3,17 @@
 Goal: a MiMo-V2.6-Flash decode step on one trn2.48xlarge (TP64 / EP64, LNC2) with **no XLA ops**: every layer's work,
 its collectives included, inside NKI kernels, and in the end state one kernel call per step, at batches of at least 8.
 
-**Status:** stage 2 below runs and is accurate (GSM8K 89.8% against 89.5% for the two half kernels; the
-[recipe](../model-recipes/mimo-v2.md#the-decode) has the numbers) but is about 1.1 ms a step slower than the two half
-kernels with the graph's all-reduces (TPOT 20.55 against 19.45 ms at c=1, 22.51 against 21.32 ms at c=8; the per-layer
-graph 22.17 and 25.36 ms). Its 96 in-kernel all-reduces a step are the cost to cut next.
+**Status:** stage 2 is the only decode form: every layer one kernel (`kernels/layer.py`, the two halves `attn_half.py`
+and `moe_half.py` inside it, the residual stream and both all-reduces in SBUF), no XLA op in a decode or prefill graph.
+An 8K MTP FP8 step costs 15.7 / 17.75 / 19.0 ms at c = 1 / 4 / 8 (23.2 / 26.6 / 29.6 when stage 2 landed; the
+[recipe](../model-recipes/mimo-v2.md#the-decode) has each step). Stage 3's first step, two layers in one kernel,
+measured zero gain: the layer kernels already run back to back in one NEFF.
 
-## What the per-layer graph runs today, per layer
+The table below is the per-layer graph stage 1 replaced, kept for where each piece went.
 
-| Piece | Today | Where it goes |
+## What the per-layer graph ran, per layer
+
+| Piece | The per-layer graph | Where it went |
 | --- | --- | --- |
 | input RMSNorm, QKV, RoPE, attention with sinks | nkilib `attention_block_tkg` (256-channel padded heads) | layer kernel, own attention at Q/K 192 / V 128 |
 | new token's K/V into the pages | NKI scatter kernel (`kv_write.py`) | layer kernel, DGE row scatter with OOB skip |
@@ -26,9 +29,9 @@ graph 22.17 and 25.36 ms). Its 96 in-kernel all-reduces a step are the cost to c
 
 | Stage | State |
 | --- | --- |
-| 1. layer kernel, the all-reduces outside | done: `kernels/attn_half.py`, `kernels/moe_half.py` (the default decode) |
+| 1. layer kernel, the all-reduces outside | done: `kernels/attn_half.py`, `kernels/moe_half.py` (now the halves inside stage 2) |
 | 2. the all-reduces inside, no XLA in a layer | done: `kernels/layer.py`, the only decode form (the XLA forms and their switches are gone) |
-| 3. one call a step | not started |
+| 3. one call a step | two layers a kernel tried: zero gain; parked |
 | 4. own attention, FP8 KV | not started |
 
 Two traps stage 2 met, both now in `kernels/layer.py`:

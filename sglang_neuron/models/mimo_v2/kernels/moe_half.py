@@ -290,7 +290,6 @@ def _prologue_transposed(hsrc, ln_w, T: int, H: int, eps, fp8_act: bool):
     eps) rounded to bf16, times the weight rounded to bf16; the FP8 input each token's row times 240 / its absolute
     max."""
     H1 = H // P
-    W = H1 * T
     # the rows transposed, every 128-column tile into one PSUM tile
     pT = nl.ndarray((P, H1, T), dtype=nl.bfloat16, buffer=nl.psum)
     for h1 in range(H1):

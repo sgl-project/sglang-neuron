@@ -10,7 +10,9 @@ that port's eager fp32 attention gathers the whole context every step and cannot
 2.33.0, the release image `pytorch-inference-sglang-neuron:v0.1.0` with this tree on `PYTHONPATH`), and with
 `--speculative-algorithm NEURON_MTP` (the checkpoint's 3 MTP layers, [below](#mtp-neuron_mtp)) and the FP8 KV cache
 (`--kv-cache-dtype fp8_e4m3`, [below](#fp8-kv-cache)) and DCP (`--dcp-size 8`, [below](#dcp---dcp-size-8)). PD runs over
-NIXL on two nodes ([below](#pd-two-trn248xlarge-nixl-over-efa)).
+NIXL on two nodes ([below](#pd-two-trn248xlarge-nixl-over-efa)). Neither the decode nor the prefill graphs hold an XLA
+compute op (NKI kernels only), and the model imports nothing from other models' packages (`kernels/PROVENANCE.md` names
+what was copied). The formal AgentX 1M points are [below](#agentx-1m-conc-8).
 
 ## The model
 
@@ -57,8 +59,8 @@ nkilib's attention kernels take one head dim for Q, K and V, and above 128 only 
 - V: its 128 channels times `attention_value_scale`, then 128 zero channels. The output projection reads the first 128.
 - The softmax scale stays `192 ** -0.5`.
 
-The prefill runs the QKV projection and RoPE in the graph, the chunk's K/V written by an NKI scatter (`kv_write.py`),
-then nkilib's segmented attention over the prior and the chunk, with the window (it loads only a window's pages) and
+The prefill runs a chunk's input RMSNorm, QKV projection, RoPE, FP8 scaling and K/V write in one NKI kernel
+(`kernels/prefill.prefill_front`), then nkilib's segmented attention over the prior and the chunk, with the window (it loads only a window's pages) and
 the sinks. The KV pool is sized for the same 256 channels: `sglang_patches/mimo_v2_launch.py` sets SGLang's
 `head_dim`, `v_head_dim`, `swa_head_dim` and `swa_v_head_dim` to 256 after `ModelConfig` derives them, and lets SGLang's
 MiMoV2 fused-QKV TP check through, since the graphs re-shard the fused QKV themselves.
@@ -93,10 +95,39 @@ decode step (TPOT x accept length) and GSM8K/1319:
 `tools/mimo_v2/bench_cc.py` times the all-reduce alone, 96 of [32, 4096] bf16 over 64 ranks: 37.5 us each in the
 graph, 45.1 us through HBM with the core barriers, 36.1 us SBUF to SBUF.
 
-The table below is the older bf16-cache, no-MTP measurement. The one-kernel layer is correct (below) but about 1.1 ms a step slower than the half kernels with the graph's
-all-reduces: its 96 in-kernel all-reduces of 64 ranks, each with its fences, cost more than the graph's. Making them
-cheaper (SBUF-to-SBUF all-reduce and residual, as nkilib's `transformer_tkg` `sbuf_residual_and_cc`) and running every
-layer in one call are the next steps ([the design](../design/mimo-v2-decode-megakernel.md)).
+The first table is the older bf16-cache, no-MTP measurement, from before the one-kernel layer kept its residual and
+all-reduces in SBUF; the second is that change, which made the one-kernel layer the only form.
+
+**The layer kernels since** (the same 8K MTP FP8 server, step = TPOT x accept):
+
+| Change | step c=1 | step c=4 | step c=8 |
+| --- | --- | --- | --- |
+| the zero-XLA step (sampling, token relay and the MTP tail in kernels) | 19.7 ms | 21.8 ms | 24.2 ms |
+| `moe_half`: the 4 local experts split between the 2 programs (no per-expert sendrecv), whole-row down tiles; RMSNorm, FP8 input and each expert's activation in a transposed `[128, n x T]` layout; the norm weight transposed on the PE. `attn_half`: O-proj before the K/V write, W_o loaded early | 15.7 ms | 18.35 ms | 20.75 ms |
+| `moe_half`: per-token scalars broadcast by stream shuffle; the programs' exchange overlaps the last expert | 15.7 ms | 17.8 ms | 19.95 ms |
+| **`attn_half`: the sliding layers' mask vectorized** (the default) | **15.7 ms** | **17.75 ms** | **19.0 ms** |
+
+GSM8K (400) 0.907-0.912 and greedy accept 3.42 throughout. The MoE half at 32 rows went from 259 to 177 us a layer; its
+middle (every local expert's weights through the PE each step) is PE-bound, and the PE is HAM-throttled to about 60%
+of its peak, so only fewer PE instructions help there. A decode row uses T of the 128 partitions: a `[T, H]`
+elementwise op costs about H cycles, `[128, H x T / 128]` about T, which is what the transposed layouts buy.
+
+Two switches (`env_registry.py`):
+
+- `SGLANG_NEURON_MIMO_SWA_MASK_VEC` (default `1`): `attn_half.install_swa_mask_patch` replaces nkilib's
+  `gen_mask_tkg._create_batch_masks_swa` (about 9 instructions a row and token) with the same mask built over
+  `[128, tiles, rows, span]` in about 9 instructions a call; bit-equal at 1 / 2 / 8 rows and 4- / 64-block tables. `0`
+  keeps nkilib's.
+- `SGLANG_NEURON_MIMO_FA_EXIT` (default `0`): pass nkilib's attention a `max_context_len` (the batch's longest row, a
+  rank's own rows under KVDP), so its flash-attention loop stops after that row's tiles. nkilib's resized-block-table
+  load reads tile 0's blocks for every dynamic tile (sgl-project/sglang-neuron#4); `install_fa_exit_patch` fixes it
+  (bit-equal from 20K to 150K, needles 12/12 and 8/8). It is off because the dynamic loop is slower than the unrolled
+  one at AgentX's mix: P90 interactivity 46.0 with it, 48.6 without, on one node; 1P1D measured the same direction.
+
+Tried and dropped: two layers fused into one kernel (zero gain: the layer kernels already run back to back in one
+NEFF), a router weight prefetch, alternating DMA queues, DVE work moved to GpSimd, and a mask built once a step for
+the sliding layers (0.9 ms a step at 8K, but it hung long-context servers at two rows or more; removed).
+`tools/mimo_v2/bench_moe_half.py` times the MoE half on one core (a chain of R calls in one kernel, R=1 against R=9).
 
 ## Accuracy
 
@@ -153,9 +184,9 @@ mimo` with the radix cache and:
 ### MTP (`NEURON_MTP`)
 
 `MTP=1 bash examples/mimo_v2/run_server.sh` adds `--speculative-algorithm NEURON_MTP` (`speculative/neuron_mtp.py`):
-one decode step verifies the previous step's 3 drafts and drafts 3 more on the device, with Hy3's step
-(`models/hy_v3/mtp_step.py`, `runtime.py`: a device carry of each request slot's next tokens and length, the host's
-per-row control) and MiMo's graphs (`models/mimo_v2/mtp.py`, `mtp_step.py`, `model.MiMoV2Graph._mtp_decode`):
+one decode step verifies the previous step's 3 drafts and drafts 3 more on the device (`models/mimo_v2/mtp.py`,
+`mtp_step.py`, `runtime.py`: a device carry of each request slot's next tokens and length, the host's per-row control,
+modelled on Hy3's step and copied, not imported; `model.MiMoV2Graph._mtp_decode`):
 
 - **Verify**: every target layer runs each row's 4 tokens at once, nkilib's `attention_block_tkg` at `S_tkg = 4` over a
   span mask (`attention.span_mask`: the prior ends at the row's committed length, the sliding layers' window starts at
@@ -172,7 +203,7 @@ per-row control) and MiMo's graphs (`models/mimo_v2/mtp.py`, `mtp_step.py`, `mod
   last token. The decode's sliding tables are one page wider (a step reaches 2 x 4 positions past the host's length).
 
 Two traps a step must avoid, both of which collapse every later answer to one repeated token at concurrency above 1
-and never show at concurrency 1 (`HyV3Runtime._allocated_table`, `mtp_step.span_inputs`, fixed for Hy3 too):
+and never show at concurrency 1 (`MiMoV2Runtime._allocated_table`, `mtp_step.span_inputs`; Hy3's step has the same fixes):
 
 - the step's block table reaches past a request's allocation, where its request-table row still holds an earlier
   request's slots (now another request's or the radix tree's pages): those columns are -1;
@@ -242,24 +273,32 @@ NEURON_MTP or the hybrid window pool.
 
 ### PD (two trn2.48xlarge, NIXL over EFA)
 
-A TP64 prefill on one node in front of a TP64 decode on the other, both on one KV pool (the window pool is not served on
-a PD role), the plugin's balancer in front:
+A TP64 prefill on one node in front of a TP64 decode on the other, the plugin's balancer in front. The form AgentX ran
+([below](#agentx-1m-conc-8)): NEURON_MTP on the decode, the FP8 cache and the hybrid window pool on both roles:
 
 ```bash
-# both: SGLANG_NEURON_HYBRID_SWA_RADIX=0, the container with /dev/infiniband (--privileged) and --network host
+# both: the container with /dev/infiniband (--privileged), --network host and --init
+export SGLANG_NEURON_PD_HYBRID_SWA=1 SGLANG_NEURON_MIMO_EXPERT_CACHE=1 SGLANG_NEURON_PRECOMPILE_CACHE=1
+export CONTEXT=1048576 MAX_RUNNING=8 MEM_FRACTION=0.66 SWA_RATIO=0.04 MAX_TOTAL_TOKENS=2106752
+PD="--kv-cache-dtype fp8_e4m3 --disaggregation-transfer-backend nixl"
 # prefill node
-HOST=<prefill ip> PORT=30000 bash examples/mimo_v2/run_server.sh --disable-hybrid-swa-memory \
-  --disaggregation-mode prefill --disaggregation-transfer-backend nixl --disaggregation-bootstrap-port 8998
+SGLANG_NEURON_MIMO_PD_MTP_KV=1 MTP=0 HOST=<prefill ip> PORT=30001 bash examples/mimo_v2/run_server.sh $PD \
+  --disaggregation-mode prefill --disaggregation-bootstrap-port 8998
 # decode node
-HOST=<decode ip> PORT=30001 bash examples/mimo_v2/run_server.sh --disable-hybrid-swa-memory \
-  --disaggregation-mode decode --disaggregation-transfer-backend nixl
-python3 -m sglang_neuron.disaggregation.balancer --prefill http://<prefill ip>:30000 \
-  --decode http://<decode ip>:30001 --bootstrap-port 8998 --port 8000
+SGLANG_NEURON_HYBRID_SWA_RADIX=0 MTP=1 HOST=<decode ip> PORT=30002 bash examples/mimo_v2/run_server.sh $PD \
+  --disaggregation-mode decode
+python3 -m sglang_neuron.disaggregation.balancer --prefill http://<prefill ip>:30001 \
+  --decode http://<decode ip>:30002 --bootstrap-port 8998 --port 8000
 ```
 
-Measured at a 64K context (bf16 cache, no MTP): GSM8K 0.900 (1319, parallel 8) through the balancer; decode TPOT
-20.92 / 23.09 / 26.23 ms at c = 1 / 8 / 16. Without EFA NIXL's LIBFABRIC backend registers no device memory
-(`registerMem: no available backends for mem type 'VRAM_SEG'`), so a one-node pair
+`SGLANG_NEURON_PD_HYBRID_SWA=1` sizes the decode's window pool without a prefill chunk in flight and adds the MTP
+layers to the prefill's window layer ids; without it both roles take `--disable-hybrid-swa-memory` (one KV pool).
+A container without `--init` keeps a crashed server's children as zombies, and the next launch waits on them.
+
+Measured at a 64K context on one pool (bf16 cache, no MTP): GSM8K 0.900 (1319, parallel 8) through the balancer; decode
+TPOT 20.92 / 23.09 / 26.23 ms at c = 1 / 8 / 16. With the hybrid window pool, MTP and the FP8 cache: GSM8K 0.916, accept
+3.43, TPOT 6.86 / 8.20 / 8.23 ms at c = 1 / 8 / 16, the same as on one pool. Without EFA NIXL's LIBFABRIC backend
+registers no device memory (`registerMem: no available backends for mem type 'VRAM_SEG'`), so a one-node pair
 (`examples/mimo_v2/run_pd_one_node.sh`) needs a node with EFA too.
 
 **NEURON_MTP and the FP8 cache on a PD pair**: the prefill takes `SGLANG_NEURON_MIMO_PD_MTP_KV=1` (it holds the MTP
@@ -309,6 +348,22 @@ The needle misses move with the decode's numerics (the per-layer graph missed ot
 depth is lost every time; the filler text repeats two sentences, which a model can skim. Reading them against a GPU
 reference on the same prompts is open.
 
+### AgentX 1M, conc 8
+
+InferenceX AgentX (agentx-bench `client/run_point.sh`, the full 1M corpus, 3600 s, a fresh server for the point),
+`CONTEXT=1048576 MAX_RUNNING=8 SWA_RATIO=0.04`, NEURON_MTP, the FP8 cache, the layer kernels' defaults:
+
+| Deployment | Tree | P50 / P90 interactivity | ITL P50 / P90 | TTFT P90 | output tok/s | a chip |
+| --- | --- | --- | --- | --- | --- | --- |
+| one trn2.48xlarge (16 chips) | 2f27e9a | 80.9 / 48.6 | 12.3 / 20.5 ms | 3.40 s | 283.4 | 17.71 |
+| 1P1D, two trn2.48xlarge (32 chips), [above](#pd-two-trn248xlarge-nixl-over-efa) | 6eaa5cd (FA exit on) | 101.9 / 65.1 | 9.8 / 15.4 ms | 3.12 s | 300.6 | 9.39 |
+
+The H100 SGLang reference on the same point: P90 interactivity 135.3, 47.2 output tok/s a GPU. On the 1P1D pair the
+FA exit off (this tree's default) measured P90 interactivity 68.3 against 67.2 over the first 40 minutes (a partial
+run). A decode step at long contexts is bound by the 9 full-attention layers (the K transposes on the PE: about 2.6 ms
+a step at 100K rows) and by the experts' weights streaming through the PE every step; the per-step all-reduces wait
+about 1.3 ms.
+
 ### Compile times and caches
 
 A first start compiles every graph: about 13 min at 8K, 26 min at 256K, 54 min at 1M. The compile cache keys hash
@@ -335,20 +390,20 @@ start with another `CACHE_DIR`.
 - A `--kv-cache-dtype` other than bf16 or `fp8_e4m3`, a dtype other than bfloat16.
 - The split q/k/v projection layout (MiMo-V2-Flash), a scaled RoPE, grouped routing, shared experts, attention biases.
 - `--enable-multimodal`, `--mm-enable-dp-encoder`.
-- `NEURON_MTP` on a PD role (the MTP step is served on an aggregated server), with other chain-shape flags than 3 / 1 / 4,
-  or with logprobs.
+- `NEURON_MTP` on a PD prefill (it takes `SGLANG_NEURON_MIMO_PD_MTP_KV=1` instead and writes the MTP layers' KV for the
+  decode), with DCP or DP attention, with other chain-shape flags than 3 / 1 / 4, or with logprobs.
 
 ## Next
 
-- **The decode megakernel** ([design](../design/mimo-v2-decode-megakernel.md)): cheaper in-kernel collectives, then
-  every layer in one call, then an attention at Q/K 192 and V 128 (no padding: 1.6x fewer KV bytes and reads).
-- **NEURON_MTP**: the verify's attention in the attention half kernel (`S > 1`), the MTP layers' passes in one kernel,
-  and SGLang's draft extend (rewriting the MTP layers' KV at the positions whose tokens were drafts).
-- **FP8 KV cache**: per-layer KV scales from a calibration (as Hy3's profile), and the prefill's full-layer packing
-  limited to the prior's pages.
-- **DCP**: faster DCP steps (the fused attention half kernel over the shards, the sliding layers kept off the
-  merge where their window allows), DCP with NEURON_MTP, and DCP over the hybrid window pool.
-- **DP attention** runs on a PD decode only (the runtime refuses it aggregated), and needs MiMo's experts over the wide EP
-  group with the DP groups' tokens gathered around them (models/gpt_oss/mxfp4's decode). PD itself is written for one
-  node (`examples/mimo_v2/run_pd_one_node.sh`, TP32 prefill + TP32 decode) and needs EFA: without it NIXL's LIBFABRIC
-  backend registers no device memory (`registerMem: no available backends for mem type 'VRAM_SEG'`).
+- **Long-context decode**, where AgentX spends its steps: the full layers' K transposes off the PE (a DMA transpose
+  needs heads of at most 128 channels: K split into two 128-channel halves, or V stored at its 128), and block-sparse
+  attention on the 9 full layers (per-page K summaries, a page selection every few layers, as Hy3's decode; an
+  approximation, so gated on needles and AgentX accuracy).
+- **The all-reduces**: about 1.3 ms a step waiting; the lever left is prefetching the next layer's weights across them.
+- **One call a step** ([design](../design/mimo-v2-decode-megakernel.md), stage 3): the 48 layers looped in one kernel.
+  Fusing two layers measured zero gain, so this is for launch overhead and cross-layer prefetch, not per-layer cost.
+- **An attention at Q/K 192 and V 128** (no padding: 1.6x fewer KV bytes and reads).
+- **Deployment**: a bigger decode batch behind the PD prefill, replicas, DP attention on the PD decode (measured as the
+  throughput layout above).
+- **FP8 KV cache**: per-layer KV scales from a calibration.
+- **DCP**: with NEURON_MTP and over the hybrid window pool.

@@ -5,7 +5,7 @@ the layout, the flags and what is not validated yet.
 
 | script | does |
 |---|---|
-| `run_server.sh` | the server; `CONTEXT` 8192 for bring-up, 262144 for the AgentX 256K point |
+| `run_server.sh` | the server; `CONTEXT` 8192 for bring-up, 262144 / 1048576 for the AgentX points (`MTP=1` for NEURON_MTP) |
 | `run_client.sh` | one greedy chat request |
 | `run_needle.py` | needles in long haystacks (the full-attention layers' long-context check) |
 | `run_agentx.sh` | one InferenceX AgentX point, from a separate CPU host |
