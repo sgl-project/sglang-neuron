@@ -32,6 +32,8 @@ KNOBS: dict = {
     "SGLANG_NEURON_GLM52_POINT": CONFIG,
     "SGLANG_NEURON_GLM52_MTP_SYNTHETIC_AL": BENCHMARK,
     "SGLANG_NEURON_GLM52_ATTN_W8": CONFIG,
+    # Hy4-Flash (models/hy_v4_flash): the context rungs of its graphs (runtime.py)
+    "SGLANG_NEURON_HY4F_CONTEXTS": CONFIG,
     # the Kimi-K3 prompt cache on the PD prefill (--radix-cache-backend kimi-prompt, mem_cache/kimi_prompt_backend):
     # its host tier, keep_previous, the chunk ends and the read-back of each page copy of a hit
     "SGLANG_NEURON_KIMI_PROMPT_HOST_SLOTS": CONFIG,

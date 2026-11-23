@@ -7,6 +7,9 @@ needs and what its launch refuses.
 
 - [GPT-OSS-120B](gpt-oss.md): MXFP4 experts, an FP8 KV cache, expert parallelism, and a disaggregated decode with DP
   attention.
+- [Hy4-Flash](hy4-flash.md): Hy4-flash-FP8's text decoder, gated MLA with the IndexPool's sparse selection and sliding
+  layers in SGLang's window pool, iHC, LatentMoE with Trn2-FP8 experts and the Engram n-gram memory, TP32 / EP32 on
+  half a trn2.48xlarge.
 - [DeepSeek-V2-Lite](deepseek-v2.md): MLA over SGLang's MLA pool, served on attention TP4.
 - [Qwen3](qwen3.md): Qwen3-0.6B and Qwen3-8B on the shared dense transformer, TP4 (and TP8 for Qwen3-8B).
 - [Qwen3-MoE](qwen3-moe.md): Qwen3-30B-A3B, the dense transformer with a sparse MoE block, TP4 with EP4.
