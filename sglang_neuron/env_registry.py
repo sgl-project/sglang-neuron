@@ -75,6 +75,8 @@ KNOBS: dict = {
     "SGLANG_NEURON_MLA_POOL": CONFIG,
     # DeepSeek-V2's longest served context, raised for a long-context probe (envs.deepseek_v2_max_context)
     "SGLANG_NEURON_DSV2_MAX_CONTEXT": CONFIG,
+    # the bf16 MoE decode's selective-expert token limit (envs.moe_decode_selective_tokens; ops/moe/moe_tkg_bf16)
+    "SGLANG_NEURON_MOE_DECODE_SELECTIVE": CONFIG,
     # opt-in HBM small-allocation arena guard, the NRT status 1200 workaround (backend.hbm_tail_guard)
     "SGLANG_NEURON_HBM_TAIL_GUARD": CONFIG,
     # HiCache L2's host<->device copies (mem_cache/host_pool.py)

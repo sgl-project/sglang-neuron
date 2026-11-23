@@ -82,3 +82,14 @@ def deepseek_v2_max_context(default: int, environ=os.environ) -> int:
     if not raw.strip().isdigit() or int(raw) <= 0:
         raise ValueError(f"SGLANG_NEURON_DSV2_MAX_CONTEXT={raw!r}: set a positive token count, or leave it unset")
     return int(raw)
+
+
+def moe_decode_selective_tokens(environ=os.environ):
+    """The most tokens the bf16 MoE decode runs in moe_tkg's selective mode (ops/moe/moe_tkg_bf16), None for the
+    platform default."""
+    value = environ.get("SGLANG_NEURON_MOE_DECODE_SELECTIVE")
+    if value is None or value == "":
+        return None
+    if not value.isdigit():
+        raise ValueError(f"SGLANG_NEURON_MOE_DECODE_SELECTIVE={value}: a token count (0 off)")
+    return int(value)
