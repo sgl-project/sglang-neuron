@@ -208,18 +208,25 @@ def selected_table_tokens(group_mask: torch.Tensor, own_group: torch.Tensor, key
 
 
 def compact_groups(chosen: torch.Tensor, own_group: torch.Tensor, query_positions: torch.Tensor, budget: int,
-                   ratio: int) -> tuple:
+                   ratio: int, chunk: int = 128) -> tuple:
     """(groups [R, budget + 1] int64, positions [R, (budget + 1) x ratio] int64, valid bool) of the tokens a query
-    attends: its first ``budget``
-    chosen groups (chosen [R, G] bool) in group order, then its own group, each expanded to its ``ratio`` tokens; an
-    empty group slot, and a token after the query, is invalid. The compaction is a scatter of each chosen group's id
-    to its rank among the row's chosen groups (a cumulative sum), the rest to a dump column."""
+    attends: its first ``budget`` chosen groups (chosen [R, G] bool) in group order, then its own group, each expanded
+    to its ``ratio`` tokens; an empty group slot (-1), and a token after the query, is invalid.
+
+    The j-th chosen group is the number of groups whose inclusive count of chosen groups is at most j (the count is
+    non-decreasing and first reaches j + 1 there), a compare and a sum over the row, ``chunk`` slots at a time. A
+    scatter of each chosen group to its rank lowers to one software DMA an element (about 22 ms a layer at 64 rows)."""
     rows, groups = chosen.shape
-    rank = block_cumsum(chosen.to(torch.int32)) - 1
-    column = torch.where(chosen & (rank < budget), rank, torch.full_like(rank, budget)).to(torch.int64)
-    ids = torch.arange(groups, device=chosen.device, dtype=torch.int64).unsqueeze(0).expand(rows, -1)
-    picked = torch.full((rows, budget + 1), -1, dtype=torch.int64, device=chosen.device).scatter(1, column, ids)
-    picked = torch.cat([picked[:, :budget], own_group.to(torch.int64).unsqueeze(1)], dim=1)
+    counts = block_cumsum(chosen.to(torch.int32))
+    total = counts[:, -1:]
+    slots = torch.arange(budget, device=chosen.device, dtype=torch.int32)
+    parts = []
+    for lo in range(0, budget, chunk):
+        j = slots[lo:lo + chunk].view(1, -1, 1)
+        parts.append((counts.unsqueeze(1) <= j).to(torch.int32).sum(dim=-1))
+    picked = torch.cat(parts, dim=1)
+    picked = torch.where(slots.unsqueeze(0) < total, picked, torch.full_like(picked, -1)).to(torch.int64)
+    picked = torch.cat([picked, own_group.to(torch.int64).unsqueeze(1)], dim=1)
     tokens = (picked.unsqueeze(-1) * ratio + torch.arange(ratio, device=chosen.device)).flatten(1)
     valid = (tokens >= 0) & (tokens <= query_positions.to(torch.int64).unsqueeze(1))
     return picked, tokens, valid
