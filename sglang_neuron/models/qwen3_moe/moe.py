@@ -8,6 +8,7 @@ import torch
 import torch.nn.functional as F
 from torch import nn
 
+from sglang_neuron.backend.stack import prime_target_family
 from sglang_neuron.models.transformer.config import DTYPE
 from sglang_neuron.ops.moe.moe_cte_bf16 import moe_experts_blockwise
 from sglang_neuron.ops.moe.moe_tkg_bf16 import moe_experts
@@ -35,6 +36,9 @@ class SparseMoE(nn.Module):
             raise ValueError(f"an expert intermediate size of {intermediate_size} does not shard over {expert_tp} ranks")
         self.num_experts, self.top_k, self.norm_topk_prob = num_experts, top_k, norm_topk_prob
         self.num_local_experts = num_experts // ep
+        # whole experts per rank when EP covers the attention TP: the hybrid prefill kernel applies (moe_cte_bf16)
+        self.ep_degree = ep if expert_tp == 1 else 1
+        prime_target_family()
         rows = intermediate_size // expert_tp
         if ep > 1:
             # held for its rank tensor, a graph input, so every rank traces one graph
@@ -70,7 +74,7 @@ class SparseMoE(nn.Module):
                      + self._ep_rank_id().reshape(1) * self.num_local_experts)
             out = moe_experts_blockwise(x, gate_up=self.gate_up_weight, down=self.down_weight,
                                         affinities=affinities.index_select(1, local), top_k=self.top_k,
-                                        padding_mask=real)
+                                        padding_mask=real, ep_degree=self.ep_degree)
         else:
             out = moe_experts(x, gate_up=self.gate_up_weight, down=self.down_weight, affinities=affinities,
                               index=experts.to(torch.int32), rank_id=self._ep_rank_id())

@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import contextlib
 import functools
+import os
 import threading
 from typing import Any, Iterator, List
 
@@ -111,6 +112,24 @@ def get_platform_target() -> str:
     from torch_neuronx.utils import get_platform_target as _target
 
     return str(_target())
+
+
+_TARGET_FAMILY = []
+
+
+def target_family() -> str:
+    """The platform target's family, read once per process: a plain Python value afterwards, so a traced graph can
+    branch on it (torch-neuronx's query is opaque to dynamo)."""
+    if not _TARGET_FAMILY:
+        _TARGET_FAMILY.append(normalize_target_family(get_platform_target()))
+    return _TARGET_FAMILY[0]
+
+
+def prime_target_family() -> None:
+    """Read the target family now, outside any traced forward (torch-neuronx's query is opaque to dynamo). A no-op in
+    CPU mode, whose kernels never run."""
+    if not envs.SGLANG_NEURON_CPU_MODE or os.environ.get("NEURON_PLATFORM_TARGET_OVERRIDE"):
+        target_family()
 
 
 def normalize_target_family(target: str) -> str:

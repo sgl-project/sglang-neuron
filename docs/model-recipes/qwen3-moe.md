@@ -98,6 +98,16 @@ flowchart LR
 
 `--stream-interval 4` streams each answer four tokens at a time, so one benchmark client keeps up with every stream.
 
+## On Trainium2
+
+The flags above are Trn3's. On a trn2.3xlarge (four logical cores at LNC2, 24 GB each) the KV pool for
+`--mem-fraction-static 0.8` holds 215,040 tokens, so state `--max-total-tokens 131072` (or up to 215040) instead of
+266240.
+
+With whole experts on each rank (`--ep-size` equal to `--tp-size`) the prefill's experts run nkilib's
+`shard_on_i_hybrid` on Trainium2, which skips the blocks no token filled (`SGLANG_NEURON_MOE_PREFILL`,
+[configuration reference](../guides/reference-configuration.md)).
+
 ## Compiled shapes
 
 As Qwen3's: a prefill graph of the chunk and of each smaller KV segment tile that splits over the attention TP ranks,

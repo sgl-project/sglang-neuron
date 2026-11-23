@@ -82,3 +82,16 @@ def deepseek_v2_max_context(default: int, environ=os.environ) -> int:
     if not raw.strip().isdigit() or int(raw) <= 0:
         raise ValueError(f"SGLANG_NEURON_DSV2_MAX_CONTEXT={raw!r}: set a positive token count, or leave it unset")
     return int(raw)
+
+
+MOE_PREFILL_IMPLS = ("auto", "block", "hybrid")
+
+
+def moe_prefill_impl(environ=os.environ) -> str:
+    """The bf16 prefill experts' kernel over whole experts per rank (ops/moe/moe_cte_bf16): ``block`` (shard_on_block,
+    every block the routing could fill), ``hybrid`` (shard_on_i_hybrid, the filled blocks only) or ``auto`` (hybrid
+    on Trainium2 where it is validated, else block)."""
+    value = environ.get("SGLANG_NEURON_MOE_PREFILL", "auto")
+    if value not in MOE_PREFILL_IMPLS:
+        raise ValueError(f"SGLANG_NEURON_MOE_PREFILL={value}: one of {', '.join(MOE_PREFILL_IMPLS)}")
+    return value
