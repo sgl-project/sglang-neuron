@@ -164,10 +164,10 @@ def _experts_by_program(xq, inv_xs, aff, gate_up_w, down_w, gate_up_scale, down_
         nisa.tensor_tensor(itb[0:P, 0:n_ic, 0:T], guT[0:P, n_ic:2 * n_ic, 0:T], sg[0:P, 0:n_ic, 0:T],
                            nl.multiply)
         ds_, inv_ds = _colmax_scales(itb, T, n_ic)
-        ds_b = _bcast_rows(ds_, T, n_ic, f"dn_scale_bcast_{j}")
+        ds_b = _bcast_rows(ds_, T, n_ic)
         nqd = nl.ndarray((P, n_ic, T), dtype=nl.float32, buffer=nl.sbuf)
         nisa.tensor_tensor(nqd[0:P, 0:n_ic, 0:T], itb[0:P, 0:n_ic, 0:T],
-                           ds_b.reshape((P, n_ic, T))[0:P, 0:n_ic, 0:T], nl.multiply)
+                           ds_b, nl.multiply)
         nisa.tensor_scalar(dst=itT[0:P, 0:n_ic, 0:T], data=nqd[0:P, 0:n_ic, 0:T], op0=nl.minimum,
                            operand0=FP8_MAX, op1=nl.maximum, operand1=-FP8_MAX)
         # the expert's weight on each row, its activation scale folded in
@@ -203,24 +203,20 @@ def _experts_by_program(xq, inv_xs, aff, gate_up_w, down_w, gate_up_scale, down_
     return acc
 
 
-def _bcast_rows(col, T: int, n: int, name: str):
-    """[128, n x T] fp32 in PSUM: column t of every n-block the per-token scalar ``col`` [T, 1] fp32 (rows
-    0 .. T - 1), the same on every partition: ones [T, 128]^T times the scalar on a token mask (one matmul a 512
-    columns)."""
-    W = n * T
-    mask = nl.ndarray((P, n, T), dtype=nl.float32, buffer=nl.sbuf)
-    nisa.iota(mask[0:T, 0:n, 0:T], pattern=[[0, n], [1, T]], offset=0, channel_multiplier=-1)
-    nisa.tensor_scalar(dst=mask[0:T, 0:n, 0:T], data=mask[0:T, 0:n, 0:T], op0=nl.equal, operand0=0.0,
-                       op1=nl.multiply, operand1=1.0)
-    nisa.tensor_scalar(dst=mask[0:T, 0:n, 0:T], data=mask[0:T, 0:n, 0:T], op0=nl.multiply, operand0=col[0:T, 0:1])
-    ones = nl.ndarray((P, P), dtype=nl.float32, buffer=nl.sbuf)
-    nisa.memset(dst=ones[0:T, 0:P], value=1.0)
-    out = nl.ndarray((P, W), dtype=nl.float32, buffer=nl.psum, name=name)
-    flat = mask.reshape((P, W))
-    for c0 in range(0, W, 512):
-        cs = min(512, W - c0)
-        nisa.nc_matmul(dst=out[0:P, c0:c0 + cs], stationary=ones[0:T, 0:P], moving=flat[0:T, c0:c0 + cs])
-    return out
+def _bcast_rows(col, T: int, n: int):
+    """The per-token scalar ``col`` [T, 1] fp32 (rows 0 .. T - 1) as a [128, n, T] operand, the same on every partition
+    and every one of the n tiles: one transpose to a row, nkilib's stream-shuffle broadcast onto the partitions and a
+    stride-0 access over the tiles (a ones matmul on a token mask cost 4 fp32 matmuls a call: bench_moe_half 194 -> 183
+    us a layer at 32 rows)."""
+    from nkilib.core.utils.stream_shuffle_broadcast import stream_shuffle_broadcast
+
+    tp = nl.ndarray((P, P), dtype=nl.float32, buffer=nl.psum)
+    nisa.nc_transpose(dst=tp[0:1, 0:T], data=col[0:T, 0:1])
+    row = nl.ndarray((P, T), dtype=nl.float32, buffer=nl.sbuf)
+    nisa.tensor_copy(dst=row[0:1, 0:T], src=tp[0:1, 0:T])
+    bc = nl.ndarray((P, 1, T), dtype=nl.float32, buffer=nl.sbuf)
+    stream_shuffle_broadcast(row[0:1, 0:T], bc.reshape((P, T))[0:P, 0:T])
+    return bc[0:P, 0:1, 0:T].broadcast(1, n)
 
 
 def _tree(x, n: int, T: int, op, dtype):
@@ -276,9 +272,9 @@ def _prologue_transposed(hsrc, ln_w, T: int, H: int, eps, fp8_act: bool):
     nisa.nc_matmul(dst=ssp[0:T, 0:1], stationary=s1[0:P, 0:T], moving=onec[0:P, 0:1])
     rr = nl.ndarray((P, 1), dtype=nl.float32, buffer=nl.sbuf)
     nisa.activation(dst=rr[0:T, 0:1], op=nl.rsqrt, data=ssp[0:T, 0:1], scale=1.0 / H, bias=eps)
-    rr_b = _bcast_rows(rr, T, H1, "pro_rr_bcast")
+    rr_b = _bcast_rows(rr, T, H1)
     nb = nl.ndarray((P, H1, T), dtype=nl.bfloat16, buffer=nl.sbuf)
-    nisa.tensor_tensor(nb[0:P, 0:H1, 0:T], hT[0:P, 0:H1, 0:T], rr_b.reshape((P, H1, T))[0:P, 0:H1, 0:T], nl.multiply)
+    nisa.tensor_tensor(nb[0:P, 0:H1, 0:T], hT[0:P, 0:H1, 0:T], rr_b, nl.multiply)
     # the weight with H on the partitions, element (p, h1) ln_w[h1 x 128 + p]: loaded in 128-element rows and
     # transposed once (a transposing DMA moves it 2 bytes at a time, ~35 us on the prologue's critical path)
     gR = nl.ndarray((P, P), dtype=ln_w.dtype, buffer=nl.sbuf)
@@ -293,9 +289,9 @@ def _prologue_transposed(hsrc, ln_w, T: int, H: int, eps, fp8_act: bool):
         return nT, None, None, None
     # each token's absolute max: over the tiles, then over the partitions through a transpose
     xs, inv_xs = _colmax_scales(nT, T, H1)
-    xs_b = _bcast_rows(xs, T, H1, "pro_xs_bcast")
+    xs_b = _bcast_rows(xs, T, H1)
     nq = nl.ndarray((P, H1, T), dtype=nl.float32, buffer=nl.sbuf)
-    nisa.tensor_tensor(nq[0:P, 0:H1, 0:T], nT[0:P, 0:H1, 0:T], xs_b.reshape((P, H1, T))[0:P, 0:H1, 0:T], nl.multiply)
+    nisa.tensor_tensor(nq[0:P, 0:H1, 0:T], nT[0:P, 0:H1, 0:T], xs_b, nl.multiply)
     xq = nl.ndarray((P, H1, P), dtype=nl.float8_e4m3, buffer=nl.sbuf)
     nisa.tensor_scalar(dst=xq[0:P, 0:H1, 0:T], data=nq[0:P, 0:H1, 0:T], op0=nl.minimum, operand0=FP8_MAX,
                        op1=nl.maximum, operand1=-FP8_MAX)
