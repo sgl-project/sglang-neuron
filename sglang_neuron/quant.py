@@ -52,10 +52,19 @@ class NeuronQuarkPassthroughQuantConfig(NeuronPassthroughQuantConfig):
         return "quark"
 
 
+class NeuronFp8PassthroughQuantConfig(NeuronPassthroughQuantConfig):
+    """A per-tensor FP8 checkpoint's config: the model dequantizes its weights as they load (models/hy_v3/fp8.py)."""
+
+    @classmethod
+    def get_name(cls) -> str:
+        return "fp8"
+
+
 _PASSTHROUGH = {config.get_name(): config
-                for config in (NeuronPassthroughQuantConfig, NeuronQuarkPassthroughQuantConfig)}
+                for config in (NeuronPassthroughQuantConfig, NeuronQuarkPassthroughQuantConfig,
+                               NeuronFp8PassthroughQuantConfig)}
 
 
 def passthrough_config(name: str) -> type:
-    """The inert config class SGLang gets for the quantization method ``name`` (mxfp4 or quark)."""
+    """The inert config class SGLang gets for the quantization method ``name`` (mxfp4, quark or fp8)."""
     return _PASSTHROUGH[name]

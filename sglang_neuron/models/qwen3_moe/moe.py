@@ -18,16 +18,21 @@ from sglang_neuron.utils.weight_loader import SafetensorsWeightLoader, set_weigh
 
 
 class SparseMoE(nn.Module):
+    # a subclass whose experts span the DP-attention replicas sets this: under DP attention its experts are laid out
+    # over the wide EP group (the world) and it gathers the replicas' tokens around them itself (MiMoV2MoE)
+    serves_dp_attention = False
+
     def __init__(self, *, hidden_size: int, num_experts: int, top_k: int, intermediate_size: int, norm_topk_prob: bool,
                  prefill: bool):
         super().__init__()
         self.prefill = prefill
         self.attn_tp_group = groups.get_neuron_attn_tp_group()
-        if STATE.dp_size > 1:
+        if STATE.dp_size > 1 and not self.serves_dp_attention:
             raise ValueError("Qwen3-MoE's experts are served on attention TP without DP attention; launch without "
                              "--enable-dp-attention")
         ep = STATE.ep_degree
-        tp = self.attn_tp_group.world_size
+        tp = (groups.get_wide_ep_group().world_size if STATE.dp_size > 1
+              else self.attn_tp_group.world_size)
         if num_experts % ep or tp % ep:
             raise ValueError(f"{num_experts} experts do not split over an EP size of {ep} within an attention TP of {tp}")
         expert_tp = tp // ep
