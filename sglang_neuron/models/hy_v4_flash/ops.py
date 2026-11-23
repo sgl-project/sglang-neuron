@@ -12,6 +12,8 @@ import torch
 import torch.nn.functional as F
 
 NEG = float("-inf")
+# top_count_mask splits the threshold interval 16 ways a step up to this many rows, in halves above
+WIDE_SEARCH_ROWS = 128
 
 
 # ---------------------------------------------------------------------------------------------------------------------
@@ -176,15 +178,21 @@ def block_cumsum(x: torch.Tensor, block: int = 128) -> torch.Tensor:
     return out.to(x.dtype) if x.dtype != torch.bool else out.to(torch.int32)
 
 
-def top_count_mask(scores: torch.Tensor, valid: torch.Tensor, count: int, iters: int = 8,
-                   ways: int = 16) -> torch.Tensor:
+def top_count_mask(scores: torch.Tensor, valid: torch.Tensor, count: int, iters: int | None = None,
+                   ways: int | None = None) -> torch.Tensor:
     """[R, G] bool: each row's ``count`` best valid entries (every valid one where a row has no more), by a search
     on the threshold instead of a sort: ``count`` above about a hundred is beyond what torch.topk lowers to well on a
     NeuronCore. Each step splits the row's interval into ``ways`` parts at once (``ways - 1`` thresholds compared in
     one pass), so ``iters`` steps resolve as finely as ``iters x log2(ways)`` halvings (32 by default) in a quarter of
-    the passes. Entries tied at the threshold (relu scores are often exactly 0) are kept in group order up to
-    ``count`` after every entry above them (a group-order cap on all of them would drop a later positive score for an
-    earlier 0 where fewer than ``count`` scores are positive)."""
+    the passes; a prefill chunk's rows halve instead (15 thresholds a pass over 2048 rows cost more than the passes).
+    Entries tied at the threshold (relu scores are often exactly 0) are kept in group order up to ``count`` after
+    every entry above them (a group-order cap on all of them would drop a later positive score for an earlier 0 where
+    fewer than ``count`` scores are positive)."""
+    if ways is None:
+        # a decode's few rows: few passes over a wide compare; a prefill chunk's rows: the compare itself dominates
+        ways = 16 if scores.shape[0] <= WIDE_SEARCH_ROWS else 2
+    if iters is None:
+        iters = 32 // (ways.bit_length() - 1)
     big = torch.finfo(torch.float32).max
     s = torch.where(valid, scores, torch.full_like(scores, -big))
     lo = torch.where(valid, scores, torch.full_like(scores, big)).amin(dim=-1, keepdim=True)
