@@ -148,12 +148,14 @@ def _attention(X, X_hidden_dim_actual, rmsnorm_X_eps, rmsnorm_X_gamma, W_qkv, co
 
 
 def _fa_exit_enabled() -> bool:
-    """Pass nkilib's attention a ``max_context_len`` on the position path (SGLANG_NEURON_MIMO_FA_EXIT, default on; 0
-    reads the graph's whole table): its flash-attention loop then stops after the longest row's tiles, with
-    install_fa_exit_patch's fix."""
+    """Pass nkilib's attention a ``max_context_len`` on the position path (SGLANG_NEURON_MIMO_FA_EXIT=1; off by
+    default): its flash-attention loop then stops after the longest row's tiles, with install_fa_exit_patch's fix.
+    Off by default: 1M AgentX c=8 measured P90 interactivity 48.6 -> 46.0 and P90 ITL 20.6 -> 21.7 ms with it (a
+    batch's longest row sits near its graph's context there, so little is skipped, and the dynamic tile loop runs
+    slower than the unrolled one), though 100K rows in a 256K graph decode 6 - 9 % faster."""
     import os
 
-    return os.environ.get("SGLANG_NEURON_MIMO_FA_EXIT", "1").strip() != "0" and install_fa_exit_patch()
+    return os.environ.get("SGLANG_NEURON_MIMO_FA_EXIT", "0").strip() == "1" and install_fa_exit_patch()
 
 
 def _max_context_len(p_sb, R: int, S: int, name: str):
