@@ -29,6 +29,56 @@ P = 128
 COLS = 512
 
 
+
+def _swa_masks_vectorized(iota, mask_out, pos_ids, start_pos, bs: int, q_head: int, s_active: int, n_sprior_tile: int,
+                          sbm):
+    """nkilib's gen_mask_tkg._create_batch_masks_swa (the per-query banded sliding-window prior mask, wrap-around
+    included), every (row, span token) at once: the same ops over [128, tiles, rows, span] through stride-0 broadcasts,
+    where nkilib's runs 9 small ops for each (row, token), ~40 us a sliding layer at 8 MTP rows (decode profile: each
+    sliding layer's attention ~180 us against a full layer's ~140 at 4K). Same values: for query (b, i) with end the
+    row's prior length pos_ids[b, 0] and start its window start, normal = (iota >= start) x (iota < end), wrap =
+    max(...), final = normal + (start > end) x (wrap - normal)."""
+    P_MAX = nl.tile_size.pmax
+    shape = (P_MAX, n_sprior_tile, bs, s_active)
+    io = iota[0:P_MAX, 0:n_sprior_tile].expand_dim(2).broadcast(2, bs).expand_dim(3).broadcast(3, s_active)
+    st2 = start_pos[0:P_MAX, 0:bs * s_active].reshape((P_MAX, bs, s_active))
+    en2 = pos_ids[0:P_MAX, 0:bs * s_active].reshape((P_MAX, bs, s_active)).select(2, 0).expand_dim(2).broadcast(
+        2, s_active)
+    st = st2.expand_dim(1).broadcast(1, n_sprior_tile)
+    en = en2.expand_dim(1).broadcast(1, n_sprior_tile)
+    ge = sbm.alloc_stack(shape, dtype=nl.float32, buffer=nl.sbuf)
+    lt = sbm.alloc_stack(shape, dtype=nl.float32, buffer=nl.sbuf)
+    nrm = sbm.alloc_stack(shape, dtype=nl.float32, buffer=nl.sbuf)
+    nisa.tensor_tensor(ge[...], io, st, op=nl.greater_equal)
+    nisa.tensor_tensor(lt[...], io, en, op=nl.less)
+    nisa.tensor_tensor(nrm[...], ge[...], lt[...], op=nl.multiply)
+    nisa.tensor_tensor(ge[...], ge[...], lt[...], op=nl.maximum)
+    nisa.tensor_tensor(ge[...], ge[...], nrm[...], op=nl.subtract)
+    wrap = sbm.alloc_stack((P_MAX, bs, s_active), dtype=nl.float32, buffer=nl.sbuf)
+    nisa.tensor_tensor(wrap[...], st2, en2, op=nl.greater)
+    nisa.tensor_tensor(ge[...], ge[...], wrap[...].expand_dim(1).broadcast(1, n_sprior_tile), op=nl.multiply)
+    nisa.tensor_tensor(ge[...], nrm[...], ge[...], op=nl.add)
+    for qh in range(q_head):
+        out_view = mask_out.select(3, qh)  # [P_MAX, n_sprior_tile, bs, s_active]
+        nisa.tensor_copy(out_view, ge[...], engine=nisa.vector_engine if qh % 2 == 0 else nisa.scalar_engine)
+
+
+def install_swa_mask_patch() -> bool:
+    """Route nkilib's sliding-window prior mask through _swa_masks_vectorized (the default;
+    SGLANG_NEURON_MIMO_SWA_MASK_VEC=0 keeps nkilib's). The attention keeps its position path, so this, unlike the
+    sliding layers' step mask (model.MiMoV2Graph._swa_step_mask), leaves the decode graph's structure as it is."""
+    import os
+
+    if os.environ.get("SGLANG_NEURON_MIMO_SWA_MASK_VEC", "1").strip() == "0":
+        return False
+    import nkilib.core.attention.gen_mask_tkg as gen_mask
+
+    gen_mask._create_batch_masks_swa = _swa_masks_vectorized
+    return True
+
+
+install_swa_mask_patch()
+
 def _attention(X, X_hidden_dim_actual, rmsnorm_X_eps, rmsnorm_X_gamma, W_qkv, cos, sin, active_blocks_table, K_cache,
                V_cache, attention_mask, sink, softmax_scale, k_scale=None, v_scale=None):
     return attention_block_tkg(
