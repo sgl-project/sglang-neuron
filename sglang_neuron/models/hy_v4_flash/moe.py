@@ -5,8 +5,8 @@ routed experts over EP.
     out = combine_output_norm(post_expert_proj(experts(pre_expert_proj(x))) + shared_expert(x))
 
 The router (sigmoid, selection bias, renormalized, times ``routed_scaling_factor``) and the latent projections are
-replicated; each rank runs its ``E / ep`` experts on the latent rows (moe_tkg's FP8 row mode in a decode, torch in a
-prefill: experts_cte.py), applies ``post_expert_proj`` to its partial sum (linear, so the sum over ranks commutes
+replicated; each rank runs its ``E / ep`` experts on the latent rows (a one-token decode only the local experts it
+chose, moe_hits.py; a larger decode all of them in moe_tkg's FP8 row mode; a prefill in moe_cte, experts_cte.py), applies ``post_expert_proj`` to its partial sum (linear, so the sum over ranks commutes
 with it), adds its TP
 shard of the shared expert, and one all-reduce sums the ranks before the norm.
 
@@ -189,10 +189,34 @@ class LatentMoE(nn.Module):
             out = out + y * local_aff[:, e:e + 1]
         return out
 
+    def _experts_hits(self, x: torch.Tensor, affinities: torch.Tensor) -> torch.Tensor:
+        """A one-token step's routed output from only the local experts it chose (moe_hits.py): the token's local
+        experts packed first with their affinities, and their count."""
+        from sglang_neuron.backend.stack import wrap_nki
+        from sglang_neuron.models.hy_v4_flash.moe_hits import moe_tkg_hits
+        from sglang_neuron.utils.hardware_config import get_logical_nc_config
+
+        e = self.num_local
+        first = self._rank_id(x.device).reshape(()).to(torch.int64) * e
+        local = affinities.index_select(1, first + torch.arange(e, device=x.device))
+        hit = local > 0
+        # the chosen experts first, in expert order
+        key = hit.to(torch.int32) * (2 * e) + (e - torch.arange(e, device=x.device, dtype=torch.int32))
+        order = torch.topk(key, e, dim=1).indices
+        slots = order.to(torch.int32)
+        slot_aff = local.gather(1, order).float()
+        count = hit.sum(dim=1, keepdim=True).to(torch.int32)
+        kernel = wrap_nki(moe_tkg_hits)[get_logical_nc_config()]
+        return kernel(x, self.gate_up, self.down, slots, slot_aff, count, self.gate_up_scale, self.down_scale,
+                      float(self.config.swiglu_limit)).float()
+
     def _experts_kernel(self, x: torch.Tensor, affinities: torch.Tensor, chosen: torch.Tensor) -> torch.Tensor:
         from sglang_neuron.backend.stack import wrap_nki
         from sglang_neuron.utils.hardware_config import get_logical_nc_config
 
+        if x.shape[0] == 1:
+            # about half an expert a rank: the all-expert kernel would read all of them
+            return self._experts_hits(x, affinities)
         kernel = wrap_nki(_moe_tkg_fp8)[get_logical_nc_config()]
         rank = self._rank_id(x.device)
         idx = chosen.to(torch.int32)
