@@ -28,6 +28,7 @@ import hashlib
 import logging
 import os
 import re
+import uuid
 from importlib import metadata
 from pathlib import Path
 from typing import Iterable, Iterator, List, Mapping, Optional, Tuple
@@ -191,7 +192,9 @@ def check_cache(root: Path, digest: str) -> str:
                            "kernel sources or kernel library it was built from, and a NEFF's cache key covers neither, "
                            "so its NEFFs could run old kernels; launch with another cache directory, or remove this one")
     root.mkdir(parents=True, exist_ok=True)
-    tmp = root / f".{KERNEL_STAMP}.{os.getpid()}"
+    # a name of its own for each writer: servers in separate containers share a cache directory but not a PID
+    # namespace, so a name made from the PID can be the same file for two of them
+    tmp = root / f".{KERNEL_STAMP}.{uuid.uuid4().hex}"
     tmp.write_text(digest + "\n")
     os.replace(tmp, stamp)
     return f"compile cache {root}: kernel sources {digest} (stamped)"
