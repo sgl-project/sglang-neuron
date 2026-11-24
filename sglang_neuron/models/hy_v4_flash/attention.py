@@ -358,7 +358,7 @@ class Attention(nn.Module):
             self.q_a, self.q_a_norm.weight.view(1, -1), self.q_b, self.kv_a, self.kv_a_norm.weight.view(1, -1),
             self.w_uk, self.k_w_uvT, self.gate, self.o, self.sinks.view(1, -1),
             cos.repeat_interleave(2, dim=-1).contiguous(), sin.repeat_interleave(2, dim=-1).contiguous(), self.k_pm,
-            self.k_cache, self.v_cache, table.to(torch.int32), first, positions.reshape(rows, 1).to(torch.float32),
+            self._read_kv_pages_raw(table, int(md["block_size"])), first, positions.reshape(rows, 1).to(torch.float32),
             eps=float(cfg.rms_norm_eps), hc_eps=float(cfg.hc_eps), hc_mag=float(cfg.hc_magnitude),
             scale=float(self.kind.scaling), window=int(self.kind.sliding_window))
         self._write_kv(mla_rows, md["slot_mapping"])
@@ -413,6 +413,10 @@ class Attention(nn.Module):
 
     def _read_kv(self, slots: torch.Tensor) -> torch.Tensor:
         return self._rows(read_rows(self.k_cache, slots), read_rows(self.v_cache, slots))
+
+    def _read_kv_pages_raw(self, table: torch.Tensor, block: int) -> torch.Tensor:
+        """[R, blocks x block, 576] in the pool's dtype: the K and V halves of the pages' rows side by side."""
+        return torch.cat([read_pages(self.k_cache, table, block), read_pages(self.v_cache, table, block)], dim=-1)
 
     def _read_kv_pages(self, table: torch.Tensor, block: int) -> torch.Tensor:
         return self._rows(read_pages(self.k_cache, table, block), read_pages(self.v_cache, table, block))

@@ -112,6 +112,14 @@ def reference(w, sinks=None):
     return (values.reshape(rows_n, -1) @ w["o"]).float(), post, compact.float()
 
 
+def window_keys(w):
+    """[T, NB x 128, 576] each row's window pages of the pool before the rows' own writes (the graph's gather)."""
+    import torch
+
+    slots = (w["table"].long().unsqueeze(-1) * PAGE + torch.arange(PAGE)).flatten(1)
+    return w["cache"][slots].contiguous()
+
+
 def kernel_args(w):
     import torch
 
@@ -123,8 +131,8 @@ def kernel_args(w):
     return [w["streams"], hi, lo, w["base"].view(1, -1), w["scale"].view(1, -1), w["ln_w"].view(1, -1), w["q_a"],
             w["qa_ln"].view(1, -1), w["q_b"], w["kv_a"], w["kv_ln"].view(1, -1), w["w_uk"],
             w["w_uv"].transpose(1, 2).contiguous(), w["gate"], w["o"], w["sinks"].view(1, -1), cosf.contiguous(),
-            sinf.contiguous(), pm_matrix(), cache[:, :HALF].contiguous(), cache[:, HALF:].contiguous(), w["table"],
-            w["first"].float().view(-1, 1), w["pos"].float().view(-1, 1)]
+            sinf.contiguous(), pm_matrix(), window_keys(w), w["first"].float().view(-1, 1),
+            w["pos"].float().view(-1, 1)]
 
 
 KWARGS = dict(eps=EPS, hc_eps=HC_EPS, hc_mag=MAG, scale=SCALE, window=WINDOW)
