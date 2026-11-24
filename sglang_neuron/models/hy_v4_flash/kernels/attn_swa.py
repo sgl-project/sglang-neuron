@@ -135,8 +135,6 @@ def attn_swa(streams, fn_hi, fn_lo, hc_base, hc_scale, ln_w, q_a, qa_ln, q_b, kv
     sk = nl.ndarray((P, h), dtype=nl.float32, buffer=nl.sbuf)
     nisa.dma_copy(dst=sk[0:1, 0:h], src=sinks)
     # p on every column: the slots' offsets in a page, and the rows' ids for the one-hots
-    iota_nb = nl.ndarray((P, NB), dtype=nl.float32, buffer=nl.sbuf)
-    nisa.iota(iota_nb[0:P, 0:NB], pattern=[[0, NB]], offset=0, channel_multiplier=1)
     row_ids = nl.ndarray((P, P), dtype=nl.float32, buffer=nl.sbuf)
     nisa.iota(row_ids[0:P, 0:P], pattern=[[0, P]], offset=0, channel_multiplier=1)
     zeros = nl.ndarray((P, P), dtype=nl.float32, buffer=nl.sbuf)
@@ -145,6 +143,34 @@ def attn_swa(streams, fn_hi, fn_lo, hc_base, hc_scale, ln_w, q_a, qa_ln, q_b, kv
     nisa.iota(kp0[0:P, 0:NB], pattern=[[P, NB]], offset=0, channel_multiplier=1)
     ones = nl.ndarray((P, 1), dtype=nl.bfloat16, buffer=nl.sbuf)
     nisa.memset(ones[0:P, 0:1], 1.0)
+    # every row's pages' slots (table[r, j] x 128 + p) and window bias, before the loop: [128, T, NB]
+    tb = nl.ndarray((P, T * NB), dtype=nl.int32, buffer=nl.sbuf)
+    nisa.dma_copy(dst=tb[0:P, 0:T * NB], src=table.reshape((1, T * NB)).ap(pattern=[[0, P], [1, T * NB]], offset=0))
+    tbf = nl.ndarray((P, T * NB), dtype=nl.float32, buffer=nl.sbuf)
+    nisa.tensor_copy(dst=tbf[0:P, 0:T * NB], src=tb[0:P, 0:T * NB])
+    iota_all = nl.ndarray((P, T * NB), dtype=nl.float32, buffer=nl.sbuf)
+    nisa.iota(iota_all[0:P, 0:T * NB], pattern=[[0, T * NB]], offset=0, channel_multiplier=1)
+    slot_all = nl.ndarray((P, T * NB), dtype=nl.int32, buffer=nl.sbuf)
+    nisa.scalar_tensor_tensor(dst=slot_all[0:P, 0:T * NB], data=tbf[0:P, 0:T * NB], op0=nl.multiply,
+                              operand0=float(P), op1=nl.add, operand1=iota_all[0:P, 0:T * NB])
+    fa = nl.ndarray((P, T), dtype=nl.float32, buffer=nl.sbuf)
+    pa = nl.ndarray((P, T), dtype=nl.float32, buffer=nl.sbuf)
+    nisa.dma_copy(dst=fa[0:P, 0:T], src=first.reshape((1, T)).ap(pattern=[[0, P], [1, T]], offset=0))
+    nisa.dma_copy(dst=pa[0:P, 0:T], src=pos.reshape((1, T)).ap(pattern=[[0, P], [1, T]], offset=0))
+    bias_all = nl.ndarray((P, T * NB), dtype=nl.float32, buffer=nl.sbuf)
+    for r in range(T):
+        kp = nl.ndarray((P, NB), dtype=nl.float32, buffer=nl.sbuf)
+        nisa.tensor_scalar(dst=kp[0:P, 0:NB], data=kp0[0:P, 0:NB], op0=nl.add, operand0=fa[0:P, r:r + 1])
+        lo = nl.ndarray((P, 1), dtype=nl.float32, buffer=nl.sbuf)
+        nisa.tensor_scalar(dst=lo[0:P, 0:1], data=pa[0:P, r:r + 1], op0=nl.subtract, operand0=float(window))
+        m1 = nl.ndarray((P, NB), dtype=nl.float32, buffer=nl.sbuf)
+        nisa.tensor_scalar(dst=m1[0:P, 0:NB], data=kp[0:P, 0:NB], op0=nl.less, operand0=pa[0:P, r:r + 1])
+        m2 = nl.ndarray((P, NB), dtype=nl.float32, buffer=nl.sbuf)
+        nisa.tensor_scalar(dst=m2[0:P, 0:NB], data=kp[0:P, 0:NB], op0=nl.greater, operand0=lo[0:P, 0:1])
+        nisa.tensor_tensor(bias_all[0:P, r * NB:(r + 1) * NB], m1[0:P, 0:NB], m2[0:P, 0:NB], nl.multiply)
+    # allowed 1 -> 0, masked 0 -> NEG
+    nisa.tensor_scalar(dst=bias_all[0:P, 0:T * NB], data=bias_all[0:P, 0:T * NB], op0=nl.subtract, operand0=1.0,
+                       op1=nl.multiply, operand1=-NEG)
     att = nl.ndarray((T, h * LAT), dtype=nl.bfloat16, buffer=nl.shared_hbm, name="attn_swa_attended")
     for r in range(pid, T, n_prg):
         # one-hot of row r over the T rows, its columns all alike: a matmul against it copies row r anywhere
@@ -152,39 +178,14 @@ def attn_swa(streams, fn_hi, fn_lo, hc_base, hc_scale, ln_w, q_a, qa_ln, q_b, kv
         nisa.tensor_scalar(dst=sel32[0:T, 0:P], data=row_ids[0:T, 0:P], op0=nl.equal, operand0=float(r))
         sel = nl.ndarray((P, P), dtype=nl.bfloat16, buffer=nl.sbuf)
         nisa.tensor_copy(dst=sel[0:T, 0:P], src=sel32[0:T, 0:P])
-        # the pages' slots: table[r, j] x 128 + p
-        tb = nl.ndarray((P, NB), dtype=nl.int32, buffer=nl.sbuf)
-        nisa.dma_copy(dst=tb[0:P, 0:NB], src=table.ap(pattern=[[0, P], [1, NB]], offset=r * NB))
-        tbf = nl.ndarray((P, NB), dtype=nl.float32, buffer=nl.sbuf)
-        nisa.tensor_copy(dst=tbf[0:P, 0:NB], src=tb[0:P, 0:NB])
-        slot = nl.ndarray((P, NB), dtype=nl.int32, buffer=nl.sbuf)
-        nisa.scalar_tensor_tensor(dst=slot[0:P, 0:NB], data=tbf[0:P, 0:NB], op0=nl.multiply, operand0=float(P),
-                                  op1=nl.add, operand1=iota_nb[0:P, 0:NB])
         kraw = nl.ndarray((P, NB, KD), dtype=k_cache.dtype, buffer=nl.sbuf)
         for j in range(NB):
             for half, cache in ((0, k_cache), (1, v_cache)):
                 nisa.dma_copy(dst=kraw[0:P, j, half * HALF:(half + 1) * HALF],
                               src=cache.ap(pattern=[[HALF, P], [1, HALF]], offset=0,
-                                           vector_offset=slot[0:P, j:j + 1], indirect_dim=0))
+                                           vector_offset=slot_all[0:P, r * NB + j:r * NB + j + 1], indirect_dim=0))
         keys = nl.ndarray((P, NB, KD), dtype=nl.bfloat16, buffer=nl.sbuf)
         nisa.tensor_copy(dst=keys[0:P, 0:NB, 0:KD], src=kraw[0:P, 0:NB, 0:KD])
-        # the window mask: first + j x 128 + p in (pos - window, pos)
-        fb = nl.ndarray((P, 2), dtype=nl.float32, buffer=nl.sbuf)
-        nisa.dma_copy(dst=fb[0:P, 0:1], src=first.ap(pattern=[[0, P], [1, 1]], offset=r))
-        nisa.dma_copy(dst=fb[0:P, 1:2], src=pos.ap(pattern=[[0, P], [1, 1]], offset=r))
-        kp = nl.ndarray((P, NB), dtype=nl.float32, buffer=nl.sbuf)
-        nisa.tensor_scalar(dst=kp[0:P, 0:NB], data=kp0[0:P, 0:NB], op0=nl.add, operand0=fb[0:P, 0:1])
-        lo = nl.ndarray((P, 1), dtype=nl.float32, buffer=nl.sbuf)
-        nisa.tensor_scalar(dst=lo[0:P, 0:1], data=fb[0:P, 1:2], op0=nl.subtract, operand0=float(window))
-        m1 = nl.ndarray((P, NB), dtype=nl.float32, buffer=nl.sbuf)
-        nisa.tensor_scalar(dst=m1[0:P, 0:NB], data=kp[0:P, 0:NB], op0=nl.less, operand0=fb[0:P, 1:2])
-        m2 = nl.ndarray((P, NB), dtype=nl.float32, buffer=nl.sbuf)
-        nisa.tensor_scalar(dst=m2[0:P, 0:NB], data=kp[0:P, 0:NB], op0=nl.greater, operand0=lo[0:P, 0:1])
-        bias = nl.ndarray((P, NB), dtype=nl.float32, buffer=nl.sbuf)
-        nisa.tensor_tensor(bias[0:P, 0:NB], m1[0:P, 0:NB], m2[0:P, 0:NB], nl.multiply)
-        # allowed 1 -> 0, masked 0 -> NEG
-        nisa.tensor_scalar(dst=bias[0:P, 0:NB], data=bias[0:P, 0:NB], op0=nl.subtract, operand0=1.0,
-                           op1=nl.multiply, operand1=-NEG)
         # row r's own scores and MLA row onto partition 0
         own_ps = nl.ndarray((P, LAT), dtype=nl.float32, buffer=nl.psum)
         nisa.nc_matmul(dst=own_ps[0:1, 0:LAT], stationary=sel[0:T, 0:1], moving=own[0:T, 0:LAT])
@@ -208,7 +209,7 @@ def attn_swa(streams, fn_hi, fn_lo, hc_base, hc_scale, ln_w, q_a, qa_ln, q_b, kv
                 nisa.tensor_tensor(prod[0:P, 0:KD], keys[0:P, j, 0:KD], qb[0:P, 0:KD], nl.multiply)
                 nisa.tensor_reduce(sc[0:P, j:j + 1], op=nl.add, data=prod[0:P, 0:KD], axis=1, keepdims=True)
             nisa.scalar_tensor_tensor(dst=sc[0:P, 0:NB], data=sc[0:P, 0:NB], op0=nl.multiply, operand0=scale,
-                                      op1=nl.add, operand1=bias[0:P, 0:NB])
+                                      op1=nl.add, operand1=bias_all[0:P, r * NB:(r + 1) * NB])
             # the max over the window, the sink and the own score, broadcast back to the partitions
             cmax = nl.ndarray((P, 1), dtype=nl.float32, buffer=nl.sbuf)
             nisa.tensor_reduce(cmax[0:P, 0:1], op=nl.maximum, data=sc[0:P, 0:NB], axis=1, keepdims=True)

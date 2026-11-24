@@ -318,6 +318,50 @@ class Attention(nn.Module):
         out = values.reshape(values.shape[0], -1) @ self.o
         return self.post_norm(neuron_collectives.all_reduce(self.attn_tp_group, out))
 
+    def prepare_decode_kernel(self, hc) -> None:
+        """A sliding layer's decode attention half kernel's derived weights (kernels/attn_swa.py), as buffers: ``hc``'s
+        (the layer's attn_hc) fn transposed in its bf16 part and the bf16 rest, w_uv as [heads, latent, v] and the
+        RoPE pair swap with its sign."""
+        fnT = hc.fn.detach().t().contiguous()
+        hi = fnT.to(DTYPE)
+        self.register_buffer("k_fn_hi", hi, persistent=False)
+        self.register_buffer("k_fn_lo", (fnT - hi.float()).to(DTYPE), persistent=False)
+        self.register_buffer("k_w_uvT", self.w_uv.detach().transpose(1, 2).contiguous(), persistent=False)
+        rope = self.kind.qk_rope_head_dim
+        pm = torch.zeros(rope, rope, dtype=torch.float32, device=self.w_uv.device)
+        idx = torch.arange(0, rope, 2, device=pm.device)
+        pm[idx + 1, idx] = -1.0
+        pm[idx, idx + 1] = 1.0
+        self.register_buffer("k_pm", pm.to(DTYPE), persistent=False)
+
+    def decode_half(self, streams: torch.Tensor, positions: torch.Tensor, md: dict, hc, ln) -> tuple:
+        """(this rank's partial [T, H] before the all-reduce, iHC post [T, hc] fp32) of a sliding layer's decode: the
+        streams' mix, ``ln`` (input_layernorm) and the attention up to its all-reduce in one kernel
+        (kernels/attn_swa.py); the rows' MLA rows are written to the pool after it."""
+        from sglang_neuron.backend.stack import wrap_nki
+        from sglang_neuron.models.hy_v4_flash.kernels.attn_swa import attn_swa
+        from sglang_neuron.utils.hardware_config import get_logical_nc_config
+
+        cfg, rows = self.config, streams.shape[0]
+        cos, sin = ops.rope_tables(positions, self.inv_freq)
+        table = md["block_table_tensor"]
+        first = md["swa_kv_pos_offset"].reshape(rows, 1).to(torch.float32)
+        kernel = wrap_nki(attn_swa)[get_logical_nc_config()]
+        partial, post, mla_rows = kernel(
+            streams, self.k_fn_hi, self.k_fn_lo, hc.base.view(1, -1), hc.scale.view(1, -1), ln.weight.view(1, -1),
+            self.q_a, self.q_a_norm.weight.view(1, -1), self.q_b, self.kv_a, self.kv_a_norm.weight.view(1, -1),
+            self.w_uk, self.k_w_uvT, self.gate, self.o, self.sinks.view(1, -1),
+            cos.repeat_interleave(2, dim=-1).contiguous(), sin.repeat_interleave(2, dim=-1).contiguous(), self.k_pm,
+            self.k_cache, self.v_cache, table.to(torch.int32), first, positions.reshape(rows, 1).to(torch.float32),
+            eps=float(cfg.rms_norm_eps), hc_eps=float(cfg.hc_eps), hc_mag=float(cfg.hc_magnitude),
+            scale=float(self.kind.scaling), window=int(self.kind.sliding_window))
+        self._write_kv(mla_rows, md["slot_mapping"])
+        return partial, post
+
+    def finish_half(self, partial: torch.Tensor) -> torch.Tensor:
+        """The attention's output from decode_half's partial: the all-reduce and post_proj_norm."""
+        return self.post_norm(neuron_collectives.all_reduce(self.attn_tp_group, partial))
+
     def _write_kv(self, rows: torch.Tensor, slots: torch.Tensor) -> None:
         half = self.k_cache.shape[-1]
         if self.k_cache.dtype == KV_FP8:
