@@ -81,6 +81,11 @@ class HYV4FlashForConditionalGeneration(ModelHost):
         from sglang_neuron.models.hy_v4_flash.launch import FP8_CAST, FP8_FN_AS_E4M3
 
         args = super().neuron_compiler_args(phase, default_args)
+        if phase == "prefill":
+            # -O2, keeping the modular flow (its layer outlining keeps the 42-layer graph's compile in bounds): the
+            # serving default -O1 runs the prefill five times slower (six layers of a 2048-token chunk on one core:
+            # 352 ms at -O1, 70 at -O2)
+            args = ["-O2" if a in ("-O0", "-O1", "-O3") else a for a in args]
         if os.environ.get(FP8_CAST) != "1":
             return args
         prefix = "--internal-hlo2tensorizer-options="
