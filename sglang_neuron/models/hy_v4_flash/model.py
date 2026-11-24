@@ -43,6 +43,10 @@ from sglang_neuron.utils.weight_loader import SafetensorsWeightLoader, set_weigh
 KERNEL_MOE_MIN_ROWS = 2
 # the decode kernels take at most this many rows (a tile of partitions)
 KERNEL_MAX_ROWS = 128
+# the sparse layers' decode attention kernel (kernels/attn_swa.attn_sparse) is off: its scores on the vector engine
+# (one row's 2052 keys x 576 channels at a time) lost to the graph's attention at 1, 16 and 64 rows (six decode
+# layers on one core: 5.03 / 10.73 / 20.50 ms against 4.91 / 9.65 / 17.42)
+SPARSE_DECODE_KERNEL = False
 
 
 class HyperConnection(nn.Module):
@@ -248,7 +252,7 @@ class Hy4FlashGraph(nn.Module):
             if layer.self_attn.sliding:
                 layer.self_attn.prepare_decode_kernel(layer.attn_hc)
                 layer.attn_kernel = True
-            else:
+            elif SPARSE_DECODE_KERNEL:
                 layer.self_attn.prepare_decode_kernel()
                 layer.self_attn.sparse_kernel = True
 
