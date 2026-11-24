@@ -248,6 +248,9 @@ class Hy4FlashGraph(nn.Module):
             if layer.self_attn.sliding:
                 layer.self_attn.prepare_decode_kernel(layer.attn_hc)
                 layer.attn_kernel = True
+            else:
+                layer.self_attn.prepare_decode_kernel()
+                layer.self_attn.sparse_kernel = True
 
     def bind_hashes(self) -> None:
         for layer in self.layers:
