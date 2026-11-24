@@ -398,7 +398,8 @@ def moe_half(streams, fn_hi, fn_lo, hc_base, hc_scale, ln_w, router_wT, expert_b
     # both programs hold the same post weights: each stores one half of the columns
     post_out = nl.ndarray((T, HC), dtype=nl.float32, buffer=nl.shared_hbm, name="moe_half_post")
     HCH = HC // n_prg
-    nisa.dma_copy(dst=post_out.ap(pattern=[[HC, T], [1, HCH]], offset=pid * HCH), src=post[0:T, pid * HCH:(pid + 1) * HCH])
+    nisa.dma_copy(dst=post_out.ap(pattern=[[HC, T], [1, HCH]], offset=pid * HCH),
+                  src=post[0:T, pid * HCH:(pid + 1) * HCH])
     if debug:
         # the routed latent and the experts' input latent, for tools/hy4_flash/check_moe_half.py
         rt_out = nl.ndarray((T, L), dtype=nl.bfloat16, buffer=nl.shared_hbm, name="moe_half_routed")

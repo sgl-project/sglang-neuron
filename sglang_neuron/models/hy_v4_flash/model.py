@@ -34,7 +34,13 @@ from sglang_neuron.models.transformer.config import DTYPE
 from sglang_neuron.models.transformer.model import RMSNorm
 from sglang_neuron.parallel import groups
 from sglang_neuron.utils.checkpoints import SafetensorsCheckpoint
+from sglang_neuron.utils.neuron_utils import can_run_kernel
 from sglang_neuron.utils.weight_loader import SafetensorsWeightLoader, set_weight_loader
+
+
+# a decode of at least this many rows runs the MoE half kernel; one row keeps the graph's MoE, whose expert kernel
+# reads only the experts it chose (moe_hits.py): the half kernel reads all 16 local experts (0.66 ms at one row)
+KERNEL_MOE_MIN_ROWS = 2
 
 
 class HyperConnection(nn.Module):
@@ -70,12 +76,18 @@ class DecoderLayer(nn.Module):
         self.post_attention_layernorm = RMSNorm(config.hidden_size, config.rms_norm_eps)
         self.self_attn = Attention(config, layer_idx)
         self.mlp = LatentMoE(config, phase) if config.moe_layers[layer_idx] else DenseMLP(config)
+        # set by Hy4FlashGraph.prepare_kernels on a decode graph's MoE layers
+        self.decode_kernel = False
 
     def forward(self, streams, attend, ngrams, real=None):
         if self.engram is not None:
             streams = self.engram(streams, ngrams)
         post, x = self.attn_hc(streams)
         streams = ops.hc_add(streams, post, attend(self.input_layernorm(x)))
+        if self.decode_kernel and streams.shape[0] >= KERNEL_MOE_MIN_ROWS and can_run_kernel(streams):
+            # the FFN block's mix, norm and MoE up to its all-reduce in one kernel (kernels/moe_half.py)
+            partial, post = self.mlp.decode_half(streams, self.ffn_hc, self.post_attention_layernorm)
+            return ops.hc_add(streams, post, self.mlp.finish_half(partial))
         post, x = self.ffn_hc(streams)
         return ops.hc_add(streams, post, self.mlp(self.post_attention_layernorm(x), real))
 
@@ -213,6 +225,15 @@ class Hy4FlashGraph(nn.Module):
                                                   device).state_dict
         self.load_state_dict(state, strict=False, assign=True)
         self.bind_hashes()
+
+    def prepare_kernels(self) -> None:
+        """After the weights load: a decode graph's MoE layers take the MoE half kernel (kernels/moe_half.py)."""
+        if self.phase != "decode":
+            return
+        for layer in self.layers:
+            if isinstance(layer.mlp, LatentMoE):
+                layer.mlp.prepare_decode_kernel(layer.ffn_hc)
+                layer.decode_kernel = True
 
     def bind_hashes(self) -> None:
         for layer in self.layers:

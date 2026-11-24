@@ -226,6 +226,38 @@ class LatentMoE(nn.Module):
         out = tiles[0] if len(tiles) == 1 else torch.cat(tiles, dim=0)
         return out.float()
 
+    def prepare_decode_kernel(self, hc) -> None:
+        """The decode MoE half kernel's derived weights (kernels/moe_half.py), as buffers so the compiled graph takes
+        them as inputs: the router transposed, and ``hc``'s (the layer's ffn_hc) fn transposed in its bf16 part and
+        the bf16 rest."""
+        fnT = hc.fn.detach().t().contiguous()
+        hi = fnT.to(DTYPE)
+        self.register_buffer("k_fn_hi", hi, persistent=False)
+        self.register_buffer("k_fn_lo", (fnT - hi.float()).to(DTYPE), persistent=False)
+        self.register_buffer("k_router_wT", self.router_w.detach().t().contiguous(), persistent=False)
+
+    def decode_half(self, streams: torch.Tensor, hc, ln) -> tuple:
+        """(this rank's partial [T, H] bf16 of the block's output before its all-reduce, iHC post [T, hc] fp32) of a
+        decode's streams [T, hc, H]: ``hc``'s mix, ``ln`` (post_attention_layernorm) and the block up to the
+        all-reduce in one kernel (kernels/moe_half.py)."""
+        from sglang_neuron.backend.stack import wrap_nki
+        from sglang_neuron.models.hy_v4_flash.kernels.moe_half import moe_half
+        from sglang_neuron.utils.hardware_config import get_logical_nc_config
+
+        cfg = self.config
+        kernel = wrap_nki(moe_half)[get_logical_nc_config()]
+        return kernel(streams, self.k_fn_hi, self.k_fn_lo, hc.base.view(1, -1), hc.scale.view(1, -1),
+                      ln.weight.view(1, -1), self.k_router_wT, self.bias.view(1, -1),
+                      self._rank_id(streams.device).to(torch.float32), self.pre, self.post, self.gate_up, self.down,
+                      self.gate_up_scale, self.down_scale, self.shared_gate_up, self.shared_down,
+                      eps=float(cfg.rms_norm_eps), hc_eps=float(cfg.hc_eps), hc_mag=float(cfg.hc_magnitude),
+                      route_scale=float(cfg.routed_scaling_factor), top_k=int(cfg.top_k),
+                      limit=float(cfg.swiglu_limit))
+
+    def finish_half(self, partial: torch.Tensor) -> torch.Tensor:
+        """The block's output from decode_half's partial: the all-reduce and combine_output_norm."""
+        return self.combine_norm(neuron_collectives.all_reduce(self.attn_tp_group, partial))
+
     def forward(self, x: torch.Tensor, real: torch.Tensor | None = None) -> torch.Tensor:
         """The block's output for x [T, H]; ``real`` [T] bool marks a prefill chunk's real rows (the prefill
         kernel's mapping leaves the padding out)."""

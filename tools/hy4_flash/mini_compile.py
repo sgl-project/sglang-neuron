@@ -32,6 +32,7 @@ def main():
     ap.add_argument("--layers", type=int, default=1)
     ap.add_argument("--kv-dtype", default="bf16", choices=sorted(KV_DTYPES), help="the KV pool's element type")
     ap.add_argument("--tp", type=int, default=1, help="shard the weights as this TP's rank 0")
+    ap.add_argument("--no-kernels", action="store_true", help="the decode without the MoE half kernel")
     ap.add_argument("--profile", default="", help="record the device profile of 2 calls into this directory")
     ap.add_argument("--bench", type=int, default=0,
                     help="run the compiled graph this many more times and report ms a call (with --tp above 1 the "
@@ -73,6 +74,8 @@ def main():
     for layer in g.layers:
         if layer.engram is not None:
             layer.engram.bind_hash()
+    if not args.no_kernels:
+        g.prepare_kernels()
     pages = args.context // PAGE
     slots = (pages + 2) * PAGE
     half = (cfg.kv_lora_rank + cfg.sparse.qk_rope_head_dim) // 2

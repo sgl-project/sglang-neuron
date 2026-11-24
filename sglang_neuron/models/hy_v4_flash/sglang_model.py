@@ -76,6 +76,7 @@ class HYV4FlashForConditionalGeneration(ModelHost):
         # the hash multipliers are buffers drawn from the loaded lookup table, which the second graph shares
         for graph in self.model_graphs.values():
             graph.bind_hashes()
+            graph.prepare_kernels()
 
     def neuron_compiler_args(self, phase: str, default_args: list[str]) -> list[str]:
         from sglang_neuron.models.hy_v4_flash.launch import FP8_CAST, FP8_FN_AS_E4M3
