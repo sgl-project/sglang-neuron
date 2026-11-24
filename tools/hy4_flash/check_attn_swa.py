@@ -150,7 +150,7 @@ def run_simulate(args_t):
     return [torch.from_numpy(np.asarray(o).astype(np.float32)) for o in outs]
 
 
-def run_device(args_t):
+def run_device(args_t, kernel=None, kwargs=None):
     os.environ["UNSAFE_FP8FNCAST"] = "1"
     from sglang_neuron.process_init import init_stack
 
@@ -171,8 +171,11 @@ def run_device(args_t):
     device = torch.device("neuron", 0)
     dev = [t.contiguous().to(device) for t in args_t]
 
+    kernel = attn_swa if kernel is None else kernel
+    kwargs = KWARGS if kwargs is None else kwargs
+
     def fn(*ts):
-        return wrap_nki(attn_swa)[get_logical_nc_config()](*ts, **KWARGS)
+        return wrap_nki(kernel)[get_logical_nc_config()](*ts, **kwargs)
 
     with stack.compile_scope(args_cc):
         compiled = torch.compile(fn, backend=stack.compile_backend_name(), fullgraph=True, dynamic=False)
