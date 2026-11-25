@@ -77,9 +77,13 @@ The random 8192 / 1024 benchmark (`python3 -m sglang.bench_serving --dataset-nam
 
 | concurrency (prompts) | TTFT mean | TPOT mean | total tokens/s |
 | --- | --- | --- | --- |
-| 1 (10) | 2574 ms | 42.2 ms | 202 |
-| 64 (320) | 37.9 s | 277 ms | 1803 |
+| 1 (10) | 1852 ms | 26.1 ms | 324 |
+| 64 (128) | 43.7 s | 225 ms | 2125 |
 
 A decode of one token runs only the local experts it chose (`moe_hits.py`, about half an expert a rank against all
-16), and of 4 rows or more selects its IndexPool groups in nkilib's top-k. Most of what remains is the attention and
-iHC in torch: the gathered KV rows are transposed on the PE every layer, and the iHC mixes run on wide fp32 streams.
+16), and of 4 rows or more selects its IndexPool groups in nkilib's top-k. A decode of 2 rows or more runs each MoE
+block from the iHC mix to its all-reduce in one kernel (`kernels/moe_half.py`), and of up to 16 rows each sliding
+layer's attention (`kernels/attn_swa.py`); a prefill chunk's iHC mixes run in `kernels/hc_prefill.py`. At 64
+concurrent requests a decode step is 144 ms and a 2048-token prefill chunk about 380 ms, and the decode steps wait
+behind the chunks: about half of a chunk's time is fixed (a 35-token chunk takes 188 ms), most of it the prefill
+experts, whose hybrid kernel runs all 16 local experts' static blocks whatever the chunk's routing.
