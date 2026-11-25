@@ -49,10 +49,11 @@ def quantize_rows(x, T: int, n: int):
     return q, inv
 
 
-def project(xT, T: int, w, out_dtype, col0: int = 0, cols=None, row0: int = 0, rows=None, ring: int = 2):
+def project(xT, T: int, w, out_dtype, col0: int = 0, cols=None, row0: int = 0, rows=None, ring: int = 6):
     """[128, cols] (rows 0 .. T - 1) of x @ w[row0:row0 + rows, col0:col0 + cols]: ``xT`` [128, k tiles, T] the input
-    transposed (tile t holds input columns t x 128 ..), ``w`` [K, N] in HBM streamed one 128-row tile at a time, fp32
-    accumulation, ``out_dtype`` result."""
+    transposed (tile t holds input columns t x 128 ..), ``w`` [K, N] in HBM streamed one 128-row tile at a time
+    through ``ring`` buffers, fp32 accumulation, ``out_dtype`` result. A 2-deep ring left the matmuls waiting on the
+    tiles' DMAs: the sliding attention kernel ran 0.285 / 0.443 ms at 1 / 16 rows against 0.202 / 0.389 with 6."""
     K, N = w.shape
     rows = K - row0 if rows is None else rows
     cols = N - col0 if cols is None else cols
