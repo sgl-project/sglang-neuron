@@ -51,6 +51,10 @@ KERNEL_ATTN_MAX_ROWS = 16
 # (one row's 2052 keys x 576 channels at a time) lost to the graph's attention at 1, 16 and 64 rows (six decode
 # layers on one core: 5.03 / 10.73 / 20.50 ms against 4.91 / 9.65 / 17.42)
 SPARSE_DECODE_KERNEL = False
+# a prefill chunk's iHC mixes run in kernels/hc_prefill.py when its rows are whole tiles of this many: the graph's mix
+# (an fp32 matmul 8 columns wide, on the vector engine) was about 200 ms of a 2048-token chunk's 550 at TP32; two
+# layers of a chunk on one core: 148.0 ms against 390.9
+HC_KERNEL_TILE = 128
 
 
 class HyperConnection(nn.Module):
@@ -65,9 +69,28 @@ class HyperConnection(nn.Module):
         self.scale = nn.Parameter(torch.empty(2, dtype=torch.float32), requires_grad=False)
         for p in (self.fn, self.base, self.scale):
             set_weight_loader(p, weights.vector(torch.float32))
+        # set by Hy4FlashGraph.prepare_kernels on a prefill graph's mixes
+        self.prefill_kernel = False
+
+    def prepare_prefill_kernel(self) -> None:
+        """The prefill mix kernel's fn (kernels/hc_prefill.py), transposed in its bf16 part and the bf16 rest, as
+        buffers so the compiled graph takes them as inputs."""
+        fnT = self.fn.detach().t().contiguous()
+        hi = fnT.to(torch.bfloat16)
+        self.register_buffer("k_fn_hi", hi, persistent=False)
+        self.register_buffer("k_fn_lo", (fnT - hi.float()).to(torch.bfloat16), persistent=False)
+        self.prefill_kernel = True
 
     def forward(self, streams):
         c = self.config
+        if self.prefill_kernel and streams.shape[0] % HC_KERNEL_TILE == 0 and can_run_kernel(streams):
+            from sglang_neuron.backend.stack import wrap_nki
+            from sglang_neuron.models.hy_v4_flash.kernels.hc_prefill import hc_mix_rows
+            from sglang_neuron.utils.hardware_config import get_logical_nc_config
+
+            kernel = wrap_nki(hc_mix_rows)[get_logical_nc_config()]
+            return kernel(streams, self.k_fn_hi, self.k_fn_lo, self.base.view(1, -1), self.scale.view(1, -1),
+                          eps=float(c.rms_norm_eps), hc_eps=float(c.hc_eps), hc_mag=float(c.hc_magnitude))
         return ops.hc_mix(streams, self.fn, self.base, self.scale, c.hc_mult, c.hc_magnitude, c.hc_eps,
                           c.rms_norm_eps)
 
@@ -246,8 +269,12 @@ class Hy4FlashGraph(nn.Module):
 
     def prepare_kernels(self) -> None:
         """After the weights load: a decode graph's MoE layers take the MoE half kernel (kernels/moe_half.py) and its
-        sliding layers the attention half kernel (kernels/attn_swa.py)."""
+        sliding layers the attention half kernel (kernels/attn_swa.py); a prefill graph's iHC mixes take
+        kernels/hc_prefill.py."""
         if self.phase != "decode":
+            for layer in self.layers:
+                layer.attn_hc.prepare_prefill_kernel()
+                layer.ffn_hc.prepare_prefill_kernel()
             return
         for layer in self.layers:
             if isinstance(layer.mlp, LatentMoE):

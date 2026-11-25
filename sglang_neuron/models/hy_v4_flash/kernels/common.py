@@ -91,15 +91,16 @@ def rms_norm(x, T: int, n: int, w, eps: float):
     return out
 
 
-def hc_mix(streams, fn_hi, fn_lo, hc_base, hc_scale, T: int, eps: float, hc_eps: float, hc_mag: float):
-    """ops.hc_mix of ``streams`` [T, hc, H] (HBM): (the streams in SBUF [128, hc H] bf16, post [128, hc] fp32, the
-    block input [128, H] bf16). fn's mixes contract its bf16 part and its bf16 rest (fn_hi, fn_lo [hc H, 2 hc]) with
-    fp32 accumulation."""
-    _, HC, H = streams.shape
+def hc_mix(streams, fn_hi, fn_lo, hc_base, hc_scale, T: int, eps: float, hc_eps: float, hc_mag: float,
+           row0: int = 0):
+    """ops.hc_mix of rows row0 .. row0 + T - 1 of ``streams`` [rows, hc, H] (HBM, T <= 128): (the streams in SBUF
+    [128, hc H] bf16, post [128, hc] fp32, the block input [128, H] bf16). fn's mixes contract its bf16 part and its
+    bf16 rest (fn_hi, fn_lo [hc H, 2 hc]) with fp32 accumulation."""
+    rows, HC, H = streams.shape
     D = HC * H
     D1 = D // P
     st = nl.ndarray((P, D), dtype=nl.bfloat16, buffer=nl.sbuf)
-    nisa.dma_copy(dst=st[0:T, 0:D], src=streams.reshape((T, D)).ap(pattern=[[D, T], [1, D]], offset=0))
+    nisa.dma_copy(dst=st[0:T, 0:D], src=streams.reshape((rows, D)).ap(pattern=[[D, T], [1, D]], offset=row0 * D))
     sq = nl.ndarray((P, D), dtype=nl.float32, buffer=nl.sbuf)
     ss = nl.ndarray((P, 1), dtype=nl.float32, buffer=nl.sbuf)
     nisa.activation(dst=sq[0:T, 0:D], op=nl.square, data=st[0:T, 0:D], reduce_op=nl.add, reduce_res=ss[0:T, 0:1],
