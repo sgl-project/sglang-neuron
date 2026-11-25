@@ -32,6 +32,9 @@ def main():
     ap.add_argument("--layers", type=int, default=1)
     ap.add_argument("--kv-dtype", default="bf16", choices=sorted(KV_DTYPES), help="the KV pool's element type")
     ap.add_argument("--tp", type=int, default=1, help="shard the weights as this TP's rank 0")
+    ap.add_argument("--pool-tokens", type=int, default=0,
+                    help="size every layer's KV pool (and the per-slot state) for this many tokens, as a server's "
+                         "--max-total-tokens does; 0 sizes it for --context alone")
     ap.add_argument("--no-kernels", action="store_true", help="the decode without the MoE half kernel")
     ap.add_argument("--profile", default="", help="record the device profile of 2 calls into this directory")
     ap.add_argument("--bench", type=int, default=0,
@@ -77,9 +80,10 @@ def main():
     if not args.no_kernels:
         g.prepare_kernels()
     pages = args.context // PAGE
-    slots = (pages + 2) * PAGE
+    pool_pages = max(pages + 2, args.pool_tokens // PAGE + 1)
+    slots = pool_pages * PAGE
     half = (cfg.kv_lora_rank + cfg.sparse.qk_rope_head_dim) // 2
-    caches = {layer.self_attn.name: [torch.zeros(pages + 2, 1, PAGE, half, dtype=KV_DTYPES[args.kv_dtype], device=dev)
+    caches = {layer.self_attn.name: [torch.zeros(pool_pages, 1, PAGE, half, dtype=KV_DTYPES[args.kv_dtype], device=dev)
                                      for _ in range(2)] for layer in g.layers}
     g.bind_kv_cache(caches)
     g.bind_state(slots, dev)

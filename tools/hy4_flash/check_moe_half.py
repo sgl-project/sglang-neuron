@@ -179,6 +179,8 @@ def main() -> int:
     parser.add_argument("--simulate", action="store_true")
     parser.add_argument("--fp8-act", action="store_true", help="the kernel's W8A8 experts")
     parser.add_argument("--grid", type=int, default=1, help="programs under --simulate (the device runs its LNC)")
+    parser.add_argument("--no-split", action="store_true",
+                        help="the latent-split expert loop (every program runs every expert) for an A/B")
     args = parser.parse_args()
     global GRID
     GRID = args.grid
@@ -189,6 +191,7 @@ def main() -> int:
         control, _ = reference(w, args.rank, args.experts, use_bias=False)
         exact, _ = reference(w, args.rank, args.experts, w8a8=True)
         KWARGS["fp8_act"] = args.fp8_act
+        KWARGS["split_experts"] = not args.no_split
         got, got_post = (run_simulate if args.simulate else run_device)(kernel_args(w, args.rank))
         rel = ((got - want).norm() / want.norm().clamp(min=1e-30)).item()
         rel_c = ((got - control).norm() / control.norm().clamp(min=1e-30)).item()

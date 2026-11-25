@@ -18,10 +18,12 @@ Per layer and rank, for T <= 128 decode rows:
 The outputs are the rank's partial [T, H] bf16, which the caller all-reduces, then combine_output_norm and the iHC add
 (ops.hc_add) with ``post`` [T, hc] fp32.
 
-The two programs of a logical NeuronCore each contract one half of the latent for the experts' gate / up and exchange
-the halves of their partial sums (``sendrecv``); each keeps one half of I for the activation and the down projection,
-and of the latent for post_expert_proj; a last exchange sums the two programs' output partials, each program storing
-its half of H. The iHC mix, the norm, the router and pre_expert_proj run in both.
+The two programs of a logical NeuronCore each run half of the local experts over the whole latent and I
+(``split_experts``, the default), then exchange (``sendrecv``) halves of their routed-latent partials, each keeping one
+half of the latent for post_expert_proj; a last exchange sums the two programs' output partials, each program storing
+its half of H. The iHC mix, the norm, the router and pre_expert_proj run in both. Without ``split_experts`` each program
+runs every expert over one half of the latent (gate / up) and of I (down) and exchanges its gate / up partial sums once
+an expert: 18 exchanges a layer against 2, and 0.786 against 0.617 ms on one core at 64 rows.
 
 Inputs (this rank's shapes at TP32 / EP32: H 3072, hc 4, latent 1536, E 16 local of 512, I 1536, shared 48):
   streams        [T, hc, H] bf16
@@ -86,7 +88,7 @@ def _quantize_rows(x, T: int, n: int):
 @nki.jit
 def moe_half(streams, fn_hi, fn_lo, hc_base, hc_scale, ln_w, router_wT, expert_bias, rank, pre_w, post_w,
              gate_up_w, down_w, gate_up_scale, down_scale, sh_gate_up, sh_down, eps=1e-5, hc_eps=1e-6,
-             hc_mag=2.0, route_scale=1.0, top_k=16, limit=10.0, fp8_act=False, debug=False):
+             hc_mag=2.0, route_scale=1.0, top_k=16, limit=10.0, fp8_act=False, split_experts=True, debug=False):
     T, HC, H = streams.shape
     D = HC * H
     E, L, _, I = gate_up_w.shape  # noqa: E741
@@ -242,13 +244,21 @@ def moe_half(streams, fn_hi, fn_lo, hc_base, hc_scale, ln_w, router_wT, expert_b
     acc = nl.ndarray((P, L), dtype=nl.float32, buffer=nl.sbuf)
     slots = [0, 0]
     chunks = [(g, c0, min(512, I - c0)) for g in range(2) for c0 in range(0, I, 512)]
-    for e in range(E):
+    # split_experts: each program runs half of the experts over the whole latent and I, so nothing is exchanged inside
+    # the loop; otherwise each runs every expert over its half of the latent (gate / up) and of I (down), exchanging
+    # its gate / up partial sums once an expert
+    split = split_experts and n_prg > 1
+    NE = E // n_prg if split else E
+    KL, IE = (L1, I) if split else (n_kl, ILe)
+    IC = IE // P
+    for j in range(NE):
+        e = pid * NE + j if split else j
         ps = [nl.ndarray((P, 512), dtype=nl.float32, buffer=nl.psum) for _ in chunks]
-        for k in range(n_kl // rows):
+        for k in range(KL // rows):
             buf = gu_ring[slots[0] % RING]
             slots[0] += 1
-            row = l0 + rows * k * P
-            t0 = pid * n_kl + rows * k
+            row = (0 if split else l0) + rows * k * P
+            t0 = (0 if split else pid * n_kl) + rows * k
             nisa.dma_copy(dst=buf[0:P, 0:rows, 0:2 * I],
                           src=gate_up_w.ap(pattern=[[2 * I, P], [P * 2 * I, rows], [1, 2 * I]],
                                            offset=e * (L * 2 * I) + row * 2 * I), dge_mode=nisa.dge_mode.hwdge)
@@ -267,8 +277,10 @@ def moe_half(streams, fn_hi, fn_lo, hc_base, hc_scale, ln_w, router_wT, expert_b
                                    operand0=inv_ls[0:T, 0:1])
             else:
                 nisa.tensor_copy(dst=part[0:T, g, c0:c0 + cs], src=ps[ci][0:T, 0:cs])
-        gu = nl.ndarray((P, 2, ILe), dtype=nl.float32, buffer=nl.sbuf)
-        if n_prg > 1:
+        gu = nl.ndarray((P, 2, IE), dtype=nl.float32, buffer=nl.sbuf)
+        if split:
+            gu = part
+        elif n_prg > 1:
             send = nl.ndarray((P, 2, ILe), dtype=nl.float32, buffer=nl.sbuf)
             recv = nl.ndarray((P, 2, ILe), dtype=nl.float32, buffer=nl.sbuf)
             nisa.tensor_copy(dst=send[0:T, 0:2, 0:ILe], src=part[0:T, 0:2, other * ILe:(other + 1) * ILe])
@@ -278,52 +290,54 @@ def moe_half(streams, fn_hi, fn_lo, hc_base, hc_scale, ln_w, router_wT, expert_b
                                nl.add)
         else:
             nisa.tensor_copy(dst=gu[0:T, 0:2, 0:ILe], src=part[0:T, 0:2, 0:ILe])
-        gus = nl.ndarray((P, 2, ILe), dtype=nl.float32, buffer=nl.sbuf)
-        nisa.dma_copy(dst=gus[0:T, 0:2, 0:ILe],
-                      src=gate_up_scale.ap(pattern=[[0, T], [I, 2], [1, ILe]], offset=e * 2 * I + pid * ILe),
+        i0 = 0 if split else pid * ILe
+        gus = nl.ndarray((P, 2, IE), dtype=nl.float32, buffer=nl.sbuf)
+        nisa.dma_copy(dst=gus[0:T, 0:2, 0:IE],
+                      src=gate_up_scale.ap(pattern=[[0, T], [I, 2], [1, IE]], offset=e * 2 * I + i0),
                       dge_mode=nisa.dge_mode.hwdge)
-        nisa.tensor_tensor(gu[0:T, 0:2, 0:ILe], gu[0:T, 0:2, 0:ILe], gus[0:T, 0:2, 0:ILe], nl.multiply)
-        if debug and e == 0:
+        nisa.tensor_tensor(gu[0:T, 0:2, 0:IE], gu[0:T, 0:2, 0:IE], gus[0:T, 0:2, 0:IE], nl.multiply)
+        if debug and j == 0 and not split:
             gu0 = nl.ndarray((P, 2, ILe), dtype=nl.float32, buffer=nl.sbuf)
             nisa.tensor_copy(dst=gu0[0:T, 0:2, 0:ILe], src=gu[0:T, 0:2, 0:ILe])
         # ops.swiglu: the gate clamped above, the up both ways
-        nisa.tensor_scalar(dst=gu[0:T, 0, 0:ILe], data=gu[0:T, 0, 0:ILe], op0=nl.minimum, operand0=limit)
-        nisa.tensor_scalar(dst=gu[0:T, 1, 0:ILe], data=gu[0:T, 1, 0:ILe], op0=nl.minimum, operand0=limit,
+        nisa.tensor_scalar(dst=gu[0:T, 0, 0:IE], data=gu[0:T, 0, 0:IE], op0=nl.minimum, operand0=limit)
+        nisa.tensor_scalar(dst=gu[0:T, 1, 0:IE], data=gu[0:T, 1, 0:IE], op0=nl.minimum, operand0=limit,
                            op1=nl.maximum, operand1=-limit)
-        g_sb = nl.ndarray((P, ILe), dtype=nl.float32, buffer=nl.sbuf)
-        nisa.activation(dst=g_sb[0:T, 0:ILe], op=nl.silu, data=gu[0:T, 0, 0:ILe])
-        it = nl.ndarray((P, ILe), dtype=nl.bfloat16, buffer=nl.sbuf)
-        nisa.tensor_tensor(it[0:T, 0:ILe], gu[0:T, 1, 0:ILe], g_sb[0:T, 0:ILe], nl.multiply)
+        g_sb = nl.ndarray((P, IE), dtype=nl.float32, buffer=nl.sbuf)
+        nisa.activation(dst=g_sb[0:T, 0:IE], op=nl.silu, data=gu[0:T, 0, 0:IE])
+        it = nl.ndarray((P, IE), dtype=nl.bfloat16, buffer=nl.sbuf)
+        nisa.tensor_tensor(it[0:T, 0:IE], gu[0:T, 1, 0:IE], g_sb[0:T, 0:IE], nl.multiply)
         col = nl.ndarray((P, 1), dtype=nl.float32, buffer=nl.sbuf)
         if fp8_act:
-            iq, inv_ds = _quantize_rows(it, T, ILe)
+            iq, inv_ds = _quantize_rows(it, T, IE)
             nisa.tensor_tensor(col[0:T, 0:1], aff[0:T, e:e + 1], inv_ds[0:T, 0:1], nl.multiply)
-            iqT = _transpose(iq, T, n_ic, nl.float8_e4m3)
+            iqT = _transpose(iq, T, IC, nl.float8_e4m3)
         else:
             nisa.tensor_copy(dst=col[0:T, 0:1], src=aff[0:T, e:e + 1])
-            iqT = _transpose(it, T, n_ic, nl.bfloat16)
+            iqT = _transpose(it, T, IC, nl.bfloat16)
         base = e * (I * L)
         for hq in range(L // DN_COLS):
             pd = nl.ndarray((P, DN_COLS), dtype=nl.float32, buffer=nl.psum)
-            for j in range(n_ic // rows):
+            for jj in range(IC // rows):
                 db = dn_ring[slots[1] % RING]
                 slots[1] += 1
-                r0 = pid * ILe + rows * j * P
+                r0 = i0 + rows * jj * P
                 nisa.dma_copy(dst=db[0:P, 0:rows, 0:DN_COLS],
                               src=down_w.ap(pattern=[[L, P], [P * L, rows], [1, DN_COLS]],
                                             offset=base + r0 * L + hq * DN_COLS), dge_mode=nisa.dge_mode.hwdge)
                 if fp8_act:
-                    nisa.nc_matmul(dst=pd[0:T, 0:DN_COLS], stationary=iqT[0:P, 2 * j:2 * j + 2, 0:T],
+                    nisa.nc_matmul(dst=pd[0:T, 0:DN_COLS], stationary=iqT[0:P, 2 * jj:2 * jj + 2, 0:T],
                                    moving=db[0:P, 0:2, 0:DN_COLS], perf_mode=nisa.matmul_perf_mode.double_row)
                 else:
-                    nisa.nc_matmul(dst=pd[0:T, 0:DN_COLS], stationary=iqT[0:P, j, 0:T], moving=db[0:P, 0, 0:DN_COLS])
+                    nisa.nc_matmul(dst=pd[0:T, 0:DN_COLS], stationary=iqT[0:P, jj, 0:T],
+                                   moving=db[0:P, 0, 0:DN_COLS])
             ds = nl.ndarray((P, DN_COLS), dtype=nl.float32, buffer=nl.sbuf)
             nisa.dma_copy(dst=ds[0:T, 0:DN_COLS], src=down_scale.ap(pattern=[[0, T], [1, DN_COLS]],
                                                                     offset=e * L + hq * DN_COLS))
             c0 = hq * DN_COLS
             scaled = nl.ndarray((P, DN_COLS), dtype=nl.float32, buffer=nl.sbuf)
             nisa.tensor_tensor(scaled[0:T, 0:DN_COLS], pd[0:T, 0:DN_COLS], ds[0:T, 0:DN_COLS], nl.multiply)
-            if e == 0:
+            if j == 0:
                 nisa.tensor_scalar(dst=acc[0:T, c0:c0 + DN_COLS], data=scaled[0:T, 0:DN_COLS], op0=nl.multiply,
                                    operand0=col[0:T, 0:1])
             else:
@@ -409,6 +423,7 @@ def moe_half(streams, fn_hi, fn_lo, hc_base, hc_scale, ln_w, router_wT, expert_b
         aff_out = nl.ndarray((T, E), dtype=nl.float32, buffer=nl.shared_hbm, name="moe_half_aff")
         nisa.dma_copy(dst=aff_out, src=aff[0:T, 0:E])
         gu_out = nl.ndarray((T, 2, I), dtype=nl.float32, buffer=nl.shared_hbm, name="moe_half_gu0")
+        assert not split, "debug's expert-0 gate / up output is the latent-split loop's"
         nisa.dma_copy(dst=gu_out.ap(pattern=[[2 * I, T], [I, 2], [1, ILe]], offset=pid * ILe), src=gu0[0:T, 0:2, 0:ILe])
         return out, post_out, rt_out, lat_out, aff_out, gu_out
     return out, post_out
