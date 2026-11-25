@@ -53,6 +53,11 @@ _IGNORED_SERVER_ARGS = frozenset({
     "watchdog_timeout", "random_seed", "prompt_tokens_details", "enable_request_time_stats_logging",
     # the scheduler's policy alone: which batch runs next, not what a graph computes
     "prefill_decode_interval", "prefill_decode_interval_min_bs", "schedule_policy", "schedule_conservativeness",
+    # HiCache's host tier: its size and its write / prefetch policy fill host memory and choose what moves when, but
+    # leave the device pool and every graph as they are
+    "hicache_size", "hicache_ratio", "hicache_host_memory_fraction", "hicache_write_policy",
+    "hicache_storage_prefetch_policy", "hicache_storage_prefetch_retry_poll_interval",
+    "hicache_storage_prefetch_retry_max_attempts", "radix_eviction_policy",
 })
 # environment switches of the same kind: the scheduler's choices and what a launch records (SGLANG_NEURON_PROFILE_*)
 _IGNORED_ENV_PREFIXES = ("SGLANG_NEURON_PROFILE_", "SGLANG_NEURON_PREFILL_YIELD", "SGLANG_NEURON_HOST_TRACE")
