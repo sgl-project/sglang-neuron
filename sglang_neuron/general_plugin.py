@@ -283,6 +283,11 @@ def _register_launch_hooks() -> None:
 
     dspark_server_args.register(HookRegistry, HookType.REPLACE)
     gpt_oss_backend_check.register(HookRegistry, HookType.AROUND)
+    # Hy4-Flash: its config type and the MLA pool geometry SGLang 43881a7 does not know, in every process: the launching
+    # one resolves the arguments, the schedulers build the pools
+    from sglang_neuron.sglang_patches import hy4_flash_launch
+
+    hy4_flash_launch.register(HookRegistry, HookType.AROUND)
     # a prefill without a decode peer (bring-up, timing): argument resolution and the tokenizer manager
     pd_fake_prefill.register(HookRegistry, HookType.AROUND)
     neuron_system_profile.register_tokenizer(HookRegistry, HookType.AROUND)

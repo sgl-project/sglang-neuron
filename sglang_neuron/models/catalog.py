@@ -227,6 +227,13 @@ MODELS = {
                                        # every rank plans each step's programs from the DP-attention cohort snapshot
                                        # (models/qwen35/megakernel.py); its async decode reads its ids from device tokens
                                        megakernel=MegakernelServing(dp_steps_from_exchange=True, async_steps=True)),
+    # Hy4-Flash's text decoder (models/hy_v4_flash): gated MLA rows in the MHA pool (one 288-channel KV head, a row's
+    # halves in K and V), the sliding layers' in SGLang's window pool; its IndexPool and Engram state beside the pool,
+    # the routed experts in Trn2 FP8
+    "HYV4FlashForConditionalGeneration": ModelSpec(package="sglang_neuron.models.hy_v4_flash",
+                                                   kv_cache_dtypes=("auto", "bf16", "bfloat16", "fp8_e4m3"),
+                                                   quantizations=("fp8",), hybrid_swa_memory=True,
+                                                   launch_hooks="sglang_neuron.models.hy_v4_flash.launch"),
     "DeepseekV2ForCausalLM": ModelSpec(package="sglang_neuron.models.deepseek_v2",
                                        kv_cache_dtypes=("auto", "bf16", "bfloat16"), prefill_holds_prior=True),
     # GLM-5.2 (models/glm52), one host whose PD role picks its giga kernel (sglang_model.py) and one set of
