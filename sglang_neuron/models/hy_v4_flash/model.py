@@ -43,6 +43,10 @@ from sglang_neuron.utils.weight_loader import SafetensorsWeightLoader, set_weigh
 KERNEL_MOE_MIN_ROWS = 2
 # the decode kernels take at most this many rows (a tile of partitions)
 KERNEL_MAX_ROWS = 128
+# a sliding layer's attention kernel (kernels/attn_swa.attn_swa) runs up to this many rows: in the TP32 server's
+# 64-row decode it took about 20 ms a layer (the step 750 ms against 146 ms with the graph's attention), though one
+# core runs it in 1.14 ms; c=1 keeps it (TPOT 26 against 42 ms)
+KERNEL_ATTN_MAX_ROWS = 16
 # the sparse layers' decode attention kernel (kernels/attn_swa.attn_sparse) is off: its scores on the vector engine
 # (one row's 2052 keys x 576 channels at a time) lost to the graph's attention at 1, 16 and 64 rows (six decode
 # layers on one core: 5.03 / 10.73 / 20.50 ms against 4.91 / 9.65 / 17.42)
@@ -89,7 +93,7 @@ class DecoderLayer(nn.Module):
     def forward(self, streams, attend, ngrams, real=None, attend_half=None):
         if self.engram is not None:
             streams = self.engram(streams, ngrams)
-        if self.attn_kernel and streams.shape[0] <= KERNEL_MAX_ROWS and can_run_kernel(streams):
+        if self.attn_kernel and streams.shape[0] <= KERNEL_ATTN_MAX_ROWS and can_run_kernel(streams):
             # a sliding layer's mix, norm and attention up to its all-reduce in one kernel (kernels/attn_swa.py)
             partial, post = attend_half(streams, self.attn_hc, self.input_layernorm)
             streams = ops.hc_add(streams, post, self.self_attn.finish_half(partial))
