@@ -77,7 +77,7 @@ The random 8192 / 1024 benchmark (`python3 -m sglang.bench_serving --dataset-nam
 
 | concurrency (prompts) | TTFT mean | TPOT mean | total tokens/s |
 | --- | --- | --- | --- |
-| 1 (10) | 1852 ms | 26.1 ms | 324 |
+| 1 (10) | 1857 ms | 24.2 ms | 347 |
 | 64 (128) | 43.7 s | 225 ms | 2125 |
 
 A decode of one token runs only the local experts it chose (`moe_hits.py`, about half an expert a rank against all
