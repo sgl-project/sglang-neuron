@@ -57,9 +57,6 @@ KERNEL_TOPK_MIN_ROWS = 4
 # and up to this many groups a row (the kernel's tested range is 151936; a 1M-token rung's table has 262144)
 KERNEL_TOPK_GROUPS = 128 * 1024
 TOPK_EMPTY = 3.0e38
-# the sparse decode kernel takes its keys in tiles of 128 (a row's 2052 padded to 2176) and at most 128 rows
-SPARSE_KEY_TILE = 128
-SPARSE_KERNEL_MAX_ROWS = 128
 # an FP8 KV pool (--kv-cache-dtype fp8_e4m3): its element type and Trn2's e4m3 range
 KV_FP8 = torch.float8_e4m3fn
 KV_FP8_MAX = 240.0
@@ -278,8 +275,6 @@ class Attention(nn.Module):
         set_weight_loader(self.sinks, weights.head_vector(heads))
         self.register_buffer("inv_freq", ops.inv_freq(kind.rope_theta, rope), persistent=False)
         self.indexer = None if self.sliding else IndexPool(config)
-        # set by Hy4FlashGraph.prepare_kernels on a decode graph's sparse layers (kernels/attn_swa.attn_sparse)
-        self.sparse_kernel = False
         # bound by bind_kv_cache: the layer's K and V pool buffers as rows [slots, 288], each half of an MLA row
         self.k_cache = None
         self.v_cache = None
@@ -323,15 +318,14 @@ class Attention(nn.Module):
         out = values.reshape(values.shape[0], -1) @ self.o
         return self.post_norm(neuron_collectives.all_reduce(self.attn_tp_group, out))
 
-    def prepare_decode_kernel(self, hc=None) -> None:
-        """The decode attention kernels' derived weights (kernels/attn_swa.py), as buffers: w_uv as [heads, latent,
-        v], the RoPE pair swap with its sign, and for a sliding layer's half kernel ``hc``'s (the layer's attn_hc) fn
-        transposed in its bf16 part and the bf16 rest."""
-        if hc is not None:
-            fnT = hc.fn.detach().t().contiguous()
-            hi = fnT.to(DTYPE)
-            self.register_buffer("k_fn_hi", hi, persistent=False)
-            self.register_buffer("k_fn_lo", (fnT - hi.float()).to(DTYPE), persistent=False)
+    def prepare_decode_kernel(self, hc) -> None:
+        """A sliding layer's decode attention kernel's derived weights (kernels/attn_swa.py), as buffers: w_uv as
+        [heads, latent, v], the RoPE pair swap with its sign, and ``hc``'s (the layer's attn_hc) fn transposed in its
+        bf16 part and the bf16 rest."""
+        fnT = hc.fn.detach().t().contiguous()
+        hi = fnT.to(DTYPE)
+        self.register_buffer("k_fn_hi", hi, persistent=False)
+        self.register_buffer("k_fn_lo", (fnT - hi.float()).to(DTYPE), persistent=False)
         self.register_buffer("k_w_uvT", self.w_uv.detach().transpose(1, 2).contiguous(), persistent=False)
         rope = self.kind.qk_rope_head_dim
         pm = torch.zeros(rope, rope, dtype=torch.float32, device=self.w_uv.device)
@@ -363,36 +357,6 @@ class Attention(nn.Module):
             scale=float(self.kind.scaling), window=int(self.kind.sliding_window))
         self._write_kv(mla_rows, md["slot_mapping"])
         return partial, post
-
-    def _decode_sparse_kernel(self, x: torch.Tensor, positions: torch.Tensor, md: dict) -> torch.Tensor:
-        """A sparse layer's decode attention output through the attention kernel (kernels/attn_swa.attn_sparse): the
-        IndexPool's choice in the graph, its tokens' slots and positions handed to the kernel, the rows' MLA rows
-        written to the pool after it."""
-        from sglang_neuron.backend.stack import wrap_nki
-        from sglang_neuron.models.hy_v4_flash.kernels.attn_swa import attn_sparse
-        from sglang_neuron.utils.hardware_config import get_logical_nc_config
-
-        cfg, rows = self.config, x.shape[0]
-        table, block = md["block_table_tensor"], int(md["block_size"])
-        pos = positions.to(torch.int64)
-        q_resid = self.q_a_norm(x @ self.q_a)
-        self.indexer.write(x, pos, md["slot_mapping"], table, torch.arange(rows, device=pos.device), block)
-        _, tokens, allowed = self.indexer.selected_groups(x, q_resid, pos, table, block)
-        slots = token_slots(table, block, tokens.clamp(min=0)).to(torch.int32)
-        keypos = torch.where(allowed, tokens, torch.full_like(tokens, -1)).to(torch.float32)
-        pad = (-tokens.shape[1]) % SPARSE_KEY_TILE
-        if pad:
-            slots = torch.nn.functional.pad(slots, (0, pad))
-            keypos = torch.nn.functional.pad(keypos, (0, pad), value=-1.0)
-        cos, sin = ops.rope_tables(positions, self.inv_freq)
-        kernel = wrap_nki(attn_sparse)[get_logical_nc_config()]
-        partial, mla_rows = kernel(
-            x, q_resid, self.q_b, self.kv_a, self.kv_a_norm.weight.view(1, -1), self.w_uk, self.k_w_uvT, self.gate,
-            self.o, self.sinks.view(1, -1), cos.repeat_interleave(2, dim=-1).contiguous(),
-            sin.repeat_interleave(2, dim=-1).contiguous(), self.k_pm, self.k_cache, self.v_cache, slots, keypos,
-            positions.reshape(rows, 1).to(torch.float32), eps=float(cfg.rms_norm_eps), scale=float(self.kind.scaling))
-        self._write_kv(mla_rows, md["slot_mapping"])
-        return self.finish_half(partial)
 
     def finish_half(self, partial: torch.Tensor) -> torch.Tensor:
         """The attention's output from decode_half's partial: the all-reduce and post_proj_norm."""
@@ -487,8 +451,6 @@ class Attention(nn.Module):
             allowed = (key_pos <= pos.unsqueeze(1)) & (key_pos > pos.unsqueeze(1) - window)
             keys = self._read_kv_pages(table, block)
         else:
-            if self.sparse_kernel and rows <= SPARSE_KERNEL_MAX_ROWS and can_run_kernel(x):
-                return self._decode_sparse_kernel(x, positions, md)
             self.indexer.write(x, pos, md["slot_mapping"], table, torch.arange(rows, device=pos.device), block)
             # the IndexPool's index_topk tokens a row, gathered: a decode reads them, not its graph's whole context
             picked, _, allowed = self.indexer.selected_groups(x, q_resid, pos, table, block)

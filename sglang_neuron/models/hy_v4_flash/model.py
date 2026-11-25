@@ -47,10 +47,6 @@ KERNEL_MAX_ROWS = 128
 # 64-row decode it took about 20 ms a layer (the step 750 ms against 146 ms with the graph's attention), though one
 # core runs it in 1.14 ms; c=1 keeps it (TPOT 26 against 42 ms)
 KERNEL_ATTN_MAX_ROWS = 16
-# the sparse layers' decode attention kernel (kernels/attn_swa.attn_sparse) is off: its scores on the vector engine
-# (one row's 2052 keys x 576 channels at a time) lost to the graph's attention at 1, 16 and 64 rows (six decode
-# layers on one core: 5.03 / 10.73 / 20.50 ms against 4.91 / 9.65 / 17.42)
-SPARSE_DECODE_KERNEL = False
 # a prefill chunk's iHC mixes run in kernels/hc_prefill.py when its rows are whole tiles of this many: the graph's mix
 # (an fp32 matmul 8 columns wide, on the vector engine) was about 200 ms of a 2048-token chunk's 550 at TP32; two
 # layers of a chunk on one core: 148.0 ms against 390.9
@@ -283,9 +279,6 @@ class Hy4FlashGraph(nn.Module):
             if layer.self_attn.sliding:
                 layer.self_attn.prepare_decode_kernel(layer.attn_hc)
                 layer.attn_kernel = True
-            elif SPARSE_DECODE_KERNEL:
-                layer.self_attn.prepare_decode_kernel()
-                layer.self_attn.sparse_kernel = True
 
     def bind_hashes(self) -> None:
         for layer in self.layers:
