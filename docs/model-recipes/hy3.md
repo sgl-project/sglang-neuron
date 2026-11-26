@@ -105,7 +105,8 @@ server with the FP8 cache, the same KV scale profile and the same `SGLANG_NEURON
 - prefill: TP64 `--dcp-size 8`, `--disaggregation-mode prefill`, `--chunked-prefill-size 2048`,
   `--max-total-tokens 262144`, `--enable-hierarchical-cache --hicache-size 16` (HiCache L2 over the DCP pool, about
   6.7M host tokens), `SGLANG_NEURON_HY3_PD_MTP_KV=1` (it holds the MTP layer and writes its KV, so both pools hold the
-  same layers; no `--speculative-algorithm`). Under the sparse decode it keeps the summaries of the pages each chunk
+  same layers; no `--speculative-algorithm`), `SGLANG_NEURON_PREFILL_YIELD=2048` (a turn of at most one chunk of
+  uncached tokens prefills between two chunks of a long cold prompt instead of after all of them). Under the sparse decode it keeps the summaries of the pages each chunk
   writes, and the transfer and HiCache move them with their pages (`memory_pool.PAGE_SIDE_BUFFERS`).
 - decode: TP64 `--dcp-size 8` `NEURON_MTP`, `--disaggregation-mode decode`, `--cuda-graph-bs-decode 4 8 12 16`,
   `--max-running-requests 16`, `--max-total-tokens 262144`.
@@ -164,7 +165,8 @@ harness 1.0.14; GSM8K 100 through the balancer 0.95 to 0.96):
 
 | | nodes | output tokens/s | TTFT p50/p90/p99 | ITL p50/p90 | prefix hit |
 | --- | --- | --- | --- | --- | --- |
-| 1P1D, TP64 DCP8 prefill | 2 | 432.9 | 2.92/12.87/27.92 s | 20.9/27.1 ms | 95.1% |
+| 1P1D, TP64 DCP8 prefill | 2 | 433.6 | 3.08/12.18/30.78 s | 20.9/27.6 ms | 95.0% |
+| 1P1D, the same with `SGLANG_NEURON_PREFILL_YIELD=2048` on the prefill | 2 | 437.4 | 2.61/10.47/34.69 s | 20.7/26.2 ms | 95.1% |
 | 2P1D, two TP32 DCP4 prefills on one node (stripes) | 2 | 432.3 | 2.45/10.33/33.84 s | 20.8/26.6 ms | — |
 | 2P1D, two TP64 DCP8 prefill nodes | 3 | 442.3 | 2.31/7.31/— s | 21.1/27.5 ms | — |
 
@@ -184,7 +186,9 @@ compares with other 20-minute runs only.
 ## Status and next steps
 
 - TTFT's tail is a long cold prompt's chunks: a Neuron prefill forward runs one request, so the turns behind a 170k-token
-  cold prompt wait for all of its chunks (`SGLANG_NEURON_PREFILL_YIELD` trades decode ITL for part of it).
+  cold prompt wait for all of its chunks. `SGLANG_NEURON_PREFILL_YIELD` lets one-chunk turns through (on an aggregated
+  server it trades decode ITL for it; on a PD prefill it costs nothing: turns under 2048 uncached tokens went from 6.0 to
+  2.4 s mean TTFT), but a turn of two to four chunks still waits.
 - A decode layer (bs 8, MTP span 4, 32k context) is about 0.43 ms, a quarter of it waiting on its three collectives (the
   DCP merge and two 64-rank all-reduces of 256 KB, 27 us each, latency-bound; the runtime's default algorithms are the
   fastest measured); the span fold and the selection still cost about 3.9 ms of the step, and the decode MoE block

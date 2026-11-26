@@ -18,9 +18,15 @@ for it, and its result is a whole prompt's). The chunked request was checkpointe
 pass always continues the chunked request: a long prompt prefills at no less than half its speed.
 
 A pass yields only with room in the KV pool for the short request and a chunk beside it. Off (0) by default; a PD
-prefill server or a pipelined one never yields.
+decode server or a pipelined one never yields.
 
-Target, md5-pinned against upstream SGLang 43881a7: ``Scheduler._get_new_batch_prefill_raw`` (wrapped)."""
+On a PD prefill server ``process_prefill_chunk`` (wrapped) runs after every pass and, while a request is chunked,
+checkpoints it and sends its last chunk's KV to its decode. After a pass that yielded, the chunked request ran no chunk:
+the wrapper hides it from that call, which then only retires the short request's batch, and the next pass sends the
+chunked request's next chunk as usual.
+
+Targets, md5-pinned against upstream SGLang 43881a7: ``Scheduler._get_new_batch_prefill_raw`` and
+``SchedulerDisaggregationPrefillMixin.process_prefill_chunk`` (both wrapped)."""
 
 from __future__ import annotations
 
@@ -31,7 +37,10 @@ logger = logging.getLogger(__name__)
 
 ENV = "SGLANG_NEURON_PREFILL_YIELD"
 _SCHEDULER = "sglang.srt.managers.scheduler"
-_TARGETS_MD5 = {(_SCHEDULER, "Scheduler._get_new_batch_prefill_raw"): "54e259e006cb8a1a3ff15ba2d412d430"}
+_PREFILL = "sglang.srt.disaggregation.prefill"
+_TARGETS_MD5 = {(_SCHEDULER, "Scheduler._get_new_batch_prefill_raw"): "54e259e006cb8a1a3ff15ba2d412d430",
+                (_PREFILL, "SchedulerDisaggregationPrefillMixin.process_prefill_chunk"):
+                    "dca76f30fd359b20c4c3b2e861490e34"}
 # the waiting requests a pass looks at for one that fits
 _SCAN = 16
 
@@ -57,14 +66,25 @@ def _short_request(scheduler, tokens: int):
 
 
 def _uncached(req) -> int:
-    """The tokens a request's next prefill computes: its fill ids past the prefix it matched."""
-    return len(req.full_untruncated_fill_ids) - int(req.prefix_len)
+    """The tokens a request's next prefill computes: its fill ids past the prefix it matched, on the device or in
+    HiCache's host tier (``num_matched_prefix_tokens`` = ``prefix_len`` + ``host_hit_length``, which the builder loads
+    back rather than computes). Counting the device prefix only, a PD prefill whose prefixes sit mostly in L2 took
+    nearly every multi-turn request for a long one and yielded a few times an hour."""
+    matched = max(int(req.prefix_len), int(getattr(req, "num_matched_prefix_tokens", 0) or 0))
+    return len(req.full_untruncated_fill_ids) - matched
 
 
 def _room(scheduler, tokens: int) -> bool:
+    """Whether the KV pool holds the short request and two chunks beside it: its free pages and the radix cache's
+    evictable ones, which the batch builder evicts as it allocates. A server that keeps every finished prompt cached
+    (a PD prefill under AgentX) has almost no free pages, only evictable ones."""
     allocator = getattr(scheduler, "token_to_kv_pool_allocator", None)
     available = getattr(allocator, "available_size", None)
-    return available is None or available() >= tokens + 2 * int(scheduler.chunked_prefill_size or 0)
+    if available is None:
+        return True
+    evictable = getattr(getattr(scheduler, "tree_cache", None), "evictable_size", None)
+    room = available() + (int(evictable()) if evictable is not None else 0)
+    return room >= tokens + 2 * int(scheduler.chunked_prefill_size or 0)
 
 
 _YIELDS = [0]
@@ -82,7 +102,7 @@ def _get_new_batch_prefill_raw(original_fn, self, prefill_delayer_single_pass, r
     yielded_last = getattr(self, "_neuron_prefill_yielded", False)
     self._neuron_prefill_yielded = False
     mode = getattr(self.disaggregation_mode, "value", self.disaggregation_mode)
-    if (chunked is None or tokens <= 0 or yielded_last or not self.waiting_queue or str(mode) != "null"
+    if (chunked is None or tokens <= 0 or yielded_last or not self.waiting_queue or str(mode) not in ("null", "prefill")
             or _pipelined()):
         return original_fn(self, prefill_delayer_single_pass, running_batch)
     req = _short_request(self, tokens)
@@ -103,11 +123,27 @@ def _get_new_batch_prefill_raw(original_fn, self, prefill_delayer_single_pass, r
         raise RuntimeError(f"prefill yield: request {req.rid} became a chunked request beside {chunked.rid}")
     if batch is not None:
         self._neuron_prefill_yielded = True
+        batch.neuron_prefill_yield = True
         _YIELDS[0] += 1
         if _YIELDS[0] in (1, 10, 100) or _YIELDS[0] % 1000 == 0:
             logger.info("[neuron] prefill yield %d: %s (%d new tokens) ran before chunked %s's next chunk", _YIELDS[0],
                         req.rid, _uncached(req), chunked.rid)
     return batch, running_batch
+
+
+def _process_prefill_chunk(original_fn, self, last_batch, running_batch):
+    """A PD prefill's per-pass chunk step: after a yielding pass the chunked request ran no chunk, so it is hidden from
+    the step (no second checkpoint or send of its last chunk); the step still retires the short request's batch."""
+    if last_batch is None or not getattr(last_batch, "neuron_prefill_yield", False) or self.chunked_req is None:
+        return original_fn(self, last_batch=last_batch, running_batch=running_batch)
+    chunked, self.chunked_req = self.chunked_req, None
+    try:
+        return original_fn(self, last_batch=last_batch, running_batch=running_batch)
+    finally:
+        if self.chunked_req is not None:
+            raise RuntimeError(f"prefill yield: the chunk step set chunked request {self.chunked_req.rid} beside "
+                               f"{chunked.rid}")
+        self.chunked_req = chunked
 
 
 def register(registry, around) -> None:
@@ -117,3 +153,5 @@ def register(registry, around) -> None:
         return
     source_guard.check_targets(_TARGETS_MD5, __name__)
     registry.register(f"{_SCHEDULER}.Scheduler._get_new_batch_prefill_raw", _get_new_batch_prefill_raw, around)
+    registry.register(f"{_PREFILL}.SchedulerDisaggregationPrefillMixin.process_prefill_chunk", _process_prefill_chunk,
+                      around)
