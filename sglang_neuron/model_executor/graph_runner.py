@@ -220,6 +220,11 @@ class BucketConfig:
             # whole P_MAX attention tiles that split evenly over the attention TP ranks, at least two tokens a rank
             return tokens > attn_tp_size and tokens % attn_tp_size == 0 and tokens % P_MAX == 0
 
+        def ladder_fits(tokens):
+            # under DCP a prefill starts at a whole virtual page (kv_shards blocks), and so ends at one unless it is a
+            # prompt's last piece: a smaller bucket is a whole number of virtual pages
+            return fits(tokens) and tokens % (kv_shards * block_size) == 0
+
         if not prefill:
             prefill_buckets = []
         elif not fits(chunked_prefill_size):
@@ -227,7 +232,7 @@ class BucketConfig:
                              f"multiple of {P_MAX} and of the attention TP size ({attn_tp_size}), and above it")
         elif prefill_token_counts is None:
             prefill_buckets = sorted(t for t in SUPPORTED_KV_SEGMENT_SIZES
-                                     if prefill_ladder and t < chunked_prefill_size and fits(t))
+                                     if prefill_ladder and t < chunked_prefill_size and ladder_fits(t))
             prefill_buckets.append(chunked_prefill_size)
         else:
             # counts above the chunk never run: every forward is at most one chunk
@@ -1289,7 +1294,9 @@ class NeuronModelRuntime:
         """The serving device-profile window (SGLANG_NEURON_PROFILE_SERVE_*) a decode dispatch counts against, or None.
         Every decode dispatch counts, an idle DP rank's dummy and a non-last PP stage's too: the window's entry and exit
         are barriers every rank of the (stage's) TP group must reach on the same step."""
-        if phase != "decode" or not self._profile_serve:
+        # SGLANG_NEURON_PROFILE_SERVE_PHASE=prefill counts the prefill dispatches instead (an aggregated server's
+        # chunks, which every rank of the TP group runs)
+        if not self._profile_serve or phase != os.environ.get("SGLANG_NEURON_PROFILE_SERVE_PHASE", "decode"):
             return None
         if not hasattr(self, "_serving_capture"):
             from sglang_neuron.model_executor.profiling import ServingCapture, serve_label
