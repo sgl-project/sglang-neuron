@@ -255,6 +255,10 @@ def sampled_positions(positions: torch.Tensor, sampling_positions: torch.Tensor)
     return torch.index_select(positions.reshape(-1), 0, sampling_positions.reshape(-1).to(torch.int64))
 
 
+# RLKIT patch: read once at import (a launch constant, like MAX_TOP_LOGPROBS above), so the traced forward sees a bool
+_RLKIT_SAMPLER_KERNEL = os.environ.get("RLKIT_SAMPLER_KERNEL", "0").strip() == "1"
+
+
 def sample_sharded_logits(logits, group, rank, vocabulary_size, temperatures, row_keys,
                           top_logprobs=MAX_TOP_LOGPROBS):
     """Exact temperature sampling from vocabulary shards (Gumbel-max), plus logprobs.
@@ -277,6 +281,10 @@ def sample_sharded_logits(logits, group, rank, vocabulary_size, temperatures, ro
         raise ValueError("Packed float32 token IDs require a vocabulary smaller than 2**24")
     if not 0 <= top_logprobs <= logits.shape[-1]:
         raise ValueError("top_logprobs must fit in a local vocabulary shard")
+    if _RLKIT_SAMPLER_KERNEL:  # RLKIT patch: the shard-local stage as one NKI kernel (rlkit_sampler_kernel.py)
+        from sglang_neuron import rlkit_sampler_kernel
+        return rlkit_sampler_kernel.sample_sharded_logits_kernel(logits, group, rank, vocabulary_size, temperatures,
+                                                                 row_keys, top_logprobs)
     rows, width = logits.shape
     logits, sampled, inverse, score = _tempered_scores(logits, rank, vocabulary_size, temperatures, row_keys)
     value, local_id = _first_max(score)
