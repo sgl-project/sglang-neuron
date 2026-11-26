@@ -41,6 +41,10 @@ logger = logging.getLogger(__name__)
 
 _STATS = os.environ.get("SGLANG_NEURON_HICACHE_STATS", "0") == "1"
 _VERIFY = os.environ.get("SGLANG_NEURON_HICACHE_VERIFY", "0") == "1"
+# the most _BatchOp records one nrt_tensor_{read,write}_batch call takes (tensors x runs): the driver copies the whole
+# list into kernel memory, and a load of a long scattered prefix over a pool with many regions (Hy3: 242, its K, V
+# and sparse summaries) failed there with -12 (ENOMEM), which killed the server; a transfer splits its runs instead
+MAX_BATCH_OPS = 16384
 
 
 # ---- runtime library --------------------------------------------------------------------------------------------
@@ -350,8 +354,10 @@ class TransferEngine:
         if self.handles is None:  # CPU mode: host tensors stand in for the device
             job.ops = torch_page_copy(self.devt, self.host, job.runs, job.to_host)
             return
-        ops = batch_ops(job.runs, *self._op_cols)  # kept alive by this frame until the call returns
-        self._execute(job.to_host, ops)
+        step = max(1, MAX_BATCH_OPS // max(1, len(self.devt)))
+        for i in range(0, len(job.runs), step):
+            ops = batch_ops(job.runs[i:i + step], *self._op_cols)  # kept alive by this frame until the call returns
+            self._execute(job.to_host, ops)
         job.ops = len(self.devt) * len(job.runs)
 
     # -- completion (any thread) --
@@ -726,14 +732,16 @@ class NeuronPagedHostPool(HostKVCache):
 
 class NeuronHostKVPool(NeuronPagedHostPool):
     """The host copy of a Neuron MHA pool (NeuronMHATokenToKVPoolKind), for HiCache L2: every layer's K, then every
-    layer's V."""
+    layer's V, then the page side buffers a model keeps next to those K caches (memory_pool.PAGE_SIDE_BUFFERS: Hy3's
+    sparse page summaries), so a page loaded back carries its own side rows rather than whatever its device slot held
+    last."""
 
     remote_dram_tier = True
 
     def __init__(self, buffer_info, host_to_device_ratio, host_size, page_size, layout, pin_memory=True,
                  device="cpu", allocator_type="default", *, device_capacity_tokens, start_layer, end_layer,
                  draft_buffer_infos=(), write_back_staging=None, pool_label: str = "kv", head_group_num: int = 1,
-                 unit_tokens=None):
+                 unit_tokens=None, dcp_size=None, dcp_rank=None):
         if draft_buffer_infos or write_back_staging is not None:
             raise ValueError("Neuron HiCache keeps no draft KV and no write-back staging")
         self.check_allocator(allocator_type, pool_label)
@@ -748,11 +756,43 @@ class NeuronHostKVPool(NeuronPagedHostPool):
             unit = int(unit_tokens)
         else:
             unit = k[0][0].numel() // max(1, int(self.head_num) * int(self.head_dim)) if len(k) else page_size
-        super().__init__(k + v, dtype=buffer_info.dtype, page_size=page_size, layer_num=len(k),
+        # DCP (Hy3's prefill under --dcp-size): an allocator page is a virtual page of one block on every DCP rank,
+        # this rank's block of page i in row i (memory_pool.py), as on the MLA pool: the unit is the virtual page,
+        # whose row holds unit / dcp of this rank's tokens (hybrid_host_pool.NeuronHostMLAPool)
+        # the assembler passes them under DCP (hybrid_host_pool._mha_dcp_builder); else this rank's, if any
+        dcp, dcp_rank = (int(dcp_size), int(dcp_rank or 0)) if dcp_size else _dcp_of_pool(buffer_info)
+        if dcp > 1:
+            unit *= dcp
+            if page_size % unit:
+                raise ValueError(f"HiCache over a DCP{dcp} MHA pool: the host page of {page_size} tokens is not whole "
+                                 f"virtual pages of {unit} tokens (a {unit // dcp}-token block on each DCP rank)")
+        super().__init__(k + v + _side_buffers(k), dtype=buffer_info.dtype, page_size=page_size, layer_num=len(k),
                          device_capacity_tokens=device_capacity_tokens, start_layer=start_layer, end_layer=end_layer,
                          host_to_device_ratio=host_to_device_ratio, host_size=host_size, layout=layout,
-                         allocator_type=allocator_type, pool_label=pool_label,
+                         allocator_type=allocator_type, pool_label=pool_label, dcp_size=dcp, dcp_rank=dcp_rank,
                          unit=unit if unit and page_size % unit == 0 and unit < page_size else None)
+
+
+def _dcp_of_pool(buffer_info) -> tuple:
+    """(DCP size, DCP rank) of a DCP-sharded MHA pool's host copy, (1, 0) otherwise (and under token CP, whose rows
+    NeuronCpHostKVPool handles)."""
+    from sglang.srt.runtime_context import get_parallel
+
+    parallel = get_parallel()
+    if not getattr(parallel, "dcp_enabled", False) or 0 < _row_tokens(buffer_info) < buffer_info.page_size:
+        return 1, 0
+    return int(parallel.attn_dcp_size), int(parallel.attn_dcp_rank)
+
+
+def _side_buffers(k_buffers: list) -> list:
+    """The page side buffers (memory_pool.PAGE_SIDE_BUFFERS) of the K caches ``k_buffers``, in their providers' order:
+    each a page-first tensor of the pool's page count, which the host pool keeps as one more region."""
+    import types
+
+    from sglang_neuron.mem_cache import memory_pool
+
+    return [side for provider in memory_pool.PAGE_SIDE_BUFFERS for _, side in provider(types.SimpleNamespace(
+        k_buffer=k_buffers))]
 
 
 def _row_tokens(buffer_info) -> int:

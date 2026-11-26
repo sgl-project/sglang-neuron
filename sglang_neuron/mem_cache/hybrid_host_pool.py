@@ -188,6 +188,11 @@ def kv_host_pool(original, *, kv_pool, page_size, use_mla=None, override_kv_cach
     from sglang_neuron.mem_cache.memory_pool import NeuronMLATokenToKVPool
 
     if not isinstance(kv_pool, NeuronMLATokenToKVPool):
+        if get_parallel().dcp_enabled and getattr(kv_pool, "dcp", None) is not None:
+            # a DCP-sharded Neuron MHA pool (Hy3's prefill): upstream's builder with its MLA-only DCP assertion widened
+            # to it; it passes the DCP size and rank to host_pool.NeuronHostKVPool, which keeps the pages as the MLA
+            # host pool does
+            original = _mha_dcp_builder(original)
         return original(kv_pool=kv_pool, page_size=page_size, use_mla=use_mla,
                         override_kv_cache_dim=override_kv_cache_dim, host_size=host_size,
                         mtp_draft_device_pools=mtp_draft_device_pools, pool_label=pool_label)
@@ -200,6 +205,22 @@ def kv_host_pool(original, *, kv_pool, page_size, use_mla=None, override_kv_cach
                              device_capacity_tokens=kv_pool.size if kv_pool.host_capacity_tokens is None
                              else kv_pool.host_capacity_tokens,
                              allocator_type=hybrid_pool_assembler._get_allocator_type(), pool_label=pool_label)
+
+
+_MHA_DCP_BUILDER = []
+
+
+def _mha_dcp_builder(original):
+    """hybrid_pool_assembler.build_kv_host_pool rebuilt with its "HiCache + DCP is only wired for the MLA host pool"
+    assertion passing a DCP-sharded Neuron MHA pool too (memory_pool.NeuronMHATokenToKVPool with ``dcp``)."""
+    import inspect
+
+    from sglang_neuron.sglang_patches import source_guard
+
+    if not _MHA_DCP_BUILDER:
+        _MHA_DCP_BUILDER.append(source_guard.with_substitutions(inspect.unwrap(original), [(
+            "assert use_mla, (", "assert use_mla or getattr(kv_pool, 'dcp', None) is not None, (")]))
+    return _MHA_DCP_BUILDER[0]
 
 
 def state_host_pool(original, mamba_pool, pool_info, *, host_size, layout, mtp_draft_device_pools=()):

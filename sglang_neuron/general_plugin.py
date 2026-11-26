@@ -300,6 +300,10 @@ def _register_launch_hooks() -> None:
     from sglang_neuron.sglang_patches import dsa_platform_adjustments
 
     dsa_platform_adjustments.register(HookRegistry, HookType.AROUND)
+    # HiCache over a DCP-sharded MHA pool (Hy3's prefill): the Neuron host pool translates DCP pages itself
+    from sglang_neuron.sglang_patches import hicache_dcp_mha
+
+    hicache_dcp_mha.register(HookRegistry, HookType.AROUND)
     HookRegistry.register(f"{_TOKENIZER}._validate_one_request", _validate_request, HookType.AROUND)
     # the served model's own sampling values for a chat request (launch hooks chat_sampling_params; the Kimi-K3 API's)
     from sglang_neuron.sglang_patches import model_chat_sampling
@@ -411,6 +415,10 @@ def _register() -> None:
     from sglang_neuron.sglang_patches import chunk_keyed_tree, decode_graph_buckets, prefill_chunk_grid
 
     prefill_chunk_grid.register(HookRegistry, HookType.AROUND, HookType.REPLACE)
+    from sglang_neuron.sglang_patches import prefill_yield
+
+    # a short prompt's prefill between two chunks of a long one (SGLANG_NEURON_PREFILL_YIELD)
+    prefill_yield.register(HookRegistry, HookType.AROUND)
     if policy.megakernel:
         # a megakernel decode's capture list is the runtime's own buckets (its warm captures), not upstream's
         # attention-TP-aligned subset — a per-layer model keeps upstream's

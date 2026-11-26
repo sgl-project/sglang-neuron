@@ -80,8 +80,13 @@ NEURON_SEND_LOOKUP = (
     "    assert peer_name in self.prep_handles_slice_dst\n"
     "    dst_handle, num_slots_dst, head_group_idx, grouping = self.prep_handles_slice_dst[peer_name]\n"
     "    src_handle, num_groups, num_ptr_pairs, num_slots_src = self.neuron_slice_srcs[grouping]\n")
+# a prefill whose ranks replicate their KV heads too (Hy3's 8 heads at TP32 feeding a TP64 decode, one head a rank on
+# both sides) sends each decode rank its rank's whole page, one group; upstream's count is then 64 // 32 // 8 = 0
+UPSTREAM_NUM_GROUPS = "        num_groups = decode_tp_size // prefill_tp_size // dst_replication\n"
+NEURON_NUM_GROUPS = "        num_groups = max(1, decode_tp_size // prefill_tp_size // dst_replication)\n"
 PREP_HANDLE_SUBSTITUTIONS = (
     (UPSTREAM_PAGE_SIZE, NEURON_PAGE_SIZE),
+    (UPSTREAM_NUM_GROUPS, NEURON_NUM_GROUPS),
     (UPSTREAM_SRC_ITEM_LEN, UPSTREAM_SRC_ITEM_LEN + PER_HEAD_BYTES_CHECK),
     (UPSTREAM_SHARED_SRC, NEURON_SRC_PER_GROUPING),
     (UPSTREAM_SRC_STORE, NEURON_SRC_STORE),
