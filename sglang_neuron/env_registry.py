@@ -25,6 +25,16 @@ KNOBS: dict = {
     "SGLANG_NEURON_MAX_TOP_LOGPROBS": CONFIG,
     # GPT-OSS's expert numeric format (models/gpt_oss/config.expert_format)
     "SGLANG_NEURON_GPT_OSS_EXPERTS": CONFIG,
+    # Hy3's FP8 KV scale profile (models/hy_v3/kv_scales.py)
+    "SGLANG_NEURON_HY3_KV_SCALES": CONFIG,
+    # Hy3's block-sparse decode under DCP: the fraction of a decode table's pages a step attends to (models/hy_v3/sparse.py)
+    "SGLANG_NEURON_HY3_SPARSE_DECODE": CONFIG,
+    # a short prompt's prefill between two chunks of a long one (sglang_patches/prefill_yield)
+    "SGLANG_NEURON_PREFILL_YIELD": CONFIG,
+    # a Hy3 PD prefill writes the MTP layer's KV for its NEURON_MTP decode (models/hy_v3/mtp.py)
+    "SGLANG_NEURON_HY3_PD_MTP_KV": CONFIG,
+    # a PD decode's prefill DCP size, for the MHA stripe hand-off (sglang_patches/dcp_page_transfer.py)
+    "SGLANG_NEURON_PD_PREFILL_DCP": CONFIG,
     # GLM-5.2 (models/glm52): the decode's weight store, the prefill's MTP rows for a drafting decode, the decode
     # point, the benchmark's pinned MTP acceptance and the decode's FP8 attention weights
     "SGLANG_NEURON_GLM52_WEIGHT_STORE": CONFIG,
@@ -105,7 +115,7 @@ KNOBS: dict = {
     "SGLANG_NEURON_PROFILE_DIR": DEBUG,
     "SGLANG_NEURON_PROFILE_RANKS": DEBUG,
     "SGLANG_NEURON_PROFILE_DEVICE_MODE": DEBUG,
-    **{f"SGLANG_NEURON_PROFILE_SERVE_{field}": DEBUG for field in ("RANKS", "START", "STEPS")},
+    **{f"SGLANG_NEURON_PROFILE_SERVE_{field}": DEBUG for field in ("RANKS", "START", "STEPS", "PHASE")},
     # the SGLang Diffusion platform (sglang_neuron/diffusion/envs.py; docs/model-recipes/flux1-dev.md)
     "SGLANG_NEURON_REQUIRE_NKI_KERNELS": DEBUG,
     "SGLANG_NEURON_DISABLE_NKI_KERNELS": DEBUG,

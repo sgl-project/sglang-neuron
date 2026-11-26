@@ -24,17 +24,22 @@ def gen_attention_decode_mask(pos_ids: Tensor, *, bs: int, q_head: int, s_active
     """The [s_prior, bs, q_head, s_active] 0/1 mask of a decode step over a paged prior of ``s_prior`` slots.
 
     ``pos_ids`` [1, bs * s_active] ends each row's prior (exclusive) and ``start_pos``, for a sliding window, starts it.
-    The step's own tokens sit in the last ``s_active`` slots and see each other causally. ``active_gate`` [bs] (DCP,
-    one token a row) is 1 where this rank keeps the row's new token, so the group's merge counts it once.
+    The step's own tokens sit in the last ``s_active`` slots and see each other causally. ``active_gate`` (DCP) is 1
+    where this rank keeps a step's token, so the group's merge counts it once: [bs] for one token a row, or
+    [bs, s_active] for a span of tokens (a speculative verify), whose tokens can have different owners.
     """
     if s_prior % P_MAX:
         raise ValueError(f"the decode mask's prior ({s_prior}) must be a multiple of {P_MAX}")
     active = torch.triu(torch.ones(s_active, s_active, dtype=torch.float32, device=pos_ids.device))
     active_mask = active[:, None, None, :].expand(s_active, bs, q_head, s_active)
     if active_gate is not None:
-        if s_active != 1:
-            raise ValueError("decode context parallelism decodes one token a row")
-        active_mask = active_mask * active_gate.to(torch.float32).reshape(1, bs, 1, 1)
+        gate = active_gate.to(torch.float32)
+        if gate.numel() == bs:
+            if s_active != 1:
+                raise ValueError(f"a span of {s_active} tokens a row takes a [bs, {s_active}] active gate")
+            gate = gate.reshape(bs, 1)
+        # the gate of key token k: active_mask[k, b, :, q] is key k's visibility to query q
+        active_mask = active_mask * gate.reshape(bs, s_active).t().reshape(s_active, bs, 1, 1)
     active_mask = active_mask.contiguous()
     if can_run_kernel(pos_ids):
         return wrap_nki(_gen_mask_tkg_hbm)[get_logical_nc_config()](
@@ -59,6 +64,19 @@ def resize_block_len(block_len: int, bs: int, q_head: int, s_active: int, s_prio
         return block_len
     # nkilib's resize, without its prints (not traceable)
     return math.gcd(block_len, bucket_len // partitions)
+
+
+def qk_swap_layout(mask: Tensor, *, d_head: int, fp8_kv: bool, fp8_packed: bool, kv_heads: int = 1) -> Tensor:
+    """``mask`` [s_prior, bs, q_head, s_active] (gen_attention_decode_mask) in the layout attention_block_tkg takes
+    for it: as it is, or [bs, q_head, s_active, s_prior] where the kernel takes its transposed-score (QK-swap) path for
+    the shape, which nkilib's is_qk_swapped decides (a span of tokens a row, as a speculative verify, can take it)."""
+    from nkilib.core.attention.attention_tkg_utils import is_qk_swapped
+
+    s_prior, bs, q_head, s_active = (int(d) for d in mask.shape)
+    swapped = is_qk_swapped(bs=bs, q_head=q_head, d_head=d_head, s_active=s_active, curr_sprior=s_prior,
+                            lnc=get_logical_nc_config(), p_max=P_MAX, is_block_kv=True, is_2byte_kv=not fp8_kv,
+                            fp8_packed=fp8_packed, fuse_rope=False, kv_heads=kv_heads)
+    return mask.permute(1, 2, 3, 0).contiguous() if swapped else mask
 
 
 def _torch_gen_attention_decode_mask(pos_ids, bs, q_head, s_active, s_prior, start_pos, block_len, active_mask):
