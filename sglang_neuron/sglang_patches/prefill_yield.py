@@ -123,6 +123,11 @@ def _get_new_batch_prefill_raw(original_fn, self, prefill_delayer_single_pass, r
         # continues, this pass
         self.chunked_req, self._neuron_prefill_suspended = suspended, None
         self._neuron_prefill_yielded = False
+        if suspended.finished() or getattr(self, "_pending_chunked_abort_req", None) is suspended:
+            # it was aborted (or its transfer failed) while suspended: upstream's chunked-request teardown releases it
+            # (its KV, metadata buffer and pending sends), never a checkpoint of a finished request
+            self._pending_chunked_abort_req = suspended
+            self.process_pending_chunked_abort()
         return original_fn(self, prefill_delayer_single_pass, running_batch)
     chunked = self.chunked_req
     tokens = limit()
@@ -179,6 +184,12 @@ def _note(req, chunked, what: str) -> None:
 def _process_prefill_chunk(original_fn, self, last_batch, running_batch):
     """A PD prefill's per-pass chunk step: after a yielding pass the chunked request ran no chunk, so it is hidden from
     the step (no second checkpoint or send of its last chunk); the step still retires the short request's batch."""
+    req = self.chunked_req
+    if req is not None and req.finished() and getattr(self, "_pending_chunked_abort_req", None) is None:
+        # a chunked request that finished outside a step (aborted, or its transfer failed, while suspended or set aside)
+        # goes through upstream's teardown, never the step's checkpoint (which asserts on a finished request)
+        self._pending_chunked_abort_req = req
+        self.process_pending_chunked_abort()
     if last_batch is None or not getattr(last_batch, "neuron_prefill_yield", False) or self.chunked_req is None:
         return original_fn(self, last_batch=last_batch, running_batch=running_batch)
     chunked, self.chunked_req = self.chunked_req, None
@@ -191,6 +202,16 @@ def _process_prefill_chunk(original_fn, self, last_batch, running_batch):
         self.chunked_req = chunked
 
 
+def _abort_request(original_fn, self, recv_req):
+    """Scheduler.abort_request: a suspended chunked request is in no queue upstream looks at, so an abort of it would be
+    lost; mark it as the pending chunked abort, which the pass that resumes it tears down."""
+    out = original_fn(self, recv_req)
+    suspended = getattr(self, "_neuron_prefill_suspended", None)
+    if suspended is not None and (getattr(recv_req, "abort_all", False) or suspended.rid.startswith(recv_req.rid)):
+        self._pending_chunked_abort_req = suspended
+    return out
+
+
 def register(registry, around) -> None:
     from sglang_neuron.sglang_patches import source_guard
 
@@ -200,3 +221,4 @@ def register(registry, around) -> None:
     registry.register(f"{_SCHEDULER}.Scheduler._get_new_batch_prefill_raw", _get_new_batch_prefill_raw, around)
     registry.register(f"{_PREFILL}.SchedulerDisaggregationPrefillMixin.process_prefill_chunk", _process_prefill_chunk,
                       around)
+    registry.register(f"{_SCHEDULER}.Scheduler.abort_request", _abort_request, around)

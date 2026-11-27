@@ -113,6 +113,8 @@ server with the FP8 cache, the same KV scale profile and the same `SGLANG_NEURON
   `--max-running-requests 16`, `--max-total-tokens 262144`.
   `--disaggregation-decode-enable-radix-cache` keeps finished prompts on the decode, so a returning prefix moves
   only its new pages (D-only replay of 85k-token prompts at C=8: TTFT 0.73 -> 0.63 s, TPOT unchanged; GSM8K 0.94 / 0.96).
+  Leave it off under AgentX: the decode's pool, already near full, then also holds finished prompts, and the hour at
+  c=16 lost throughput (381.7 against 433.6 tok/s) and metric coverage (20 requests still in flight at the end).
 - both: `--disaggregation-transfer-backend nixl` (LIBFABRIC over EFA), the prefill's `--disaggregation-bootstrap-port`.
 
 Put the balancer in front, as for [Qwen3-MoE](qwen3-moe.md#serving), with one `--bootstrap-port` per `--prefill` and
