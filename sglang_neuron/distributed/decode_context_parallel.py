@@ -164,10 +164,9 @@ def dcp_launch_problems(server_args, architecture: str, spec) -> list:
     if backend not in (None, "ag_rs"):
         problems.append(f"--dcp-comm-backend {backend}: the Neuron decode kernel runs its own DCP collectives; launch "
                         "without the flag")
-    if role == "decode" and getattr(server_args, "disaggregation_decode_enable_radix_cache", False):
-        problems.append("--disaggregation-decode-enable-radix-cache: no run covers the decode radix cache under DCP, "
-                        "where SGLang pages the tree at the virtual page and the prefill sends each DCP rank its pages "
-                        "after the decode's prefix")
+    # --disaggregation-decode-enable-radix-cache: SGLang pages the decode's tree at the virtual page (page x DCP size),
+    # and the prefill sends each DCP rank only its pages after the decode's prefix (dcp_page_transfer._prefix_pages,
+    # dcp_stripes.ChunkStripes)
     from sglang_neuron import sglang_tree
 
     # a DCP group is ranks of one attention TP group (--tp-size over the DP-attention groups); each scheduler checks it

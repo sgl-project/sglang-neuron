@@ -111,6 +111,8 @@ server with the FP8 cache, the same KV scale profile and the same `SGLANG_NEURON
   writes, and the transfer and HiCache move them with their pages (`memory_pool.PAGE_SIDE_BUFFERS`).
 - decode: TP64 `--dcp-size 8` `NEURON_MTP`, `--disaggregation-mode decode`, `--cuda-graph-bs-decode 4 8 12 16`,
   `--max-running-requests 16`, `--max-total-tokens 262144`.
+  `--disaggregation-decode-enable-radix-cache` keeps finished prompts on the decode, so a returning prefix moves
+  only its new pages (D-only replay of 85k-token prompts at C=8: TTFT 0.73 -> 0.63 s, TPOT unchanged; GSM8K 0.94 / 0.96).
 - both: `--disaggregation-transfer-backend nixl` (LIBFABRIC over EFA), the prefill's `--disaggregation-bootstrap-port`.
 
 Put the balancer in front, as for [Qwen3-MoE](qwen3-moe.md#serving), with one `--bootstrap-port` per `--prefill` and
