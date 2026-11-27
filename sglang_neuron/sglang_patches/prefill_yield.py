@@ -10,12 +10,15 @@ several times their own prefill).
 
 Here, ``Scheduler._get_new_batch_prefill_raw`` (wrapped): when a request is chunked, the pass before the chunked
 request's next chunk is given instead to the first waiting request (of the first ``_SCAN``, in queue order) whose
-uncached tokens fit ``SGLANG_NEURON_PREFILL_YIELD`` (at most one chunk, so it prefills in this one forward and never
-becomes a second chunked request). The pass runs upstream's builder with the chunked request set aside and the waiting
-queue narrowed to that request, so the batch carries no chunked request (the chunked request counts no middle chunk
-for it, and its result is a whole prompt's). The chunked request was checkpointed after its last chunk
-(``checkpoint_kv_cache`` sets its prefix to its extend end), so setting it back resumes it where it stopped. The next
-pass always continues the chunked request: a long prompt prefills at no less than half its speed.
+uncached tokens fit ``SGLANG_NEURON_PREFILL_YIELD``. The pass runs upstream's builder with the chunked request set aside
+and the waiting queue narrowed to that request. The chunked request was checkpointed after its last chunk
+(``checkpoint_kv_cache`` sets its prefix to its extend end), so setting it back resumes it where it stopped.
+
+- A request of at most one chunk prefills whole in that pass (the batch carries no chunked request, and its result is
+  a whole prompt's); the next pass always continues the chunked request.
+- A longer one (up to the limit, e.g. 8192 tokens = 4 chunks of 2048) takes over as the chunked request: the long one
+  is suspended, the short one prefills chunk by chunk to its end, and the pass after its last chunk resumes the long
+  one. No yield happens while one is suspended, so requests never nest deeper than one.
 
 A pass yields only with room in the KV pool for the short request and a chunk beside it. Off (0) by default; a PD
 decode server or a pipelined one never yields.
@@ -53,16 +56,33 @@ def limit() -> int:
     return int(raw)
 
 
-def _short_request(scheduler, tokens: int):
-    """The first of the first _SCAN waiting requests whose uncached tokens fit ``tokens`` (its prefix matched as the
-    builder matches it, Req.init_next_round_input), or None."""
-    for req in scheduler.waiting_queue[:_SCAN]:
+def _short_request(scheduler, tokens: int) -> int:
+    """The queue index of the first of the first _SCAN waiting requests whose uncached tokens fit ``tokens`` (its prefix
+    matched as the builder matches it, Req.init_next_round_input) and the KV pool's room (_room), or -1."""
+    for i, req in enumerate(scheduler.waiting_queue[:_SCAN]):
         if getattr(req, "grammar", None) is not None or req.finished():
             continue
         req.init_next_round_input(scheduler.tree_cache)
         if 0 < _uncached(req) <= tokens:
-            return req
-    return None
+            return i if _room(scheduler, _uncached(req)) else -1
+    return -1
+
+
+def _agreed(scheduler, index: int) -> int:
+    """``index`` if every TP rank chose the same one, else -1. Each rank's choice reads its own KV pool, and under DCP the
+    ranks' pools differ (a rank owns every D-th page), so ranks could choose differently and build different batches,
+    which hangs the TP collectives (the scheduler watchdog fired with one rank's batch empty and another's not). One
+    MIN all-reduce of (index, -index) over the TP CPU group gives the lowest and the highest choice."""
+    import torch
+    import torch.distributed as dist
+
+    group = getattr(scheduler, "tp_cpu_group", None)
+    if group is None or not dist.is_initialized() or dist.get_world_size(group) == 1:
+        return index
+    both = torch.tensor([index, -index], dtype=torch.int64)
+    dist.all_reduce(both, op=dist.ReduceOp.MIN, group=group)
+    low, high = int(both[0]), -int(both[1])
+    return index if low == high else -1
 
 
 def _uncached(req) -> int:
@@ -97,38 +117,63 @@ def _pipelined() -> bool:
 
 
 def _get_new_batch_prefill_raw(original_fn, self, prefill_delayer_single_pass, running_batch):
+    suspended = getattr(self, "_neuron_prefill_suspended", None)
+    if suspended is not None and self.chunked_req is None:
+        # the turn that took over a chunked request's turn (below) prefilled its last chunk: the suspended request
+        # continues, this pass
+        self.chunked_req, self._neuron_prefill_suspended = suspended, None
+        self._neuron_prefill_yielded = False
+        return original_fn(self, prefill_delayer_single_pass, running_batch)
     chunked = self.chunked_req
-    tokens = min(limit(), int(self.chunked_prefill_size or 0))
+    tokens = limit()
+    chunk = int(self.chunked_prefill_size or 0)
     yielded_last = getattr(self, "_neuron_prefill_yielded", False)
     self._neuron_prefill_yielded = False
     mode = getattr(self.disaggregation_mode, "value", self.disaggregation_mode)
-    if (chunked is None or tokens <= 0 or yielded_last or not self.waiting_queue or str(mode) not in ("null", "prefill")
-            or _pipelined()):
+    if (chunked is None or suspended is not None or tokens <= 0 or chunk <= 0 or yielded_last or not self.waiting_queue
+            or str(mode) not in ("null", "prefill") or _pipelined()):
         return original_fn(self, prefill_delayer_single_pass, running_batch)
-    req = _short_request(self, tokens)
-    if req is None or not _room(self, _uncached(req)):
+    # every rank reaches this point together (the conditions above follow the broadcast requests and the agreed
+    # history), so every rank takes part in the agreement
+    index = _agreed(self, _short_request(self, tokens))
+    if index < 0:
         return original_fn(self, prefill_delayer_single_pass, running_batch)
+    req = self.waiting_queue[index]
     queue = self.waiting_queue
     self.waiting_queue, self.chunked_req = [req], None
     try:
         batch, running_batch = original_fn(self, prefill_delayer_single_pass, running_batch)
-    finally:
-        started = self.chunked_req
-        left = self.waiting_queue  # req if the pass did not admit it, and any request it requeued
+    except BaseException:
         self.chunked_req = chunked
+        raise
+    finally:
+        left = self.waiting_queue  # req if the pass did not admit it, and any request it requeued
         kept = set(map(id, queue))
         self.waiting_queue = [r for r in queue if r is not req or req in left] + [r for r in left if id(r) not in kept]
-    if started is not None:
-        # req fit one chunk, so the builder cannot have chunked it; two chunked requests would lose one
-        raise RuntimeError(f"prefill yield: request {req.rid} became a chunked request beside {chunked.rid}")
-    if batch is not None:
-        self._neuron_prefill_yielded = True
-        batch.neuron_prefill_yield = True
-        _YIELDS[0] += 1
-        if _YIELDS[0] in (1, 10, 100) or _YIELDS[0] % 1000 == 0:
-            logger.info("[neuron] prefill yield %d: %s (%d new tokens) ran before chunked %s's next chunk", _YIELDS[0],
-                        req.rid, _uncached(req), chunked.rid)
+    started = self.chunked_req
+    if started is None:
+        # req prefilled whole in this pass: the chunked request continues next pass
+        self.chunked_req = chunked
+        if batch is not None:
+            self._neuron_prefill_yielded = True
+            batch.neuron_prefill_yield = True
+            _note(req, chunked, "ran before")
+    elif started is req:
+        # req needs more than one chunk: it takes over as the chunked request until its last chunk, the long one
+        # suspended where its last chunk left it (checkpointed, its KV held) and continued right after
+        self._neuron_prefill_suspended = chunked
+        _note(req, chunked, "took over from")
+    else:
+        self.chunked_req = chunked
+        raise RuntimeError(f"prefill yield: request {started.rid} became a chunked request beside {chunked.rid}")
     return batch, running_batch
+
+
+def _note(req, chunked, what: str) -> None:
+    _YIELDS[0] += 1
+    if _YIELDS[0] in (1, 10, 100) or _YIELDS[0] % 1000 == 0:
+        logger.info("[neuron] prefill yield %d: %s (%d new tokens) %s chunked %s", _YIELDS[0], req.rid, _uncached(req),
+                    what, chunked.rid)
 
 
 def _process_prefill_chunk(original_fn, self, last_batch, running_batch):
