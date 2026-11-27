@@ -58,7 +58,16 @@ _IGNORED_SERVER_ARGS = frozenset({
     "hicache_size", "hicache_ratio", "hicache_host_memory_fraction", "hicache_write_policy",
     "hicache_storage_prefetch_policy", "hicache_storage_prefetch_retry_poll_interval",
     "hicache_storage_prefetch_retry_max_attempts", "radix_eviction_policy",
+    # how a PD pair moves its KV and whether the decode keeps finished prompts: the wire and the tree, not a graph
+    "disaggregation_transfer_backend", "disaggregation_decode_enable_radix_cache",
+    "disaggregation_decode_polling_interval",
 })
+# plugin sources that run on the host around the scheduler and never in or around a traced graph: the PD KV transfer
+# (its managers, wire formats and pairings) and the scheduler-only patches. An edit there leaves every graph as it was;
+# a traced frame's own source stays guarded by dynamo either way.
+_HOST_ONLY_SOURCES = ("disaggregation/",)
+_HOST_ONLY_PATCHES = ("nixl_", "dcp_page_transfer", "kv_cp_scatter", "pp_decode_stage_transfer", "prefill_yield",
+                      "decode_radix_mtp", "hicache_dcp_mha", "scheduler_metrics_rank0")
 # environment switches of the same kind: the scheduler's choices and what a launch records (SGLANG_NEURON_PROFILE_*)
 _IGNORED_ENV_PREFIXES = ("SGLANG_NEURON_PROFILE_", "SGLANG_NEURON_PREFILL_YIELD", "SGLANG_NEURON_HOST_TRACE")
 
@@ -160,14 +169,19 @@ def _version(dist: str) -> str:
 
 
 def _plugin_sources_digest() -> str:
-    """The plugin's Python sources, every file: a traced function's source is checked by dynamo only for the frames it
-    inlined, and the code around a graph (its inputs' layout, its wrappers) shapes it too."""
+    """The plugin's Python sources, every file but the host-only ones (``_HOST_ONLY_SOURCES``, ``_HOST_ONLY_PATCHES``): a
+    traced function's source is checked by dynamo only for the frames it inlined, and the code around a graph (its
+    inputs' layout, its wrappers) shapes it too."""
     from sglang_neuron.backend.compile_cache import PLUGIN_ROOT
 
     digest = hashlib.sha256()
     package = PLUGIN_ROOT / "sglang_neuron"
     for path in sorted(package.rglob("*.py")):
-        digest.update(str(path.relative_to(package)).encode())
+        rel = path.relative_to(package).as_posix()
+        if rel.startswith(_HOST_ONLY_SOURCES) or (rel.startswith("sglang_patches/")
+                                                   and path.name.startswith(_HOST_ONLY_PATCHES)):
+            continue
+        digest.update(rel.encode())
         digest.update(path.read_bytes())
     return digest.hexdigest()
 
