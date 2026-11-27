@@ -109,8 +109,66 @@ def refuse_head_slice(original_fn, self, mooncake_session_id, prefill_kv_indices
     return 1
 
 
+# The Neuron driver gives EFA 2 MiB pages for a registration only when it is at least 256 MiB
+# (NEURON_P2P_HUGE_PAGE_SZ_USAGE_THRESHOLD) and its length, VA and PA are 2 MiB-aligned; anything else is mapped at
+# 4 KiB pages. A Hy3 rank's pool is 242 buffers of tens of MiB each, so one registration per buffer put every byte of
+# HBM on the NICs at 4 KiB pages: the NIC page tables and the kernel memory behind them filled (DEREG_MR -22 in dmesg,
+# and a HiCache load-back's driver batch copy failing with -12 under load). One span per /dev/neuron mapping, 2 MiB
+# aligned and at least 256 MiB, takes 2 MiB pages; every buffer lies inside its span, so every transfer address is
+# registered.
+_HUGE = 2 << 20
+_HUGE_MIN = 256 << 20
+
+
+def _neuron_vmas() -> list:
+    out = []
+    with open("/proc/self/maps") as f:
+        for line in f:
+            if "/dev/neuron" in line:
+                a, b = (int(x, 16) for x in line.split()[0].split("-"))
+                out.append((a, b))
+    return sorted(out)
+
+
+def coalesce_neuron_regions(regions: list) -> list:
+    """(ptr, len) regions with the Neuron HBM ones replaced by one 2 MiB-aligned span per /dev/neuron mapping (host
+    regions unchanged)."""
+    vmas = _neuron_vmas()
+    spans: dict = {}
+    out = []
+    for ptr, length in regions:
+        vma = next((v for v in vmas if v[0] <= ptr and ptr + length <= v[1]), None)
+        if vma is None:
+            out.append((ptr, length))
+            continue
+        lo, hi = spans.get(vma, (ptr, ptr + length))
+        spans[vma] = (min(lo, ptr), max(hi, ptr + length))
+    for (va, vb), (lo, hi) in sorted(spans.items()):
+        lo, hi = max(va, lo // _HUGE * _HUGE), min(vb, -(-hi // _HUGE) * _HUGE)
+        if hi - lo < _HUGE_MIN:
+            hi = min(vb, lo + _HUGE_MIN)
+            lo = max(va, hi - _HUGE_MIN)
+        out.append((lo, hi - lo))
+    return out
+
+
+def registerable_regions(original_fn, self, *args, **kwargs):
+    """AROUND MooncakeKVManager._registerable_regions: the Neuron HBM regions as one span per /dev/neuron mapping, for
+    both the registration and the deregistration (coalesce_neuron_regions)."""
+    regions = original_fn(self, *args, **kwargs)
+    coalesced = coalesce_neuron_regions(regions)
+    if not getattr(self, "_neuron_coalesce_logged", False):
+        self._neuron_coalesce_logged = True
+        logger.info("[neuron] Mooncake: %d regions registered as %d (%.1f GiB of Neuron HBM in %d span(s))",
+                    len(regions), len(coalesced),
+                    sum(n for p, n in coalesced if (p, n) not in regions) / (1 << 30),
+                    sum(1 for r in coalesced if r not in regions))
+    return coalesced
+
+
 def register_hooks(registry, around) -> None:
     from sglang_neuron.sglang_patches import source_guard
 
     source_guard.check_targets(_TARGETS_MD5, __name__)
     registry.register(f"{_CONN}.{_SEND_SLICE}", refuse_head_slice, around)
+    registry.register(f"{_CONN}.MooncakeKVManager._registerable_regions", registerable_regions, around)
