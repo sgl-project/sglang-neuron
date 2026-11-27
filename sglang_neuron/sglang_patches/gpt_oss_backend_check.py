@@ -7,7 +7,7 @@ whose two backends are both ``neuron``, the module swaps ``attention_backends_of
 the backends through) for one that answers a listed backend, for that one call only. Any other launch runs the
 adjustment unchanged. The server arguments are never modified.
 
-The wrapped target is md5-pinned against upstream SGLang 43881a7.
+The source guard covers the model-specific adjustment that performs the check.
 
 Upstream: SGLang's GPT-OSS check could accept the attention backend an out-of-tree platform registers; this module
 then goes away.
@@ -19,7 +19,7 @@ import contextlib
 import importlib
 
 TARGET = "sglang.srt.arg_groups.model_hook.handle_model_specific_adjustments"
-_TARGET_MD5 = "a735fb8d579c5fb17e107828e2546b4b"
+_TARGET_MD5 = "5dfa26e67b1cbb3ae0c340fd43dd1d16"
 # a listed backend; on a GPT-OSS launch the adjustment reads the backends for this check only
 _LISTED = ("triton", "triton")
 

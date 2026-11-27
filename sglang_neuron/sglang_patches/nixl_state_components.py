@@ -33,7 +33,7 @@ other two.
 
 Upstream: a generic refusal at registration, where upstream fails the same pairing at each request's last chunk.
 
-Targets, each checked against upstream SGLang 43881a7: ``NixlKVManager._add_remote_peer`` (wrapped), and the sources the
+Targets, each checked against upstream SGLang 6a1b4b67: ``NixlKVManager._add_remote_peer`` (wrapped), and the sources the
 refusal relies on (their reasons at ``_TARGETS_MD5``)."""
 
 from __future__ import annotations
@@ -46,21 +46,21 @@ _COMMON = "sglang.srt.disaggregation.common.conn"
 TARGET = (_NIXL, "NixlKVManager._add_remote_peer")
 # (module, qualified name): md5 of the source
 _TARGETS_MD5 = {
-    TARGET: "e2ee9f36cd7849d884c49275e4c10bde",
+    TARGET: "9da5fea5453d71ac4a08299aa13fa10a",
     # sends component i into dst_state_data_ptrs[i] at dst_state_indices[i], each [] past the decode's components, and
     # fails a request whose component has no destination indices at its last chunk
-    (_NIXL, "NixlKVManager.maybe_send_extra"): "a0419a7cd7d96bc4a2b3f9e61c948c92",
+    (_NIXL, "NixlKVManager.maybe_send_extra"): "0683e1409a99c0f561e1263541869a6f",
     # the decode registers each of its state components' entries (from_zmq's msg[8], after the guard frame and the aux
     # item sizes), [] when it has none
-    (_NIXL, "NixlKVManager.build_receiver_registration_message"): "1d28c9d9c8345a71db02d6840a7a3acc",
-    (_NIXL, "KVArgsRegisterInfo.from_zmq"): "888b10e09310b5af69364bbf6ffbdfab",
+    (_NIXL, "NixlKVManager.build_receiver_registration_message"): "05672eec732d94dd911b0120bcdbe41a",
+    (_NIXL, "KVArgsRegisterInfo.from_zmq"): "2d14e31288922d07db40e1ac4098255f",
     # both roles' state components, in the KV storage's wire order: a pool with a sliding-window sub-pool (a hybrid SWA
     # pool) registers its window component, an MHA pool none
-    (_UTILS, "setup_state_kv_args"): "c09eb7e917545ca1d45e53b58ecdee67",
+    (_UTILS, "setup_state_kv_args"): "3181b9a4efef5a15fa4787aa5ca3cf1e",
     # hands each registration to _add_remote_peer; a refusal raised there ends it
     (_NIXL, "NixlKVManager._start_bootstrap_thread"): "0ad34e79d2d77da1b2cb45c799e94748",
     # the prefill info the decode reads at first contact names no state component
-    (_COMMON, "PrefillServerInfo"): "48c66f9592eff5eb430d870febbcfc55",
+    (_COMMON, "PrefillServerInfo"): "d79a73941371008f7799efcdf355ad9b",
 }
 
 

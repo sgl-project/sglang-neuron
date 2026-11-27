@@ -46,11 +46,11 @@ POST_XFER = (_NIXL, "NixlKVManager._post_xfer")
 MAYBE_ACK = (_COMMON, "CommonKVManager._maybe_ack_drained_abort")
 SEND_ACKS = (_COMMON, "CommonKVManager._send_abort_acks")
 _TARGETS_MD5 = {
-    TRANSFER_WORKER: "aaccdcf4cb029cd5aa2f01d265e85c25",
+    TRANSFER_WORKER: "390fed72b7f58f53a35ff1b288410509",
     REGISTER_TARGET: "7629a27d0f8a6add3c70a2b245efd7e8",
     (_COMMON, "CommonKVManager.poison_deferred_ack_room"): "1713c79fd0024debb06c8de12b72d332",
     MAYBE_ACK: "3dd95713461d31328f5f707e657e67b8",
-    (_COMMON, "CommonKVManager.update_status"): "3957aa78394858a23f22fb85ef4243b6",
+    (_COMMON, "CommonKVManager.update_status"): "8287f3f402dbdf00c5c0123f18017b80",
     SEND_ACKS: "3d758824ad34d6c8fb963d13a4cd1e6e",
     (_COMMON, "CommonKVManager._send_abort_ack"): "1a1d21f00855fd549cbd34e08e8942dd",
     (_NIXL, "NixlKVManager._handle_abort_notification"): "e6b31f79d46246334b8b43f14b8bd88b",

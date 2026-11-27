@@ -201,7 +201,15 @@ class Qwen35DecodeRuntime(NeuronModelRuntime):
         layout = self.model_graph.layout
         if layout.paged and not getattr(self, "_q35_laddered", False):
             page, full = layout.slot_tokens, layout.rope_len
-            self.buckets.decode_contexts = sorted({max(page, -(-full // q // page) * page) for q in (4, 2, 1)})
+            contexts = {max(page, -(-full // q // page) * page) for q in (4, 2, 1)}
+            if layout.kv_cp == 16 and page == 2048 and 32768 in contexts:
+                # The 32K KV-CP program diverges from prefill on Trn3. The
+                # same rows match with the 64K program. Its extra table
+                # columns are padding, and the kernel bounds work by position.
+                contexts.remove(32768)
+                if full == 32768:
+                    contexts.add(65536)
+            self.buckets.decode_contexts = sorted(contexts)
             self._q35_laddered = True
 
     def _warm_shapes(self) -> list:

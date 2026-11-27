@@ -40,7 +40,7 @@ COPY_RESULT = f"{_SCHEDULER}.Scheduler._copy_result_to_cpu"
 # scheduler's targets, checked only where a pipelined decode registers its hooks (register_scheduler)
 _LAUNCH_MD5 = {
     (_OVERRIDES, "_pipeline_parallel_overlap_disable"): "0a84a05a59cb3ccfb036db66eaf20308",
-    (_VALIDATION, "check_pipeline_parallel_compat"): "44d64b766a8d3b06d8c1ec8d67338432",
+    (_VALIDATION, "check_pipeline_parallel_compat"): "906a0c985e2a0cdc4d7d68cd5c4bb11d",
 }
 _SCHEDULER_MD5 = {
     (_SCHEDULER, "Scheduler.run_batch"): "afa792c782bfe5e3914d892209b15982",

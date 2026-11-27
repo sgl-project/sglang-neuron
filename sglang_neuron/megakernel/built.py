@@ -97,6 +97,7 @@ class NeuronBuiltMegakernel:
     draft_extend = None
     begin_draft_round = None
     graph_variants = None
+    speculative_runtime_hooks = None
 
     def __init__(self, *, name: str, model, programs: Sequence[PhaseProgram], pool_layout: Optional[PoolLayout],
                  widths: Sequence[int]):

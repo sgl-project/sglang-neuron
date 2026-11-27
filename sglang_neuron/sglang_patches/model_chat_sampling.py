@@ -27,7 +27,7 @@ from __future__ import annotations
 _PROTOCOL = "sglang.srt.entrypoints.openai.protocol"
 TARGETS_MD5 = {
     # the request's sampling dict: its own values, the generation config, then _DEFAULT_SAMPLING_PARAMS
-    (_PROTOCOL, "ChatCompletionRequest.to_sampling_params"): "682600a77b91c5d148dc61503a8c257c",
+    (_PROTOCOL, "ChatCompletionRequest.to_sampling_params"): "b92d88da449da471a40ab8cc4132a249",
 }
 
 

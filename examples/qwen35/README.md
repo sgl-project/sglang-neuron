@@ -30,6 +30,23 @@ bash /opt/sglang-neuron/examples/qwen35/run_gsm8k.sh     # prints the accuracy
 Run both in a third shell on the prefill node, the balancer's host: `run_client.sh` sends one greedy request to
 `/generate`, and `run_gsm8k.sh` asks the first `NUM_QUESTIONS` (100) of GSM8K's test split, five-shot and greedy.
 
+## Qualify the native megakernel uprev
+
+Use two Trn3 nodes with EFA and the same candidate image, text checkpoint, and packed weights mounted on both.
+Record the image digests and weight pack revision for the candidate and the patched `43881a7` baseline.
+Confirm the retained source guards pass and smoke-test ordinary Qwen3-0.6B on the candidate before this run.
+
+1. Start both roles and the balancer with the commands above. Confirm both role logs report the Qwen3.5
+   megakernel and the NIXL LIBFABRIC backend. Capture the greedy response for each image with
+   `run_client.sh | sed -n '2p' | jq -e '.output_ids | select(type == "array" and length > 0)'`.
+   Save the token IDs as `baseline.ids.json` and `candidate.ids.json` and compare with
+   `diff -u baseline.ids.json candidate.ids.json`.
+2. Send a request with a prefix longer than one 2,048-token prefill chunk, then send a request sharing that prefix.
+   Route both to the same prefill replica when checking reuse. Check the second request's cache-hit count and
+   save both responses. Verify both complete through the balancer.
+3. Repeat startup with `--enable-nvidia-megakernel` appended to the role commands and check for the launcher
+   deprecation warning. Save logs for both roles and the balancer with the exact launch commands.
+
 ## Notes
 
 - **Checkpoint and weight pack:** the servers serve a text-only view of the Qwen3.5-397B-A17B FP8 checkpoint

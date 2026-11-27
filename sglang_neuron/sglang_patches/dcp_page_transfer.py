@@ -61,7 +61,7 @@ Upstream: a DCP plan next to the MLA token plan, picked by pool layout: whole pa
 upstream's NPU DCP already places them (mem_cache/kv/alloc/runner_ids at interleave_size = page_size), and a pairing
 for a DCP prefill of another DCP size. Only the Neuron pools use that layout over NIXL today.
 
-Targets are md5-pinned against upstream SGLang 43881a7."""
+Targets are md5-pinned against upstream SGLang 6a1b4b67."""
 
 from __future__ import annotations
 
@@ -98,21 +98,21 @@ _DECODE_TARGETS_MD5 = {
 _PREFILL_TARGETS_MD5 = {
     (_COMMON, "CommonKVManager.requires_dcp_relayout"): "f84990db91dfd31901080126008830f0",
     (_COMMON, "CommonKVManager._init_dcp_pack_buffers_once"): "2810bb36ba7bc2dccc42096f91a7011d",
-    (_NIXL, "NixlKVManager._add_remote_peer"): "e2ee9f36cd7849d884c49275e4c10bde",
-    (_NIXL, "NixlKVManager._prepare_payload_xfer"): "0d52b004d8811f5b3306c8f184f306a7",
+    (_NIXL, "NixlKVManager._add_remote_peer"): "9da5fea5453d71ac4a08299aa13fa10a",
+    (_NIXL, "NixlKVManager._prepare_payload_xfer"): "5f7588eeaa96c3561c6f9469299271eb",
     (_NIXL, "NixlKVManager.send_kvcache_dcp"): "d3c82d1c580cc38dc43a2f9dd9b5345c",
-    (_NIXL, "KVArgsRegisterInfo.from_zmq"): "888b10e09310b5af69364bbf6ffbdfab",
-    (_UTILS, "build_dcp_token_transfer_plan"): "87788be2090c0c03766d4d762e8f3646",
-    (_NIXL, "NixlKVManager.maybe_send_extra"): "a0419a7cd7d96bc4a2b3f9e61c948c92",
+    (_NIXL, "KVArgsRegisterInfo.from_zmq"): "2d14e31288922d07db40e1ac4098255f",
+    (_UTILS, "build_dcp_token_transfer_plan"): "00282e6019edc399879188eec012d48d",
+    (_NIXL, "NixlKVManager.maybe_send_extra"): "0683e1409a99c0f561e1263541869a6f",
     # every chunk of a request is queued through send_kv_chunk, after the decode's TransferInfos arrived
     (_PREFILL, "SchedulerDisaggregationPrefillMixin.send_kv_chunk"): "0e5a574d819e4c08526f8751615bc139",
     # registers self.draft_token_to_kv_pool's entries after the target's (num_draft_entries) and their band ids
-    (_PREFILL, "PrefillBootstrapQueue._init_kv_manager"): "a64cc26a13904432901c1b256ae1e2d0",
+    (_PREFILL, "PrefillBootstrapQueue._init_kv_manager"): "edf39dc1510ed254211e4feb7d79160c",
     # a relayout peer's chunk goes plan -> pack -> send_kvcache_dcp, its state through maybe_send_extra on the last
     # chunk, and the plan gets the request's own TransferInfo.dst_kv_indices (request_of); the stripe send posts
     # through the generic sender, by page; the state rank pairing is upstream's scatter slice
-    (_NIXL, "NixlKVManager.transfer_worker"): "aaccdcf4cb029cd5aa2f01d265e85c25",
-    (_NIXL, "NixlKVManager._send_kvcache_generic"): "23f6707348dbe01adfe24a8652a16eb6",
+    (_NIXL, "NixlKVManager.transfer_worker"): "390fed72b7f58f53a35ff1b288410509",
+    (_NIXL, "NixlKVManager._send_kvcache_generic"): "43f51ef7bd4f4c4308c99cb2ddbc67e4",
     (_DISAGG_UTILS, "compute_mamba_state_slice_blocks"): "1b42454cba603cb70fc3416ebdf8d156",
 }
 # try_ensure_parallel_info is rebuilt from source with this check replaced: an MHA pool whose DCP run is its page
@@ -496,6 +496,8 @@ def add_remote_peer(original_fn, self, decode_kv_args, *args, **kwargs):
     a decode a DCP prefill sends by stripes for the stripe map (check_stripe_peer). A raise refuses that decode alone
     (nixl_peer_refusal.register_or_refuse, around the registration in the bootstrap thread)."""
     stripes = _stripe_target(self, decode_kv_args.dst_dcp_size)
+    if (stripes or int(decode_kv_args.dst_dcp_size) > 1) and decode_kv_args.dst_draft_rows_dcp_collapsed:
+        raise ValueError(f"PD DCP transfer to {decode_kv_args.agent_name}: Neuron does not support collapsed draft rows")
     if getattr(decode_kv_args, "dst_page_frame", None) is not None and not stripes:
         raise RuntimeError(f"PD transfer to decode peer {decode_kv_args.agent_name}: it announces a page rule (its KDA "
                            "state and drafter rows at pages of its state slot), which only a DCP prefill sends, by "
@@ -542,11 +544,13 @@ def prepare_payload_xfer(original_fn, self, peer_info, *args, **kwargs):
 
 def build_dcp_token_transfer_plan(original_fn, src_page_indices, dst_page_indices, *, physical_page_size: int,
                                   dcp_size: int, dcp_rank: int, src_page_offset: int = 0, decode_prefix_len: int = 0,
-                                  num_kv_tokens: Optional[int] = None):
+                                  num_kv_tokens: Optional[int] = None, draft_rows_collapsed: bool = False):
     """AROUND common.utils.build_dcp_token_transfer_plan: a DCP decode only pairs with this prefill through an MHA page
     pool (check_page_peer) or by stripes (check_stripe_peer), so the plan is the chunk (DcpPagePlan), which
     send_kvcache_dcp plans by pages or by stripes. send_kvcache_dcp refuses a page plan on an MLA pool without
     DCP."""
+    if draft_rows_collapsed:
+        raise ValueError("Neuron's PD DCP transfer plan does not support collapsed draft rows")
     return DcpPagePlan(DcpChunk(np.asarray(src_page_indices, dtype=np.int64), np.asarray(dst_page_indices,
                                                                                          dtype=np.int64),
                                 int(physical_page_size), int(dcp_size), int(dcp_rank), int(src_page_offset or 0),

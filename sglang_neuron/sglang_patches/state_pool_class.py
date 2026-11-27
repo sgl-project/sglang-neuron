@@ -6,7 +6,7 @@ mem_cache/state_pool.NeuronStatePool bound to the model's spec and kernels) in o
 
 - a megakernel model: its built object's ``pool_layout.state_pool_class`` (megakernel/pools.PoolLayout), which the
   platform answers through ``get_megakernel_state_pool_cls(pool_layout=...)``
-  (sglang_patches/megakernel_pool_layout.pool_layout reads the layout);
+  (SGLang's ``oot_megakernel_pool_layout`` reads the layout);
 - a platform-runtime model: ``NeuronModel.state_pool_class`` on the model object SGLang built.
 
 While SGLang's KV cache configurator builds that model's pools (``_init_pools``), every request table with Mamba-style
@@ -32,9 +32,9 @@ _STATE = "sglang.srt.mem_cache.kv.state_storage"
 # (module, qualified name): md5 of the source
 _TARGETS_MD5 = {
     # builds every request-to-token pool (target, PD decode, draft clone) of the configurator's model
-    (_CONFIGURATOR, "KVCacheConfigurator._init_pools"): "f6ad670db321a275d67d74467a74c3ef",
+    (_CONFIGURATOR, "KVCacheConfigurator._init_pools"): "902a9ec1e570935a74f2dedcbe220319",
     # builds self.mamba_pool from self.mamba_pool_cls
-    (_POOL, "HybridReqToTokenPool._init_mamba_pool"): "007258087fe596033454195e7c683c32",
+    (_POOL, "HybridReqToTokenPool._init_mamba_pool"): "f0388d144978e3772b2558f181c5a69e",
     (_STATE, "StateStorage.clear"): "4ab627245a0a9c9b4994aceceb22874e",
 }
 # the state pool class of the model whose pools _init_pools builds
@@ -61,9 +61,9 @@ def _checked(cls, where: str) -> Optional[type]:
 def layout_state_pool_cls(model) -> Optional[type]:
     """The platform's state pool class for ``model``'s built megakernel layout, or None (no layout, or a layout whose
     platform answers none)."""
-    from sglang_neuron.sglang_patches.megakernel_pool_layout import pool_layout
+    from sglang.srt.kernel_plugins.megakernel import oot_megakernel_pool_layout
 
-    layout = pool_layout(model)
+    layout = oot_megakernel_pool_layout(model)
     if layout is None:
         return None
     resolve = getattr(_platform(), "get_megakernel_state_pool_cls", None)

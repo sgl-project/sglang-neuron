@@ -20,10 +20,10 @@
 ARG BASE=public.ecr.aws/neuron/torch-neuronx@sha256:b4648437b8c7dbfa2acde18301a4bb4ae9658da5a412da75c59693ed4fd308ec
 # The SGLang revision the plugin's SGLang patches are written against and md5-pinned to (README, setup-guide.md), and
 # the version its wheel gets: the one SGLang's own versioning gives this commit (its setuptools-scm describe command:
-# the newest release tag, v0.5.23, plus the commit's distance from it, 413), which a depth-1 fetch cannot compute.
+# the newest matching release tag and the commit's distance from it), which a depth-1 fetch cannot compute.
 # Vulnerability scanners compare it with the fixed versions of SGLang's advisories, so it must not be a placeholder.
-ARG SGLANG_COMMIT=43881a719e42165ff987fb0273a6bf12eaeb7662
-ARG SGLANG_VERSION=0.5.24.dev413+g43881a7
+ARG SGLANG_COMMIT=66f68440777b855c0934815ff31e7daa4493690b
+ARG SGLANG_VERSION=0.5.24.dev2298+g66f6844077
 # The plugin commit the context is (the image's revision label); the build script passes `git rev-parse HEAD`.
 ARG SGLANG_NEURON_COMMIT=unknown
 # When the image was built (the created label; the base's own label is the Ubuntu base's date).

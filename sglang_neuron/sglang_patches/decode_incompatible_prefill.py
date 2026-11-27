@@ -26,7 +26,7 @@ their abort sends no ABORT, and nixl_peer_refusal's ``record_failure`` wrap pass
 
 Upstream: generic; upstream would raise the same typed error from its own refusals of one prefill.
 
-Targets are md5-pinned against upstream SGLang 43881a7: ``DecodePreallocQueue._ensure_prefill_info`` (wrapped) and the
+Targets are md5-pinned against upstream SGLang 6a1b4b67: ``DecodePreallocQueue._ensure_prefill_info`` (wrapped) and the
 sources the wrapper relies on."""
 
 from __future__ import annotations
@@ -43,14 +43,13 @@ TARGET = f"{_DECODE}.DecodePreallocQueue._ensure_prefill_info"
 _TARGETS_MD5 = {
     # sets the prefill's attempt time before try_ensure_parallel_info, which a raise leaves set: the prefill's later
     # requests stay pending for the retry interval
-    (_DECODE, "DecodePreallocQueue._ensure_prefill_info"): "9bbdde803af402b44d086ee58dbbfda7",
+    (_DECODE, "DecodePreallocQueue._ensure_prefill_info"): "086ce239c5cf232758da4a16b8bc8fe1",
     # caches the prefill's info only after _resolve_rank_mapping returns
-    (_COMMON, "CommonKVManager.try_ensure_parallel_info"): "15b2d05442275911ca74f44980700aac",
-    # keeps only the returned remaining requests pending and initializes only the ready prefills' receivers; a failed
-    # request stays in the queue
-    (_DECODE, "DecodePreallocQueue._resolve_pending_reqs"): "f77910873e66c71e120a97aa20b3a452",
+    (_COMMON, "CommonKVManager.try_ensure_parallel_info"): "90636b1cbbb04ad5da7c3368886d1289",
+    # The ready mapping gates receiver initialization. A failed request stays in the owning queue for retirement.
+    (_DECODE, "DecodePreallocQueue._resolve_pending_reqs"): "f5ce7bf1f71685d28e0e46cdb28d9654",
     # the next poll of a failed receiver aborts its request with the room's recorded reason
-    (_DECODE, "DecodePreallocQueue._update_handshake_waiters"): "558e493b485e756ea2b2941a460d0dbc",
+    (_DECODE, "DecodePreallocQueue._update_handshake_waiters"): "1032e5d782db08ad7d116d52f334cb2e",
     (_COMMON, "CommonKVReceiver.failure_exception"): "f568ed6f41876219b79a0ccd57a40b96",
     # fails the receiver and records its own reason first, which record_failure after it replaces
     (_COMMON, "CommonKVReceiver.abort"): "d1aaee19a0e575b463710144cf339d6c",
@@ -70,16 +69,15 @@ class PrefillIncompatibleError(RuntimeError):
 def ensure_prefill_info(original_fn, self, addr_to_reqs):
     """AROUND DecodePreallocQueue._ensure_prefill_info: upstream's, one prefill at a time, so one refusal loses no other
     prefill's result. A prefill that raises PrefillIncompatibleError has its queued requests failed."""
-    ready, remaining = {}, []
+    ready = {}
     for bootstrap_addr, reqs in addr_to_reqs.items():
         try:
-            addr_ready, addr_remaining = original_fn(self, {bootstrap_addr: reqs})
+            addr_ready = original_fn(self, {bootstrap_addr: reqs})
         except PrefillIncompatibleError as error:
             _fail_queued(self, bootstrap_addr, reqs, f"Prefill {bootstrap_addr} cannot serve this decode: {error}")
             continue
         ready.update(addr_ready)
-        remaining.extend(addr_remaining)
-    return ready, remaining
+    return ready
 
 
 def _fail_queued(queue, bootstrap_addr, reqs, reason: str) -> None:
@@ -88,6 +86,7 @@ def _fail_queued(queue, bootstrap_addr, reqs, reason: str) -> None:
     logger.error("%s; failing its %d queued request(s)", reason, len(reqs))
     for decode_req in reqs:
         receiver = decode_req.kv_receiver
+        decode_req.awaiting_prefill_dp_rank = False
         # None after a queue cleanup (upstream's retries-exhausted path). An already failed receiver keeps its reason:
         # a duplicate bootstrap room's receiver fails without owning the room's failure record.
         if receiver is None or receiver.conclude_state == KVPoll.Failed:

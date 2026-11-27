@@ -12,14 +12,14 @@ The tokenizer manager runs in the launching process, so the replacement is one o
 
 Upstream: a fix SGLang can take: gate the CUDA coredump on the platform's is_cuda.
 
-Target, md5-pinned against upstream SGLang 43881a7: ``TokenizerManager.dump_requests_before_crash`` (rebuilt)."""
+The source guard covers the rewritten ``TokenizerManager.dump_requests_before_crash`` method."""
 
 from __future__ import annotations
 
 _TOKENIZER = "sglang.srt.managers.tokenizer_manager"
 TARGET = f"{_TOKENIZER}.TokenizerManager.dump_requests_before_crash"
 _TARGETS_MD5 = {
-    (_TOKENIZER, "TokenizerManager.dump_requests_before_crash"): "d7d41abe1b6a8f89e00c73612583a4b0",
+    (_TOKENIZER, "TokenizerManager.dump_requests_before_crash"): "7fdb13e2d83781b5d98402d07bbee15f",
 }
 # upstream's coredump decision and its replacement: the Neuron platform is not CUDA
 SUBSTITUTIONS = (

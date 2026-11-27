@@ -510,13 +510,14 @@ _HOST_SAMPLER_SOURCES_MD5 = {
 }
 
 
-def megakernel_serving(server_args, spec):
-    """The model's catalog.MegakernelServing when the launch serves its whole-model megakernel (the model declares one
-    and the launch passes --enable-nvidia-megakernel), else None."""
+def megakernel_serving(architecture, spec, *, target):
+    """Use registration metadata while resolving the platform's model defaults."""
     megakernel = getattr(spec, "megakernel", None)
-    if megakernel is None or not getattr(server_args, "enable_nvidia_megakernel", False):
+    if megakernel is None:
         return None
-    return megakernel
+    from sglang_neuron.megakernel import upstream
+
+    return megakernel if upstream.require().spec_registered([architecture], target=target) else None
 
 
 def host_sampler_unserved(server_args, megakernel=None, spec=None) -> list:
@@ -569,7 +570,15 @@ def check_host_sampler(server_args, megakernel=None, spec=None) -> None:
 class NeuronSRTPlatform(SRTPlatform, NeuronDeviceMixin):
     # Only graph capture, for the decode graph runner. No Triton kernels, piecewise prefill graphs, HiCache device
     # kernels or PyNccl communicators.
-    capabilities = PlatformCapabilities(graph_capture=True)
+    capabilities = PlatformCapabilities(
+        graph_capture=True, supports_megakernel=True, accepts_legacy_megakernel_flag=True
+    )
+
+    def requires_megakernel(self, server_args, hf_config) -> bool:
+        return (
+            "Qwen3_5MoeForCausalLM" in (hf_config.architectures or ())
+            and bool(os.environ.get("SGLANG_NEURON_QWEN35_PACK"))
+        )
 
     def support_mamba_cache_extra_buffer(self) -> bool:
         """Upstream's mamba extra buffer (the tracking slots its radix cache adopts as state checkpoints) is served for
@@ -604,7 +613,7 @@ class NeuronSRTPlatform(SRTPlatform, NeuronDeviceMixin):
         chunk_keyed_tree.validate_launch(server_args, architecture, spec)
         check_quantization(server_args, architecture, spec)
         _check_plugin_env(server_args)
-        megakernel = megakernel_serving(server_args, spec)
+        megakernel = megakernel_serving(architecture, spec, target=self.get_megakernel_target())
         check_host_sampler(server_args, megakernel, spec)
         check_pipeline_stages(server_args, architecture, spec)
         check_model_launch(server_args, architecture, spec)
@@ -713,9 +722,9 @@ class NeuronSRTPlatform(SRTPlatform, NeuronDeviceMixin):
             return NeuronMLATokenToKVPool
         return None
 
-    # megakernels (sglang_patches/megakernel_platform.py; docs/design/megakernel.md, Seams)
+    # Native SGLang megakernel platform methods.
     def get_megakernel_target(self) -> str:
-        """The device target megakernel specs are matched on (Requirements.isas, register(..., isa=...)): the
+        """The device target megakernel specs are matched on (Requirements.isas, register(..., target=...)): the
         platform target's family (trn2, trn3, ...), from NEURON_PLATFORM_TARGET_OVERRIDE or the runtime's instance
         family; static, so the tokenizer process answers it too."""
         from sglang_neuron.backend.stack import get_platform_target, normalize_target_family
@@ -725,8 +734,7 @@ class NeuronSRTPlatform(SRTPlatform, NeuronDeviceMixin):
     def install_megakernel_dispatch(self, *, model, built, binding):
         """The whole-step dispatch of a built megakernel: the megakernel host's (sglang_neuron.megakernel.host
         create_dispatch), a callable with model.forward's signature that EagerRunner runs for every covered step
-        (sglang_patches/megakernel_eager_dispatch.py). The upstream model.forward wrapper (CUDA graphs) is never
-        used on this platform, so a launch without the host is refused."""
+        through SGLang's native dispatch. The host is required for a Neuron megakernel launch."""
         try:
             from sglang_neuron.megakernel.host import create_dispatch
         except ImportError as e:
@@ -741,7 +749,7 @@ class NeuronSRTPlatform(SRTPlatform, NeuronDeviceMixin):
     def activate_megakernel_pool_layout(self, pool_layout) -> None:
         """Accept a built megakernel's pool layout: an object with pool_class(kind) (the KV pool class of each kind
         its model builds, ValueError for another) and a state_pool_class. Validation only: each model's configurator
-        reads its own built object's layout (sglang_patches/megakernel_pool_layout.py), never a process-global one."""
+        reads its own built object's layout through SGLang's native pool selection."""
         if not callable(getattr(pool_layout, "pool_class", None)) or not hasattr(pool_layout, "state_pool_class"):
             raise NotImplementedError(f"the Neuron platform builds pools in a layout with pool_class(kind) and a "
                                       f"state_pool_class, not in {pool_layout!r}")

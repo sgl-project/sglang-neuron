@@ -17,7 +17,7 @@ restarts from it over the shared KV pages as the cold prompt's own next forward 
 Inserts stop at the prompt's last whole chunk (``insert_cap``): upstream's finish insert also takes the outputs, and a
 chunk they complete would hold KV from a partial forward and decode steps, not from one cold forward. Every insert
 reaches ``checkpoint_into_tree`` (through ``UnifiedRadixCache.checkpoint`` or the streaming session). Upstream sources
-are md5-pinned against SGLang 43881a7 (``_SOURCES_MD5``) and checked before the backend registers."""
+are md5-pinned against SGLang 6a1b4b67 (``_SOURCES_MD5``) and checked before the backend registers."""
 
 from __future__ import annotations
 
@@ -34,15 +34,17 @@ from sglang_neuron.sglang_patches.chunk_keyed_tree import BACKEND
 logger = logging.getLogger(__name__)
 
 # The factory relies on create_unified_radix_cache using params.page_size as the tree page and, off HiCache, host-pool
-# retraction and the external linker, attaching nothing else. The subclass relies on checkpoint_into_tree inserting
-# [cache_protected_len, up_to), floored to the tree page, and leaving the rest to the release that follows.
+# retraction and the external linker, attaching nothing else. The subclass relies on checkpoint_into_tree forwarding
+# up_to to the insert body, which floors [cache_protected_len, up_to) to the tree page and leaves the rest for release.
 _SOURCES_MD5 = {
-    ("sglang.srt.mem_cache.registry", "create_unified_radix_cache"): "552f1ddd17921e92404871131f77c5b7",
+    ("sglang.srt.mem_cache.registry", "create_unified_radix_cache"): "7e07ff09becb9c98cb8d11609a75fb6b",
     ("sglang.srt.mem_cache.unified_radix_cache", "UnifiedRadixCache.checkpoint_into_tree"):
-        "4082530bb41b73ce76ed16c2e1531de1",
+        "1a02ddc00b627831362af8cc85016ab6",
+    ("sglang.srt.mem_cache.unified_radix_cache", "UnifiedRadixCache._checkpoint_into_tree"):
+        "cdfb6640264d3f37bc29212a151abdf6",
     # every insert, on release and at chunked checkpoints, reaches checkpoint_into_tree through it
     ("sglang.srt.mem_cache.unified_radix_cache", "UnifiedRadixCache.checkpoint"): "53beecb5431a8eff61c3b55894579d80",
-    ("sglang.srt.mem_cache.common", "release_kv_cache"): "288de87ca4a5923c41b5dd0557935694",
+    ("sglang.srt.mem_cache.common", "release_kv_cache"): "ba613463d2b30f47044fc7d64166218e",
     ("sglang.srt.mem_cache.common", "checkpoint_kv_cache"): "5449f01fe3e2e37a7d63c29de1b48623",
 }
 

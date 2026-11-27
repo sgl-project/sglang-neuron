@@ -282,11 +282,8 @@ def qwen35_built_class():
                 decoding = [int(n or 0) for m, n in zip(modes, meta.num_decode_requests) if m.is_decode()]
             elif planner._q35_layout.dp > 1:
                 # without the cohort every replica would plan only its own step, and the world's programs diverge
-                from sglang_neuron.sglang_patches import mlp_sync_cohort_snapshot
-
                 raise RuntimeError(f"{self.name}: a {mode.name} step without the DP-attention cohort snapshot "
-                                   f"(mlp_sync_batch_metadata; the snapshot is "
-                                   f"{'on' if mlp_sync_cohort_snapshot.enabled() else 'off'} in this process)")
+                                   "(mlp_sync_batch_metadata)")
             else:
                 prefill = local == "prefill"
                 decoding = [md.batch_size] if local == "decode" else []
@@ -390,10 +387,9 @@ def _cohort_program(prefill_rt, meta, md, local: str):
 @functools.lru_cache(maxsize=None)
 def spec():
     from sglang_neuron.megakernel import upstream
-    from sglang_neuron.sglang_patches.megakernel_platform import PlatformMegakernelSpec
 
-    _, Requirements, Numerics, NumericsKind, Feature, _, _ = upstream.contract()
-    return PlatformMegakernelSpec(
+    MegakernelSpec, Requirements, Numerics, NumericsKind, Feature, _, _ = upstream.contract()
+    return MegakernelSpec(
         name=NAME,
         requires=Requirements(
             isas=frozenset({"trn3"}),
@@ -416,6 +412,7 @@ def spec():
         model_disable_reasons=model_disable_reasons,
         config_disable_reasons=config_disable_reasons,
         request_disable_reasons=request_disable_reasons,
+        mlp_sync_cohort_metadata=True,
     )
 
 

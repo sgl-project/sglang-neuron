@@ -12,7 +12,7 @@ on a bare instance gives the same values, because every other field falls back t
 class has no default factories or ``__post_init__``. Registration checks all of this, with the field list read from
 upstream's source.
 
-Both targets are md5-pinned against upstream SGLang 43881a7.
+Source guards cover both upstream methods.
 
 Upstream: SGLang can take this host-time cut for every platform. It keeps the same objects and field values, with one
 dict copy instead of per-field Python loops."""
@@ -30,8 +30,8 @@ _BATCH = "sglang.srt.managers.schedule_batch"
 RECORD = (_SCHEDULER, "Scheduler.record_batch_in_overlap")
 COPY = (_BATCH, "ScheduleBatch.copy")
 _TARGETS_MD5 = {
-    RECORD: "f05d6533e06c099e67eda7ef859adc3e",
-    COPY: "214b0c5e6aac2bd19ee2940e8ebf9a9b",
+    RECORD: "563347bffdf75dcf42be4b12d9bd5820",
+    COPY: "4724eca2c67b9f1aa9bb0cd52c387f40",
 }
 _IMMUTABLE_DEFAULTS = (type(None), bool, int, float, str)
 
@@ -42,8 +42,8 @@ def record_batch_in_overlap(self, batch) -> None:
     self.batch_record_ct = (self.batch_record_ct + 1) % 2
     retired = self.batch_record_buf[self.batch_record_ct]
     self.batch_record_buf[self.batch_record_ct] = [batch, batch.__dict__.copy()]
-    if retired is not None and self.deferred_overlap_release is not None:
-        self.deferred_overlap_release.defer(retired)
+    if retired is not None and self.uocr_runtime is not None and self.uocr_runtime.overlap_release is not None:
+        self.uocr_runtime.overlap_release.defer(retired)
 
 
 def copied_fields(copy_fn) -> tuple[str, ...]:

@@ -22,8 +22,8 @@ CALL_SITES = ("sglang.srt.disaggregation.prefill", "sglang.srt.disaggregation.de
 # (module, qualified name): md5 of the source
 _TARGETS_MD5 = {
     (_UTILS, "build_kv_layer_ids"): "cf00a4da1b7083e667ca3be3179991ef",
-    ("sglang.srt.disaggregation.prefill", "PrefillBootstrapQueue._init_kv_manager"): "a64cc26a13904432901c1b256ae1e2d0",
-    ("sglang.srt.disaggregation.decode", "DecodePreallocQueue._init_kv_manager"): "a49fb126873eaddb433c4243112060ca",
+    ("sglang.srt.disaggregation.prefill", "PrefillBootstrapQueue._init_kv_manager"): "edf39dc1510ed254211e4feb7d79160c",
+    ("sglang.srt.disaggregation.decode", "DecodePreallocQueue._init_kv_manager"): "cd3ed380e827bf4359e501b90252f875",
     # where upstream's owner region takes its ids from (none for the Neuron pool)
     ("sglang.srt.mem_cache.static_kv_storage", "_static_owner_region"): "2763b5bde4ac9425e9c9662a90acb18b",
     ("sglang.srt.disaggregation.common.conn", "CommonKVManager.get_mha_kv_ptrs_with_pp"):

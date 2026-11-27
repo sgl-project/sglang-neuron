@@ -32,7 +32,7 @@ the decode keeps serving the other prefills. Only the prefill knows its layer pa
 
 Upstream: generic for NIXL; the stage-range registration frame is the protocol change.
 
-Targets, checked against upstream SGLang 43881a7: ``CommonKVManager._resolve_rank_mapping``,
+Targets, checked against upstream SGLang 6a1b4b67: ``CommonKVManager._resolve_rank_mapping``,
 ``DecodePreallocQueue._init_kv_manager`` and ``NixlKVManager.build_receiver_registration_message`` on the decode;
 ``KVArgsRegisterInfo.from_zmq``, ``NixlKVManager._add_remote_peer``, ``NixlKVManager._prepare_payload_xfer`` and
 ``NixlKVManager.send_kvcache`` on the prefill (all wrapped); and the sources the hooks rely on (``_RELIED_ON_MD5``)."""
@@ -49,9 +49,9 @@ _DECODE = "sglang.srt.disaggregation.decode"
 _PREFILL = "sglang.srt.disaggregation.prefill"
 # a decode stage's layer range, b"<tag><start>,<end>", after upstream's registration frames
 STAGE_FRAME_TAG = b"sglang-neuron:pp-stage-layers="
-# KVArgsRegisterInfo.from_zmq reads upstream's frames msg[0] to msg[24] (the registration after its guard frame); the
+# KVArgsRegisterInfo.from_zmq reads upstream's frames msg[0] to msg[26] (the registration after its guard frame); the
 # plugin's frames trail them, so the tag is only looked for there
-UPSTREAM_REGISTRATION_FRAMES = 25
+UPSTREAM_REGISTRATION_FRAMES = 27
 # the rank mapping fields upstream's _resolve_rank_mapping sets besides target_pp_ranks
 _MAPPING_FIELDS = ("target_tp_rank", "target_tp_ranks", "target_cp_ranks", "required_dst_info_num",
                    "required_prefill_response_num")
@@ -63,14 +63,14 @@ _DECODE_WRAPPED = {
     (_NIXL, "NixlKVManager.build_receiver_registration_message"): "1d28c9d9c8345a71db02d6840a7a3acc",
 }
 _PREFILL_WRAPPED = {
-    (_NIXL, "KVArgsRegisterInfo.from_zmq"): "888b10e09310b5af69364bbf6ffbdfab",
-    (_NIXL, "NixlKVManager._add_remote_peer"): "e2ee9f36cd7849d884c49275e4c10bde",
-    (_NIXL, "NixlKVManager._prepare_payload_xfer"): "0d52b004d8811f5b3306c8f184f306a7",
+    (_NIXL, "KVArgsRegisterInfo.from_zmq"): "2d14e31288922d07db40e1ac4098255f",
+    (_NIXL, "NixlKVManager._add_remote_peer"): "9da5fea5453d71ac4a08299aa13fa10a",
+    (_NIXL, "NixlKVManager._prepare_payload_xfer"): "5f7588eeaa96c3561c6f9469299271eb",
     (_NIXL, "NixlKVManager.send_kvcache"): "dc8b5f9e6114739fce8c623ba6bd6428",
 }
 _RELIED_ON_MD5 = {
     # calls _resolve_rank_mapping after its own checks, and caches the mapped info
-    (_COMMON, "CommonKVManager.try_ensure_parallel_info"): "15b2d05442275911ca74f44980700aac",
+    (_COMMON, "CommonKVManager.try_ensure_parallel_info"): "90636b1cbbb04ad5da7c3368886d1289",
     # a decode stage's receiver bootstraps and registers with every target_pp_ranks entry (here the prefill's stage 0)
     (_COMMON, "CommonKVReceiver._setup_bootstrap_infos"): "f1bbcd0048d2d4b25f6ede85b28ed76b",
     (_COMMON, "CommonKVReceiver._register_kv_args"): "7bcce3ad2916529b71be6f656f3ba0f7",
@@ -83,9 +83,9 @@ _RELIED_ON_MD5 = {
     # (sglang_patches/nixl_peer_refusal rebuilds it)
     (_NIXL, "NixlKVManager._start_bootstrap_thread"): "0ad34e79d2d77da1b2cb45c799e94748",
     # sends an equal-TP MHA peer's chunk through send_kvcache, over its prepared dlists when it has them
-    (_NIXL, "NixlKVManager.transfer_worker"): "aaccdcf4cb029cd5aa2f01d265e85c25",
+    (_NIXL, "NixlKVManager.transfer_worker"): "390fed72b7f58f53a35ff1b288410509",
     # the prepared send that _send_stage_prepped follows with the stage's source entries, and the post it calls
-    (_NIXL, "NixlKVManager._send_kvcache_generic"): "23f6707348dbe01adfe24a8652a16eb6",
+    (_NIXL, "NixlKVManager._send_kvcache_generic"): "43f51ef7bd4f4c4308c99cb2ddbc67e4",
     (_NIXL, "NixlKVManager._post_xfer"): "98788e15a47fbf7631846e2a7b7fcd6a",
     (_NIXL, "repeat_indices_over_layers"): "4c38a3c0e2c2a0320217f43c56806f88",
     # the prepared dlists: one run of every slot per entry, entry after entry
@@ -93,9 +93,9 @@ _RELIED_ON_MD5 = {
     (_NIXL, "NixlKVManager._prep_equal_tp_dlist"): "3f25702681e87ec5e77da6f40a7c7956",
     (_NIXL, "_homogeneous_kv_mem_kind"): "f35a8b8eb6307cc4b23816d5aec0ea45",
     # re-prepares a reloaded peer through _prepare_payload_xfer, rebuilding a stage's dlist of its own layers
-    (_NIXL, "NixlKVManager._reload_invalidated_peers"): "7a3cfca8476a78c4e9868dd8e53fffad",
+    (_NIXL, "NixlKVManager._reload_invalidated_peers"): "bdf17e87ee08d96e513d3fd788ffc434",
     # set the prefill stage's pool bounds (prefill_start_layer, prefill_end_layer) before the manager is built
-    (_PREFILL, "PrefillBootstrapQueue._init_kv_manager"): "a64cc26a13904432901c1b256ae1e2d0",
+    (_PREFILL, "PrefillBootstrapQueue._init_kv_manager"): "edf39dc1510ed254211e4feb7d79160c",
     (_PREFILL, "_transfer_start_layer"): "0d87215ab1104b4905bff40540e72933",
 }
 

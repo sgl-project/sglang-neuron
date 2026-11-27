@@ -14,13 +14,13 @@ the launching process.
 
 Upstream: ``_handle_dspark`` would ask an out-of-tree platform, as ``_handle_dflash`` does.
 
-Target md5-pinned against upstream SGLang 43881a7: ``_handle_dspark``."""
+The source guard covers the upstream ``_handle_dspark`` function."""
 
 from __future__ import annotations
 
 _MODULE = "sglang.srt.arg_groups.speculative_hook"
 TARGET = f"{_MODULE}._handle_dspark"
-_TARGET_MD5 = "3f04597c9c46327f865921ef50988f96"
+_TARGET_MD5 = "d62838adc10318e67a9c280c83a593b4"
 GATE = """    if not cfg.device.startswith(("cuda", "npu", "xpu")):
 """
 NEURON_GATE = """    if not (

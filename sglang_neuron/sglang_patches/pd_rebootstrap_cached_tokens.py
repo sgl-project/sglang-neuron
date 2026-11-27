@@ -20,7 +20,7 @@ upstream's.
 
 Upstream: a generic accounting fix in the PD commit, with no Neuron dependency.
 
-Targets, md5-pinned against SGLang 43881a7: ``DecodeTransferQueue._commit_transfer_to_req`` (wrapped), and the two the
+Targets, md5-pinned against SGLang 6a1b4b67: ``DecodeTransferQueue._commit_transfer_to_req`` (wrapped), and the two the
 kept counts rely on, ``Req.reset_for_retract`` and ``ScheduleBatchDisaggregationDecodeMixin.prepare_for_prebuilt``."""
 
 from __future__ import annotations
@@ -31,10 +31,10 @@ _TARGETS_MD5 = {
     # sets the five fields from the row on every commit, a rebootstrap's included
     TARGET: "59ff80b249c217d16e8aa06f33331a7e",
     # a retraction keeps the counts and stains the request
-    ("sglang.srt.managers.schedule_batch", "Req.reset_for_retract"): "2d5b8589e89922d7d8f4ca3b9726b96c",
+    ("sglang.srt.managers.schedule_batch", "Req.reset_for_retract"): "ef6919c23d421c2a893e23d79b3fb0c5",
     # adds nothing to a stained request's counts
     ("sglang.srt.disaggregation.decode_schedule_batch_mixin",
-     "ScheduleBatchDisaggregationDecodeMixin.prepare_for_prebuilt"): "54234b5570697fc3f922520b7a422882",
+     "ScheduleBatchDisaggregationDecodeMixin.prepare_for_prebuilt"): "08db56c0dcc5917de37d7c1cd7550417",
 }
 # the request fields the commit sets from the row's prefix-cache counts
 ACCOUNTING = ("cached_tokens", "already_computed", "cached_tokens_device", "cached_tokens_host",

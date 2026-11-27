@@ -28,7 +28,7 @@ every page id means the same page on both roles and the allocator, radix and blo
 Upstream: generic: a decode that holds all KV heads of a block of each page, served by a prefill that holds whole
 pages — one asymmetric CP pairing of layouts the equal-layout rule refuses.
 
-Targets are md5-pinned against upstream SGLang 43881a7."""
+Targets are md5-pinned against upstream SGLang 6a1b4b67."""
 
 from __future__ import annotations
 
@@ -52,9 +52,9 @@ _NIXL = "sglang.srt.disaggregation.nixl.conn"
 
 # (module, qualified name): md5 of upstream's source; the wrapped functions and the sources the transfer calls
 _TARGETS_MD5 = {
-    (_NIXL, "NixlKVManager._prepare_payload_xfer"): "0d52b004d8811f5b3306c8f184f306a7",
+    (_NIXL, "NixlKVManager._prepare_payload_xfer"): "5f7588eeaa96c3561c6f9469299271eb",
     (_NIXL, "NixlKVManager.send_kvcache"): "dc8b5f9e6114739fce8c623ba6bd6428",
-    (_COMMON, "CommonKVManager._resolve_rank_mapping"): "70d83eef6dcb74b7cce329808eecba2f",
+    (_COMMON, "CommonKVManager._resolve_rank_mapping"): "a39c496390d55801738a0af73414f070",
     # one strided run per KV entry: (ptr, xfer_len, dev, item_len stride, num_slots), the runs below
     (_NIXL, "NixlKVManager._init_equal_tp_prep_handle"): "55dbf1feaa081681ebd6afffdb068916",
     # its dlist builder, called directly for the per-peer source dlist (local agent, scatter key)
@@ -62,7 +62,7 @@ _TARGETS_MD5 = {
     # descriptor index = entry * num_slots + slot, entry-major, the send below
     (_NIXL, "repeat_indices_over_layers"): "4c38a3c0e2c2a0320217f43c56806f88",
     # the last-chunk state send every KV source reaches; skips a component whose prefill indices are empty
-    (_NIXL, "NixlKVManager.maybe_send_extra"): "a0419a7cd7d96bc4a2b3f9e61c948c92",
+    (_NIXL, "NixlKVManager.maybe_send_extra"): "0683e1409a99c0f561e1263541869a6f",
 }
 
 # the per-peer source dlist's key in prep_handles (the shared equal-TP source dlist is ""; a peer's name its own)

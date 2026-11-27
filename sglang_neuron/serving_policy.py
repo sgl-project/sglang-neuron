@@ -69,6 +69,7 @@ class ServingPolicy:
     # --radix-cache-backend neuron-chunk: the prefix cache keys whole prefill chunks (sglang_patches.chunk_keyed_tree).
     # Kept here because every process registers the backend before it sees the server arguments.
     chunk_keyed_tree: bool = False
+    hierarchical_cache: bool = False
     # --radix-cache-backend kimi-prompt: the Kimi-K3 prompt cache on the PD prefill (sglang_patches.kimi_prompt), END
     # entries at any token. Kept here because every process registers the backend before it sees the server arguments.
     kimi_prompt_cache: bool = False
@@ -510,6 +511,7 @@ def resolve(server_args, prefill_holds_prior: bool = False, model_has_giga_decod
         pp_size=pp_size,
         dcp_size=int(getattr(server_args, "dcp_size", 1) or 1),
         chunk_keyed_tree=chunk_keyed_tree.selected(server_args),
+        hierarchical_cache=bool(getattr(server_args, "enable_hierarchical_cache", False)),
         kimi_prompt_cache=kimi_prompt.selected(server_args),
         hbm_tail_guard=_hbm_tail_guard(),
         prefill_compute_ahead=_prefill_compute_ahead(server_args, role, pp_size, model_computes_ahead),

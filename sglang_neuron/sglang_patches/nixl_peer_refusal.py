@@ -42,7 +42,7 @@ _PREFILL = "sglang.srt.disaggregation.prefill"
 REPLACED = (_NIXL, "NixlKVManager._start_bootstrap_thread")
 _WRAPPED = {
     (_COMMON, "CommonKVSender.__init__"): "7dadb846afe3f233cbec620cf1d8eee9",
-    (_COMMON, "CommonKVSender.clear"): "2f2d68d7514e9b7a3d60bbaf0c035050",
+    (_COMMON, "CommonKVSender.clear"): "8091502be29709430a18796343feb8f9",
     (_NIXL, "NixlKVManager._handle_abort_notification"): "e6b31f79d46246334b8b43f14b8bd88b",
     (_COMMON, "CommonKVManager.record_failure"): "c356974ace971d8311aeaf794a2548dd",
 }
@@ -50,14 +50,14 @@ _WRAPPED = {
 _TARGETS_MD5 = {
     REPLACED: "0ad34e79d2d77da1b2cb45c799e94748",
     **_WRAPPED,
-    (_NIXL, "NixlKVSender"): "414c18889989c142c15cec6ed0417c16",
+    (_NIXL, "NixlKVSender"): "4b4bdb20bce015c39c5ed2998769b1bb",
     (_COMMON, "AbortNotification.from_zmq"): "63447705adae1a30796f92b28e7e085c",
-    (_NIXL, "NixlKVManager._add_remote_peer"): "e2ee9f36cd7849d884c49275e4c10bde",
+    (_NIXL, "NixlKVManager._add_remote_peer"): "9da5fea5453d71ac4a08299aa13fa10a",
     (_NIXL, "TransferInfo.from_zmq"): "7ba9ad4939368443fdd8574389bd4f7e",
-    (_COMMON, "CommonKVManager.update_status"): "3957aa78394858a23f22fb85ef4243b6",
-    (_COMMON, "CommonKVSender._poll_with_status"): "a0146ee1fd19a666fb61f4333523f996",
-    (_COMMON, "CommonKVSender.failure_exception"): "3aa7eb415067d4cbb8a4c03a16f86a13",
-    (_PREFILL, "SchedulerDisaggregationPrefillMixin.handle_bootstrap_failure"): "b3750a47fe171124d41dc4fd718316b5",
+    (_COMMON, "CommonKVManager.update_status"): "8287f3f402dbdf00c5c0123f18017b80",
+    (_COMMON, "CommonKVSender._poll_with_status"): "0080e72061cd45e33572212592ce9c1d",
+    (_COMMON, "CommonKVSender.failure_exception"): "933ee0e53a92ae2500baca31fb38950a",
+    (_PREFILL, "SchedulerDisaggregationPrefillMixin.handle_bootstrap_failure"): "0d7fcd8439530d011c4e85659b8897ad",
     (_COMMON, "CommonKVManager._room_notify_targets"): "4458842a2e19c357659231dc25d79d93",
     (_COMMON, "CommonKVManager.send_kv_status_message"): "8aeaa35a093c57c15f7c5173261340e8",
     (_COMMON, "CommonKVManager._encode_kv_status_message"): "03ef61a107cd8201bdb58bdd68f45374",

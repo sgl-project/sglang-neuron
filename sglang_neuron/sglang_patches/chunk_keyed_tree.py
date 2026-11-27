@@ -31,7 +31,7 @@ logger = logging.getLogger(__name__)
 # the --radix-cache-backend name the plugin registers
 BACKEND = "neuron-chunk"
 # the recurrent-state checkpoints a cached prompt keeps on its root-to-tail path on a prefill of a model that keeps one
-# at every chunk end, where the launch leaves --mamba-max-states-per-path at SGLang's -1 (default_states_per_path)
+# at every chunk end, where the launch leaves the cap unset (default_states_per_path).
 DEFAULT_STATES_PER_PATH = 4
 
 
@@ -42,8 +42,8 @@ def selected(server_args) -> bool:
 
 def default_states_per_path(server_args, spec) -> int | None:
     """``--mamba-max-states-per-path`` for a prefill on this tree of a model that keeps a recurrent-state checkpoint at
-    every chunk end (``spec.chunk_state_checkpoints``), where the launch leaves it at SGLang's -1 (unlimited):
-    DEFAULT_STATES_PER_PATH. Returns the value set, or None (another launch, or a launch that sets it).
+    every chunk end (``spec.chunk_state_checkpoints``), where the launch leaves the cap unset:
+    DEFAULT_STATES_PER_PATH. Returns the value set, or None (another launch, or a launch that sets a cap).
 
     Unlimited, every chunk a prompt computes keeps its state, and the pool's LRU frees only leaves, so the interior
     states of long prompts fill the slots and the states at the prompts' ends are freed first. A request that extends
@@ -56,7 +56,7 @@ def default_states_per_path(server_args, spec) -> int | None:
     if not (spec.chunk_state_checkpoints and selected(server_args)
             and serving_policy.launch_role(server_args) == "prefill"):
         return None
-    if int(getattr(server_args, "mamba_max_states_per_path", -1)) != -1:
+    if getattr(server_args, "mamba_max_states_per_path", None) not in (None, -1):
         return None
     server_args.mamba_max_states_per_path = DEFAULT_STATES_PER_PATH
     logger.info("[neuron] chunk state checkpoints on the %s tree: --mamba-max-states-per-path %d", BACKEND,

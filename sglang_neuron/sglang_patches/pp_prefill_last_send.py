@@ -59,9 +59,7 @@ _TARGETS_MD5 = {("sglang.srt.disaggregation.utils", "MetadataBuffers.set_buf"): 
 
 # the aux write of upstream's NixlKVManager.transfer_worker (dedented once, as source_guard rebuilds it), and the same
 # write skipped for a NO_AUX chunk; nixl_settle_then_ack adds these to its rebuild of the worker
-UPSTREAM_AUX_WRITE = """                    if kv_chunk.prefill_aux_index is None:
-                        raise RuntimeError("Missing aux index for last chunk")
-                    aux_xfer_handle = self.send_aux(
+UPSTREAM_AUX_WRITE = """                    aux_xfer_handle = self.send_aux(
                         req.agent_name,
                         kv_chunk.prefill_aux_index,
                         dst_info.dst_aux_ptrs,
@@ -70,9 +68,7 @@ UPSTREAM_AUX_WRITE = """                    if kv_chunk.prefill_aux_index is Non
                     )
                     handles.append(aux_xfer_handle)
 """
-NEURON_AUX_WRITE = """                    if kv_chunk.prefill_aux_index is None:
-                        raise RuntimeError("Missing aux index for last chunk")
-                    # a stage that sent its last chunk at its forward writes no metadata row
+NEURON_AUX_WRITE = """                    # a stage that sent its last chunk at its forward writes no metadata row
                     # (sglang_patches/pp_prefill_last_send): the last stage writes it with the first token
                     if kv_chunk.prefill_aux_index != -1:
                         aux_xfer_handle = self.send_aux(

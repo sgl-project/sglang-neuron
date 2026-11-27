@@ -7,7 +7,7 @@ without calling ``load_plugins()``. The plugin's tokenizer-side hooks would then
 serve the requests. For such a launch the platform sets the app path to ``sglang_neuron.http_worker_app:app``, which is
 SGLang's app imported after ``load_plugins()``. A custom app path is refused.
 
-Relied-on targets, md5-pinned against upstream SGLang 43881a7: ``http_server.init_multi_tokenizer``,
+Guarded source targets: ``http_server.init_multi_tokenizer``,
 ``_run_granian_server`` and ``_setup_and_run_http_server``.
 
 Upstream: SGLang can fix this by having its multi-tokenizer workers call load_plugins(), as every other process does;
@@ -22,9 +22,9 @@ SGLANG_APP_PATH = "sglang.srt.entrypoints.http_server:app"  # upstream SGLang's 
 _ENV = "SGLANG_HTTP_SERVER_APP_PATH"
 _HTTP_SERVER = "sglang.srt.entrypoints.http_server"
 _TARGETS_MD5 = {
-    "init_multi_tokenizer": "4c1585615632e5e9643e74f2dd35edaa",
-    "_run_granian_server": "7e6bf456d795dfd5d31102adfa46df3e",
-    "_setup_and_run_http_server": "ed5029a85515bde9bd024e3f6cc5ed1b",
+    "init_multi_tokenizer": "7a34b4d5642c2cc44d7b048e00103a37",
+    "_run_granian_server": "26cdd36d57c11f164f43ae5cf9358f72",
+    "_setup_and_run_http_server": "c626ffaa139aa0b37614cc80bf9989ae",
 }
 
 

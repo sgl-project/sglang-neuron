@@ -46,7 +46,7 @@ pages, the reverse, or another degree). ``cp_pages.latent_page_plan`` maps those
 
 Upstream: generic: a KV pool's context-parallel layout in the PD registration and the refusal of a decode at another.
 
-Targets, each checked against upstream SGLang 43881a7: ``NixlKVManager.build_receiver_registration_message``,
+Targets, each checked against upstream SGLang 6a1b4b67: ``NixlKVManager.build_receiver_registration_message``,
 ``KVArgsRegisterInfo.from_zmq`` and ``NixlKVManager._add_remote_peer`` (wrapped), and the sources the hand-off relies on
 (their reasons at ``_TARGETS_MD5``)."""
 
@@ -59,27 +59,27 @@ _NIXL = "sglang.srt.disaggregation.nixl.conn"
 _UTILS = "sglang.srt.disaggregation.utils"
 # a decode's KV layout, b"<tag><cp_size>,<cp_rank>,<block>", after upstream's registration frames
 CP_LAYOUT_FRAME = b"sglang-neuron:kv-cp-layout:"
-# KVArgsRegisterInfo.from_zmq reads upstream's frames msg[0] to msg[24]; the plugin's frames trail them
-_UPSTREAM_REGISTRATION_FRAMES = 25
+# KVArgsRegisterInfo.from_zmq reads upstream's frames msg[0] to msg[26]; the plugin's frames trail them
+_UPSTREAM_REGISTRATION_FRAMES = 27
 
 _WRAPPED = {
-    (_NIXL, "NixlKVManager.build_receiver_registration_message"): "1d28c9d9c8345a71db02d6840a7a3acc",
-    (_NIXL, "KVArgsRegisterInfo.from_zmq"): "888b10e09310b5af69364bbf6ffbdfab",
-    (_NIXL, "NixlKVManager._add_remote_peer"): "e2ee9f36cd7849d884c49275e4c10bde",
+    (_NIXL, "NixlKVManager.build_receiver_registration_message"): "05672eec732d94dd911b0120bcdbe41a",
+    (_NIXL, "KVArgsRegisterInfo.from_zmq"): "2d14e31288922d07db40e1ac4098255f",
+    (_NIXL, "NixlKVManager._add_remote_peer"): "9da5fea5453d71ac4a08299aa13fa10a",
 }
 # (module, qualified name): md5 of the source
 _TARGETS_MD5 = {
     **_WRAPPED,
     # at equal attention TP decode rank e pulls from prefill attention-TP rank e % attn_tp, one real source per rank
-    (_COMMON, "CommonKVManager._resolve_rank_mapping"): "70d83eef6dcb74b7cce329808eecba2f",
+    (_COMMON, "CommonKVManager._resolve_rank_mapping"): "a39c496390d55801738a0af73414f070",
     # page p of every KV entry, item_len bytes at ptr + p * item_len, into the decode's page q (the flat MLA path)
     (_NIXL, "NixlKVManager.send_kvcache"): "dc8b5f9e6114739fce8c623ba6bd6428",
     # a DSA index-K component is sent page for page like the KV, at the last chunk
-    (_NIXL, "NixlKVManager.maybe_send_extra"): "a0419a7cd7d96bc4a2b3f9e61c948c92",
+    (_NIXL, "NixlKVManager.maybe_send_extra"): "0683e1409a99c0f561e1263541869a6f",
     # hands each registration to from_zmq and _add_remote_peer; a refusal raised there refuses the peer
     (_NIXL, "NixlKVManager._start_bootstrap_thread"): "0ad34e79d2d77da1b2cb45c799e94748",
     # the KV args a hybrid DSA pool registers: the latent as KV, the index keys as a DSA state component
-    (_UTILS, "setup_state_kv_args"): "c09eb7e917545ca1d45e53b58ecdee67",
+    (_UTILS, "setup_state_kv_args"): "3181b9a4efef5a15fa4787aa5ca3cf1e",
 }
 
 

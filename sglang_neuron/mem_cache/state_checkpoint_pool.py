@@ -49,7 +49,7 @@ like the pool's tensors (so ``copy_across`` pads the same way), each bank under 
 (1..num_slots, upstream's ``MambaSlotAllocator`` ids) is slot ``(g - 1) % bank slots + 1`` of bank ``(g - 1) // bank
 slots``. A working-bank pool's checkpoints are its canonical slots; the working rows are never stored.
 
-The store binds to the request pool it serves when that pool is built (sglang_patches/megakernel_pool_layout's
+The store binds to the request pool it serves when that pool is built (sglang_patches/state_pool_class's
 ``init_mamba_pool``): it checks the two agree on the state spec and warms ``copy_across`` both ways, so a radix insert
 or hit never compiles on one rank while the others wait. A failed copy quarantines what it may have half written: the
 store on a store, the request pool on a hit."""
@@ -413,8 +413,7 @@ def maybe_init_checkpoint_pool(original, *, mamba_size, cache_params, mamba_laye
     return store
 
 
-# Upstream functions the store wraps or relies on, pinned by md5 against SGLang 43881a7 (sglang_patches.source_guard);
-# a changed source stops the launch.
+# Source guards for upstream functions the store wraps or relies on.
 _SOURCES_MD5 = {
     # wrapped: built inside HybridReqToTokenPool._init_mamba_pool (pinned by the seam) after the request pool
     ("sglang.srt.mem_cache.mamba_checkpoint_pool", "maybe_init_int8_mamba_checkpoint_pool"):
@@ -425,18 +424,17 @@ _SOURCES_MD5 = {
         "603bfc09ce044e066cb206e54a55917e",
     # takes one checkpoint slot per insert, evicting a cached checkpoint when the store is full
     ("sglang.srt.mem_cache.unified_cache.components.mamba", "MambaComponent._alloc_int8_ckpt_slot"):
-        "2f6e0934a6734dd27bfdfa4926b660ac",
+        "12563bc0e1a48178f3a3be565b2547ba",
     # the hit: load_to_active(state.pool, cow sources, cow destinations), host index tensors
     ("sglang.srt.model_executor.model_runner", "ModelRunner._maybe_execute_deferred_mamba_cow_and_clear"):
-        "e6563c974d16e638dc56944e655ebb95",
+        "540d2ec2fc794995edb2025cfee3cef1",
     # the launch refusals the store relies on (HiCache, LMCache, unified memory, a custom radix backend)
     ("sglang.srt.arg_groups.mamba_hook", "handle_int8_mamba_checkpoint"): "0828d30abbf63df6ce4e5742ea55fb71",
 }
 
 
 def register_hooks(registry, around) -> None:
-    """Registered with the megakernel pool-layout seam (sglang_patches/megakernel_pool_layout.register), which builds
-    the Neuron state pools this store serves."""
+    """Registered by the state-pool hook that builds the Neuron pools this store serves."""
     from sglang_neuron.sglang_patches import source_guard
 
     source_guard.check_targets(_SOURCES_MD5, __name__)

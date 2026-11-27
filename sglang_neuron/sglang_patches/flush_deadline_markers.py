@@ -41,9 +41,9 @@ _RECEIVER = "sglang.srt.managers.scheduler_components.request_receiver"
 # (module, qualified name): md5 of upstream's source
 _TARGETS_MD5 = {
     (_FLUSH_WRAPPER, "SchedulerFlushWrapper"): "1cf9467ea03aac1291ea779ac4f877cf",
-    (_SCHEDULER, "Scheduler.init_request_dispatcher"): "6f6131faf815fcc02360bb01d9530c4f",
-    (_SCHEDULER, "Scheduler.init_request_receiver"): "82f952f443fbd61594c4a4b6dc1c8b27",
-    (_RECEIVER, "SchedulerRequestReceiver._pull_raw_reqs"): "ada9a1afb295b795db184413c26c05e4",
+    (_SCHEDULER, "Scheduler.init_request_dispatcher"): "1c3f0593324a12d992ecea2ba7264966",
+    (_SCHEDULER, "Scheduler.init_request_receiver"): "3fbbf6de2d8d0e958a9b0b0e7800547e",
+    (_RECEIVER, "SchedulerRequestReceiver._pull_raw_reqs"): "e8e2af42ddc4dc83b2f9e202be92ad95",
 }
 
 
@@ -154,7 +154,7 @@ def init_request_dispatcher(original_fn, self, *args, **kwargs):
     """AROUND Scheduler.init_request_dispatcher: the scheduler dispatches each marker to the flush wrapper's
     ``expire``."""
     out = original_fn(self, *args, **kwargs)
-    from sglang.utils import TypeBasedDispatcher
+    from sglang.srt.utils.common import TypeBasedDispatcher
 
     self._request_dispatcher += TypeBasedDispatcher([(FlushDeadlineReached, self.flush_wrapper.expire)])
     return out

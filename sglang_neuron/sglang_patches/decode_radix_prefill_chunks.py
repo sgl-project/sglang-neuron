@@ -34,7 +34,7 @@ the same checkpoint at the same ``--context-length`` (which sets the block table
 Upstream: SGLang would carry the fingerprint in its bootstrap protocol next to a chunk-keyed radix tree. SGLang's Rust
 bootstrap registry (``SGLANG_RUST_SERVER``) drops the keys, so a chunk-keyed decode refuses every prefill behind it.
 
-Targets are md5-pinned against upstream SGLang 43881a7, one table per registration."""
+Each registration has its own source guard table."""
 
 from __future__ import annotations
 
@@ -62,8 +62,8 @@ _INFO_QUERY = ("prefill_dp_rank", "prefill_cp_rank", "target_tp_rank", "target_p
 
 # (module, qualified name): md5 of upstream's source, for each process role's hooks
 _SERVER_TARGETS_MD5 = {
-    (_COMMON, "CommonKVBootstrapServer._handle_route_put"): "e6d3daff4260d7db9207db63c2b3c3ef",
-    (_COMMON, "CommonKVBootstrapServer._handle_route_get"): "a672abb72ddbed3b3e52cb37e6831b7c",
+    (_COMMON, "CommonKVBootstrapServer._handle_route_put"): "c9c1cdd3ea8c6dae20f845311f3a8a7b",
+    (_COMMON, "CommonKVBootstrapServer._handle_route_get"): "b8330db38ac27c729242a8929549b0d8",
     # awaits self._handle_route_put and _handle_route_get by attribute, so the registry's synchronous wrapper of each
     # hook returns the coroutine it awaits
     (_COMMON, "CommonKVBootstrapServer._handle_route"): "f01eae2a78dcb3af86d7f1921241e783",
@@ -75,34 +75,37 @@ _PREFILL_TARGETS_MD5 = {
     (_COMMON, "CommonKVManager._register_topology_row"): "623206d3d4e08ee4e11f7b2771e954e8",
     # sends every row (the Rust registry's DP gather too) through _register_topology_row, from the KV manager's
     # constructor, which runs after the model set the prefill chunk grid
-    (_COMMON, "CommonKVManager.register_to_bootstrap"): "0abfe2e7802db1970be4ee6ccfcb9e45",
+    (_COMMON, "CommonKVManager.register_to_bootstrap"): "7de83350aeeea51bfabcc2ef03288b31",
 }
 _DECODE_TARGETS_MD5 = {
-    (_COMMON, "PrefillServerInfo"): "48c66f9592eff5eb430d870febbcfc55",
+    (_COMMON, "PrefillServerInfo"): "d79a73941371008f7799efcdf355ad9b",
     # builds PrefillServerInfo(**answer) from its module's globals, which the replacement rebinds
-    (_COMMON, "CommonKVManager.try_ensure_parallel_info"): "15b2d05442275911ca74f44980700aac",
+    (_COMMON, "CommonKVManager.try_ensure_parallel_info"): "90636b1cbbb04ad5da7c3368886d1289",
 }
 _CHUNK_KEYED_DECODE_TARGETS_MD5 = {
-    (_COMMON, "CommonKVManager._resolve_rank_mapping"): "70d83eef6dcb74b7cce329808eecba2f",
+    (_COMMON, "CommonKVManager._resolve_rank_mapping"): "a39c496390d55801738a0af73414f070",
     # runs upstream's own checks, then _resolve_rank_mapping, and caches the info only once it returns
-    (_COMMON, "CommonKVManager.try_ensure_parallel_info"): "15b2d05442275911ca74f44980700aac",
+    (_COMMON, "CommonKVManager.try_ensure_parallel_info"): "90636b1cbbb04ad5da7c3368886d1289",
     # inits the request's receiver
-    (_DECODE, "DecodePreallocQueue._init_receiver"): "a87b638f3e357857174fe28cd2593dd1",
+    (_DECODE, "DecodePreallocQueue._init_receiver"): "1b7dc8effd472871105d40de91711592",
     # binds the receiver to its prefill's cached info, prefill_info
     (_COMMON, "CommonKVReceiver.init"): "fe1b27f354afbc1dfb46cf7dfa0be764",
     # init every receiver but a fake transfer's (no prefill) through _init_receiver, once its prefill's info is cached
-    (_DECODE, "DecodePreallocQueue.add"): "a3fe64b4f09123d07f1d7bcf70db32b5",
-    (_DECODE, "DecodePreallocQueue._resolve_pending_reqs"): "f77910873e66c71e120a97aa20b3a452",
+    (_DECODE, "DecodePreallocQueue.add"): "201cfff95f97e061fda2dacfd4f088fd",
+    (_DECODE, "DecodePreallocQueue._resolve_pending_reqs"): "f5ce7bf1f71685d28e0e46cdb28d9654",
     # matches a request only once its initialized receiver waits for input
-    (_DECODE, "DecodePreallocQueue.pop_preallocated"): "b42db6c8d0b02438782c25253dc8a7da",
+    (_DECODE, "DecodePreallocQueue.move_preallocated"): "1165c742c77c632995f6aad8431706f8",
     # the decode's one match: under the request's extra_key (match_kv_cache), and a rebootstrap's re-bound root under it
-    (_DECODE, "DecodePreallocQueue._match_prefix_and_lock"): "f3a7dc22286b4542f3e2d3a042bdc3f1",
-    ("sglang.srt.mem_cache.common", "match_kv_cache"): "14bbc226d6cac76804d71f9478e1f00f",
+    (_DECODE, "DecodePreallocQueue._match_prefix_and_lock"): "df304fb6c9b32cb285af04b13d5b8cef",
+    ("sglang.srt.mem_cache.common", "match_kv_cache"): "9f71ebdb3c5609aaee74f8a0a0a5fb10",
     (_DECODE, "_bind_root_prefix"): "7a81ca1766d17b1501b23a87ce614e32",
     # the match keys the request's tokens on its extra_key, and so does every insert
-    ("sglang.srt.mem_cache.common", "_req_radix_key"): "06537cd4b740f3cb416258650acd671f",
+    ("sglang.srt.mem_cache.common", "_req_radix_key"): "bfd9d04e0f92cf8b44be6167612641d1",
     ("sglang.srt.mem_cache.unified_radix_cache", "UnifiedRadixCache.checkpoint_into_tree"):
-        "4082530bb41b73ce76ed16c2e1531de1",
+        "1a02ddc00b627831362af8cc85016ab6",
+    # the checkpoint wrapper delegates the insert and its extra_key to the internal method
+    ("sglang.srt.mem_cache.unified_radix_cache", "UnifiedRadixCache._checkpoint_into_tree"):
+        "cdfb6640264d3f37bc29212a151abdf6",
     # sends the request's extra_key to the prefill
     ("sglang.srt.managers.schedule_batch", "Req.build_rebootstrap_payload"): "5806078eb40812545679873977011f82",
 }
@@ -196,7 +199,7 @@ async def handle_route_get(original_fn, self, request, *args, **kwargs):
     from aiohttp import web
 
     response = await original_fn(self, request, *args, **kwargs)
-    chunk, numerics = getattr(self, _SERVER_ADVERT, (0, None))
+    chunk, numerics = getattr(self, _SERVER_ADVERT, None) or (0, None)
     # upstream answers 200 only to a query whose four ranks it parsed as integers
     if not chunk or response.status != 200 or any(int(request.query[name]) != -1 for name in _INFO_QUERY):
         return response

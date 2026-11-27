@@ -37,6 +37,7 @@ PIP = [sys.executable, "-m", "pip"]
 BASE_CHANGES = {
     "tokenizers": "SGLang pins its own tokenizers",
     "huggingface-hub": "the tokenizers SGLang pins needs a newer huggingface-hub than the container's",
+    "pillow": "SGLang requires Pillow below 13, and the Neuron base ships 13",
 }
 
 
@@ -212,7 +213,11 @@ def main() -> None:
             [sys.executable, str(args.repo / "tools/sglang_runtime_requirements.py"), str(sglang / "python")],
             check=True, capture_output=True, text=True).stdout.splitlines()
         runtime += requirement_lines(docker / "diffusion-requirements.txt")
-        added = resolve(runtime, docker / "requirements-lock.txt", args.upgrade, upgrade_packages)
+        # The new gRPC helpers can use the base runtime. Let pip resolve helper
+        # versions around it instead of upgrading the SDK image's grpcio.
+        grpc_constraint = Path(tmp) / "grpc-base.txt"
+        grpc_constraint.write_text(f"grpcio=={base['grpcio']}\n" if "grpcio" in base else "")
+        added = resolve(runtime, docker / "requirements-lock.txt", args.upgrade, upgrade_packages, grpc_constraint)
         problems = base_changes(added, base)
         if problems:
             raise SystemExit("\n".join(problems))

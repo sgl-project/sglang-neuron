@@ -76,44 +76,48 @@ _WEIGHT_UPDATES = (
 _LAUNCH_SOURCES_MD5 = {
     # an abort without logprob rows is formatted by add_logprob_to_meta_info instead
     ("sglang.srt.managers.tokenizer_manager", "TokenizerManager.convert_logprob_style"):
-        "ec11343974cdefc7f5c077f9c03da245",
+        "52fef61e42b6992795578645cf017313",
     # handles an abort itself and sends the scheduler only in_place and retract pauses, which a pipelined server refuses
-    ("sglang.srt.managers.tokenizer_manager", "TokenizerManager.pause_generation"): "201c5381ee9e863303c8b562c79b16e2",
+    ("sglang.srt.managers.tokenizer_manager", "TokenizerManager.pause_generation"): "2f219d8c0002bf5fb69539295a94f38a",
     # its first argument is the timeout a pipelined server refuses
     ("sglang.srt.managers.tokenizer_control_mixin", "TokenizerControlMixin.flush_cache"):
         "c01ade18185dfb7a995460013edecc1f",
 }
 _RUNTIME_SOURCES_MD5 = {
     # every use_* argument is a device communicator, turned off
-    ("sglang.srt.distributed.parallel_state", "init_model_parallel_group"): "fe3cc1fab307a27a8e48c3ee6657bbec",
+    ("sglang.srt.distributed.parallel_state", "init_model_parallel_group"): "dfb58a5970e01e203765fb22843e6ce4",
     # replaced by the NeuronCore's HBM, in the same units and with the same MIN over cpu_group
-    ("sglang.srt.utils.common", "get_available_gpu_memory"): "7ddd40c3e8ba9f559e516b07771ed49e",
+    ("sglang.srt.utils.device", "get_available_gpu_memory"): "0320d5c2a2141021531b0ce0d8fdd815",
     # replaced by the torch copy it dispatches to off CUDA
     ("sglang.srt.layers.dp_attention", "memcpy_func"): "3dada4b81a6675de576fdc5fa4cdf287",
     ("sglang.srt.layers.dp_attention", "memcpy_cpu"): "6ab5f4cac56f480f6e82c4ffdb873a91",
     # skipped: they only bind and re-align for SGLang's CPU engine
     ("sglang.srt.distributed.bootstrap", "_bind_threads_if_cpu"): "1e52fe867f47edcd9ca7660377258941",
-    ("sglang.srt.model_executor.model_runner", "adjust_config_with_unaligned_cpu_tp"):
-        "0b961c0c5f169b47ef54864f93d86ea3",
+    ("sglang.srt.configs.update_config", "adjust_config_with_unaligned_cpu_tp"): "c9df08e993bbda72f93d21f8cc5b935b",
     # skipped when the graph sampled on device (its tokens and logprobs are returned instead); runs on the host sampler
-    ("sglang.srt.model_executor.model_runner", "ModelRunner.sample"): "0f4e42b94e8efa0ee418ac2ca1c9a297",
+    ("sglang.srt.model_executor.model_runner", "ModelRunner.sample"): "782f8a03a5b848b8519b55f4ae062608",
     # skipped after the forward's first request, along with preemption for a request the forward refuses
-    ("sglang.srt.managers.schedule_policy", "PrefillAdder.add_one_req"): "7307599dd69fb761692018e8f1234ceb",
-    ("sglang.srt.managers.schedule_policy", "PrefillAdder.preempt_to_schedule"): "4786f82c61c5ddc9ada287fc0fd0658e",
+    ("sglang.srt.managers.schedule_policy", "PrefillAdder.add_one_req"): "c9ea767f6c48f4389d2afe632f9a35d8",
+    ("sglang.srt.managers.schedule_policy", "PrefillAdder.preempt_to_schedule"): "97b81158073fc4fa84375811fed4b0d2",
     # it would replace a request's pending abort with a successful finish, so the hook applies the abort first
-    ("sglang.srt.disaggregation.prefill", "SchedulerDisaggregationPrefillMixin.process_disagg_prefill_inflight_queue"):
-        "5b49bcb8e522b632073c48f2c075fd7f",
+    ("sglang.srt.disaggregation.prefill", "SchedulerDisaggregationPrefillMixin.process_disagg_prefill_transfer_queue"):
+        "5a34449ca451e64c6ac6759f54b9e460",
     # replaced: the requests go over the TP group's message queue instead of its broadcast
     ("sglang.srt.managers.scheduler_components.request_receiver",
-     "SchedulerRequestReceiver._broadcast_reqs_across_ranks"): "2c89050881db2b90eb39e316e32cd8c6",
+     "SchedulerRequestReceiver._broadcast_reqs_across_ranks"): "94eb66bbcae6c03dcffcefc6b1b61e01",
     # replaced for a model that builds its own KV pools: alloc_memory_pool takes its budgets, pools and allocator
     ("sglang.srt.mem_cache.kv_cache_configurator", "KVCacheConfigurator.configure"): "26002a8418c48534b2ae0f4dc60a703e",
-    ("sglang.srt.model_executor.model_runner", "ModelRunner.alloc_memory_pool"): "b8acb227f87b6ce7940c4343d11d7c9b",
+    ("sglang.srt.model_executor.model_runner", "ModelRunner.alloc_memory_pool"): "b5060ab1ecc6284611cd90bd288bbada",
     # skipped for a model that runs no step through SGLang's attention backends: the hybrid linear-attention wrapper
     # and the decode graphs' gather alignment (_no_linear_attention_backend, _no_decode_gathers)
-    ("sglang.srt.layers.attention.attention_registry", "attn_backend_wrapper"): "3c632b6bde44af715ca38957fd7a8e4d",
+    ("sglang.srt.layers.attention.attention_registry", "attn_backend_wrapper"): "21597b238e312032c5f9a9e9bb4e77f4",
     ("sglang.srt.model_executor.model_runner", "ModelRunner.decode_graph_gather_requirements"):
         "2fbdd971ac0802feaa71f9435cd8348c",
+    # wrapped for a model that allocates HBM beside SGLang's pools
+    ("sglang.srt.mem_cache.kv_cache_configurator", "KVCacheConfigurator._profile_available_bytes"):
+        "a37361b546bfd8b842bcfcf41b8810e9",
+}
+_MODEL_OWNED_DRAFT_POOL_SOURCES_MD5 = {
     # the readers of the configurator fields _without_draft_kv_pool clears: the DFLASH draft cell size, the fused draft
     # pool's decision and the draft pool's budget
     ("sglang.srt.mem_cache.kv_cache_configurator", "KVCacheConfigurator.__post_init__"):
@@ -121,10 +125,6 @@ _RUNTIME_SOURCES_MD5 = {
     ("sglang.srt.mem_cache.kv_cache_configurator", "KVCacheConfigurator._fused_draft_decision"):
         "f75de5ff155c59d64eb7ffb7dd794780",
     ("sglang.srt.model_executor.pool_configurator", "_dflash_draft_cell_size"): "f4f4333d3e77ae141d7dce96d7f07cdc",
-    # wrapped for a model that allocates HBM beside SGLang's pools: the KV budget it returns
-    # (_less_the_model_pools_beside_sglang)
-    ("sglang.srt.mem_cache.kv_cache_configurator", "KVCacheConfigurator._profile_available_bytes"):
-        "fb3fed1784bea1f39ccd4a5059b8d81b",
 }
 
 
@@ -260,8 +260,8 @@ def _register_launch_hooks() -> None:
     from sglang_neuron.managers.logprob_errors import convert_logprob_style
     from sglang_neuron.sglang_patches import (bootstrap_listen_backlog, crash_diagnostics_platform,
                                               decode_radix_prefill_chunks, detokenizer_sender, gpt_oss_backend_check,
-                                              http_fatal_sigquit, neuron_system_profile, pd_fake_prefill,
-                                              quantization_registry, source_guard)
+                                              neuron_system_profile, pd_fake_prefill, quantization_registry,
+                                              source_guard)
 
     source_guard.check_targets(_LAUNCH_SOURCES_MD5, __name__)
 
@@ -288,8 +288,6 @@ def _register_launch_hooks() -> None:
     neuron_system_profile.register_tokenizer(HookRegistry, HookType.AROUND)
     # a crashing server neither triggers CUDA coredumps nor waits 60 s for them
     crash_diagnostics_platform.register(HookRegistry, HookType.REPLACE)
-    # a multi-worker HTTP server keeps SGLang's fatal SIGQUIT handler under Uvicorn's supervisor
-    http_fatal_sigquit.register(HookRegistry, HookType.AROUND, HookType.REPLACE)
     # SGLang's PP passes over the server arguments run here, before the policy is exported; the hooks keep the overlap
     # schedule on for a pipelined decode, reading the policy when they run
     from sglang_neuron.sglang_patches import pp_overlap_schedule
@@ -312,7 +310,9 @@ def _register_launch_hooks() -> None:
     HookRegistry.register(f"{_CONTROL}.flush_cache", _refuse_timed_flush_under_pp, HookType.AROUND)
     # the launching process checks its arguments against the backend choices
     _register_attention_backend()
-    _register_megakernel_launch_seams()
+    from sglang_neuron.megakernel.registry import register_specs
+
+    register_specs()
 
 
 def register() -> None:
@@ -358,14 +358,14 @@ def _register() -> None:
     HookRegistry.register("sglang.srt.distributed.parallel_state.init_model_parallel_group",
                           _init_model_parallel_group_without_device_communicators, HookType.AROUND)
     HookRegistry.register("sglang.srt.layers.dp_attention.memcpy_func", _memcpy_torch, HookType.REPLACE)
-    HookRegistry.register("sglang.srt.utils.common.get_available_gpu_memory", _available_device_memory_gb,
+    HookRegistry.register("sglang.srt.utils.device.get_available_gpu_memory", _available_device_memory_gb,
                           HookType.AROUND)
     HookRegistry.register("sglang.srt.distributed.bootstrap._bind_threads_if_cpu", _no_cpu_engine_binding,
                           HookType.AROUND)
     from sglang_neuron.sglang_patches import numa_node_published
 
     numa_node_published.register(HookRegistry, HookType.AROUND)
-    HookRegistry.register("sglang.srt.model_executor.model_runner.adjust_config_with_unaligned_cpu_tp",
+    HookRegistry.register("sglang.srt.configs.update_config.adjust_config_with_unaligned_cpu_tp",
                           _keep_model_config, HookType.AROUND)
 
     # the model, its KV pool and its sampled outputs
@@ -410,7 +410,7 @@ def _register() -> None:
                           _preempt_only_for_an_admitted_request, HookType.AROUND)
     from sglang_neuron.sglang_patches import chunk_keyed_tree, decode_graph_buckets, prefill_chunk_grid
 
-    prefill_chunk_grid.register(HookRegistry, HookType.AROUND, HookType.REPLACE)
+    prefill_chunk_grid.register(HookRegistry, HookType.AROUND)
     if policy.megakernel:
         # a megakernel decode's capture list is the runtime's own buckets (its warm captures), not upstream's
         # attention-TP-aligned subset — a per-layer model keeps upstream's
@@ -433,7 +433,7 @@ def _register() -> None:
     from sglang_neuron.managers.logprob_errors import finish_prefill_aborts
 
     HookRegistry.register(
-        "sglang.srt.disaggregation.prefill.SchedulerDisaggregationPrefillMixin.process_disagg_prefill_inflight_queue",
+        "sglang.srt.disaggregation.prefill.SchedulerDisaggregationPrefillMixin.process_disagg_prefill_transfer_queue",
         finish_prefill_aborts, HookType.AROUND)
     if policy.async_execution:
         from sglang_neuron.model_executor import async_execution
@@ -465,14 +465,14 @@ def _register() -> None:
     disaggregation.register_hooks(HookRegistry, HookType)
     _register_pipeline_parallel(policy)
     _register_decode_context_parallel(policy)
-    _register_megakernel_runtime_seams(policy)
     # HiCache L2 (only reached with --enable-hierarchical-cache): the Neuron host pools, their transfer events and the
     # node's shared host budget
-    from sglang_neuron.mem_cache import host_budget, host_pool, hybrid_host_pool
+    if policy.hierarchical_cache:
+        from sglang_neuron.mem_cache import host_budget, host_pool, hybrid_host_pool
 
-    host_pool.register_hooks(HookRegistry, HookType)
-    hybrid_host_pool.register_hooks(HookRegistry, HookType)
-    host_budget.register_hooks(HookRegistry, HookType)
+        host_pool.register_hooks(HookRegistry, HookType)
+        hybrid_host_pool.register_hooks(HookRegistry, HookType)
+        host_budget.register_hooks(HookRegistry, HookType)
     logger.info("[neuron] runtime registered (serving policy %s)", policy.to_json())
 
 
@@ -563,36 +563,6 @@ def _register_decode_context_parallel(policy) -> None:
     from sglang_neuron.sglang_patches import dcp_groups
 
     dcp_groups.register(HookRegistry, HookType.REPLACE)
-
-
-def _register_megakernel_launch_seams() -> None:
-    """The platform seams of upstream SGLang's megakernel binding (--enable-nvidia-megakernel) that every process
-    reads: the platform's device target and the target registry the specs are found in (argument resolution, the
-    tokenizer, the schedulers) and GPT-OSS's backend overrides left to a registered spec (argument resolution). Then the
-    specs the plugin ships, on their targets (megakernel/registry.py). Without the flag every hooked function is
-    upstream's (docs/design/megakernel.md, Seams; the seams a later spec needs register here with it)."""
-    from sglang_neuron.megakernel.registry import register_specs
-    from sglang_neuron.sglang_patches import megakernel_oot_overrides, megakernel_platform, megakernel_request_contract
-
-    megakernel_platform.register(HookRegistry, HookType.AROUND, HookType.REPLACE)
-    megakernel_request_contract.register(HookRegistry, HookType.AROUND)
-    megakernel_oot_overrides.register()
-    register_specs()
-
-
-def _register_megakernel_runtime_seams(policy) -> None:
-    """The megakernel seams of a scheduler process: a platform-owned whole-step dispatch run by EagerRunner, KV
-    pools in a built megakernel's declared layout, and, on a launch of a model's whole-model megakernel
-    (ServingPolicy.megakernel), the MLP sync cohort snapshot its spec can ask for (megakernel_platform.
-    agree_mlp_sync_cohort turns it on; off, it changes nothing)."""
-    from sglang_neuron.sglang_patches import megakernel_eager_dispatch, megakernel_pool_layout
-
-    megakernel_eager_dispatch.register(HookRegistry, HookType.AROUND)
-    megakernel_pool_layout.register(HookRegistry, HookType.AROUND)
-    if policy.megakernel:
-        from sglang_neuron.sglang_patches import mlp_sync_cohort_snapshot
-
-        mlp_sync_cohort_snapshot.register(HookRegistry, HookType.AROUND, HookType.REPLACE)
 
 
 def _register_model_package() -> None:
@@ -769,6 +739,9 @@ def _without_draft_kv_pool(configurator) -> None:
     KV capacity several times over (the Kimi-K3 decode: 95,360 tokens a rank instead of its 435,072)."""
     import msgspec
 
+    from sglang_neuron.sglang_patches import source_guard
+
+    source_guard.check_targets(_MODEL_OWNED_DRAFT_POOL_SOURCES_MD5, __name__)
     aux = configurator.spec_aux_config
     configurator.spec_aux_config = msgspec.structs.replace(aux, dflash_draft_num_layers=None,
                                                            draft_kv_num_layers=None, draft_model_config=None)
@@ -830,6 +803,10 @@ def _sample_on_device(original_fn, self, logits_output, forward_batch, *args, **
     ns = getattr(logits_output, "neuron_sample", None)
     if ns is None:
         return original_fn(self, logits_output, forward_batch, *args, **kwargs)
+    if (self.sampling_observer is not None or self.canary_manager is not None
+            or forward_batch.ngram_embedding_info is not None):
+        raise RuntimeError("The Neuron device sampler does not support sampling observers, KV canaries, or n-gram updates")
+    logits_output.auxiliary_device_output = None
     pending = getattr(logits_output, "neuron_pending_sample", None)
     if pending is not None:
         pending.top_logprobs_nums = tuple(int(k or 0) for k in (forward_batch.top_logprobs_nums or ()))

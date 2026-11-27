@@ -17,7 +17,7 @@ from typing import Optional
 import torch
 
 from sglang.srt.mem_cache.allocator.paged import PagedTokenToKVPoolAllocator, alloc_decode_naive
-from sglang.srt.utils import get_num_new_pages
+from sglang.srt.mem_cache.utils import get_num_new_pages
 
 from sglang_neuron.mem_cache.page_set import PageSetFreeMixin
 
@@ -54,9 +54,9 @@ def alloc_extend_pages(prefix_lens_cpu: torch.Tensor, seq_lens_cpu: torch.Tensor
 # through these methods. free_segment (into free_page_ids) is what every row release takes, and under a radix tree also
 # every eviction (StaticKVStorage.free_units) and duplicate insert (StaticKVStorage.free_token_rows)
 _SOURCES_MD5 = {("sglang.srt.mem_cache.allocator.paged", f"PagedTokenToKVPoolAllocator.{name}"): md5 for name, md5 in (
-    ("_release_page_ids", "4357cb7cdbc0694031a80e13e6c83d30"),
-    ("clear", "77125e295b13c089351fc865ff3cc48b"),
-    ("merge_and_sort_free", "248077b82757a563810b27b28125195b"),
+    ("_release_page_ids", "ce9a5a1d4b856bf97a3220a5b08ce873"),
+    ("clear", "8adc58b825cd5003d72364294f8b214a"),
+    ("merge_and_sort_free", "cef2772456bd5e434ddc9e87241d2249"),
     ("get_all_free_pages", "026fe2e58e3882a28ddf805b88651b32"),
     ("available_size", "7b25ae8028912ba7b5d287546249ac49"),
     ("free", "19dfe9c55416704ee3b52f25a83d1777"),
@@ -170,6 +170,10 @@ def _refuse_unserved_fresh_pages(allocator) -> None:
 
 
 class NeuronPagedTokenToKVPoolAllocator(PageSetFreeMixin, PagedTokenToKVPoolAllocator):
+    # Neuron orders page reuse using its own launch counts. The upstream guard
+    # expects a CUDA event, which our partial staged-page merge cannot track.
+    supports_reuse_guard = False
+
     @property
     def zeroes_freed_pages(self) -> bool:
         """Whether every page this allocator hands out again reads zero: its pool (or a hybrid pool's full-attention

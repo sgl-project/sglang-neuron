@@ -125,8 +125,8 @@ def pp_launch_problems(server_args, policy=None) -> list:
     if attention_dp > 1:
         problems.append("DP attention (--enable-dp-attention, --attn-dp-size): the stage graphs and the seam carry "
                         "one TP group's batch")
-    if getattr(server_args, "enable_nvidia_megakernel", False):
-        problems.append("--enable-nvidia-megakernel: a whole-model kernel holds every layer, not a stage's")
+    if getattr(policy, "megakernel", False) or getattr(server_args, "enable_nvidia_megakernel", False):
+        problems.append("a whole-model megakernel holds every layer and requires one pipeline stage")
     if sgl_envs.SGLANG_PP_SKIP_PURE_CHUNKED_OUTPUT_COMM.get():
         problems.append("SGLANG_PP_SKIP_PURE_CHUNKED_OUTPUT_COMM: the seam sends every stage boundary in order, and a "
                         "skipped one would put the stages' slots out of step")

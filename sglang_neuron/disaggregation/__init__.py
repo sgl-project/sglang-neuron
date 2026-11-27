@@ -106,12 +106,11 @@ def register_hooks(registry, hook_type) -> None:
     from sglang_neuron.disaggregation import poll_reduce
     from sglang_neuron.sglang_patches import (decode_radix_prefill_chunks, nixl_await_poll, nixl_decode_listener,
                                               nixl_head_major, nixl_peer_refusal, nixl_settle_then_ack,
-                                              pd_decode_kv_quarantine, pd_kv_layer_ids, pd_status_lock,
+                                              pd_decode_kv_quarantine, pd_kv_layer_ids,
                                               prefill_dispatch_dp_rank)
 
     around, replace = hook_type.AROUND, hook_type.REPLACE
     nixl_peer_refusal.register(registry, around, replace)
-    pd_status_lock.register(registry, around, replace)
     nixl_settle_then_ack.register(registry, around, replace)
     if policy.role == "prefill":
         # the sender's transfer worker, which waits for its WRITEs

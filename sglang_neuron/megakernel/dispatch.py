@@ -1,15 +1,15 @@
 # SPDX-License-Identifier: Apache-2.0
 """The whole-step dispatch of a Neuron megakernel.
 
-SGLang's binding installs a megakernel under ``--enable-nvidia-megakernel``: it finds the spec registered for the
+SGLang's native integration installs the selected spec for the
 model's architecture on the platform's device target, checks it against the resolved configuration, builds it after the
 weights load (before the KV cache is sized) and asks the platform for the dispatch
-(``NeuronSRTPlatform.install_megakernel_dispatch``, the platform seams of ``sglang_patches/megakernel_platform.py``).
+(``NeuronSRTPlatform.install_megakernel_dispatch``).
 The platform calls ``host.create_dispatch``, which lands here:
 
 - ``attach`` refuses a built object that is not a ``NeuronBuiltMegakernel``, makes the ranks of the TP group agree on
   its digest (programs, widths, pool layout; SGLang's own agreement covers the widths and draft entries only) and
-  returns the ``NeuronMegakernelDispatch``, which SGLang keeps on the model (``megakernel_platform.EAGER_DISPATCH_KEY``).
+  returns the ``NeuronMegakernelDispatch``, which SGLang keeps on the model.
 - ``prepare`` runs once the pools exist: SGLang's ``EagerRunner`` calls it, and so does the platform's graph runner
   (``NeuronModel._ensure_runtime``); the second call with the same runner is a no-op. The built object binds its pool
   layout and builds, compiles and warms its runtimes.
@@ -26,20 +26,18 @@ from .built import NeuronBuiltMegakernel
 
 logger = logging.getLogger(__name__)
 
-# SGLang's attributes on the model: the built object (kernel_plugins.nvidia.binding.built_megakernel) and the platform's
-# whole-step dispatch (sglang_patches/megakernel_platform.EAGER_DISPATCH_KEY)
-_BUILT = "_megakernel"
-_DISPATCH = "_megakernel_eager_dispatch"
-
-
 def dispatch_of(model) -> Optional["NeuronMegakernelDispatch"]:
     """The model's installed Neuron megakernel dispatch, or None (the model's own host serves it)."""
-    dispatch = None if model is None else getattr(model, "__dict__", {}).get(_DISPATCH)
+    from sglang.srt.kernel_plugins.megakernel import oot_megakernel_dispatch
+
+    dispatch = oot_megakernel_dispatch(model)
     return dispatch if isinstance(dispatch, NeuronMegakernelDispatch) else None
 
 
 def built_megakernel(model):
-    return None if model is None else getattr(model, "__dict__", {}).get(_BUILT)
+    from sglang.srt.kernel_plugins.megakernel import oot_built_megakernel
+
+    return oot_built_megakernel(model)
 
 
 def _gather_tp(value) -> list:

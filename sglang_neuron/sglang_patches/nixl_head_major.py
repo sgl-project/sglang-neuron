@@ -33,6 +33,9 @@ from typing import Dict, Tuple
 
 HEAD_MAJOR_FRAME = b"sglang-neuron:kv-head-major"
 NEURON_KV_LAYOUT = "sglang-neuron:kv-head-major"
+# The native parser reads msg[26] as optional JSON. Keep this slot present
+# before appending extensions, even when unified memory is off.
+_UNIFIED_LAYOUT_FRAME = 26
 _CONN = "sglang.srt.disaggregation.nixl.conn"
 _COMMON = "sglang.srt.disaggregation.common.conn"
 _UTILS = "sglang.srt.disaggregation.utils"
@@ -40,9 +43,9 @@ _STAGING = "sglang.srt.disaggregation.common.staging_buffer"
 _TARGETS_MD5: Dict[Tuple[str, str], str] = {
     (_CONN, "NixlKVManager._init_hetero_tp_prep_handle"): "85727ce66c9512bc9be63136dc52db2f",
     (_CONN, "NixlKVManager.send_kvcache_slice"): "caa8942af9f2fc181c7daf2618ad6cca",
-    (_CONN, "NixlKVManager.build_receiver_registration_message"): "1d28c9d9c8345a71db02d6840a7a3acc",
-    (_CONN, "NixlKVManager._add_remote_peer"): "e2ee9f36cd7849d884c49275e4c10bde",
-    (_CONN, "KVArgsRegisterInfo.from_zmq"): "888b10e09310b5af69364bbf6ffbdfab",
+    (_CONN, "NixlKVManager.build_receiver_registration_message"): "05672eec732d94dd911b0120bcdbe41a",
+    (_CONN, "NixlKVManager._add_remote_peer"): "9da5fea5453d71ac4a08299aa13fa10a",
+    (_CONN, "KVArgsRegisterInfo.from_zmq"): "2d14e31288922d07db40e1ac4098255f",
     (_CONN, "expand_page_indices_for_slice"): "c7468a6078c8bb0085872a44a0e74ee8",
     # the head slice arithmetic the transfer keeps
     (_STAGING, "compute_head_slice_params"): "9963562e07776bf1ebd244343534ec62",
@@ -91,7 +94,13 @@ SEND_SUBSTITUTIONS = ((UPSTREAM_PAGE_SIZE, NEURON_PAGE_SIZE), (UPSTREAM_SEND_LOO
 
 
 def build_receiver_registration_message(original_fn, self, *args, **kwargs):
-    return list(original_fn(self, *args, **kwargs)) + [HEAD_MAJOR_FRAME]
+    message = list(original_fn(self, *args, **kwargs))
+    # The sender also has a leading guard frame that the parser does not see.
+    index = _UNIFIED_LAYOUT_FRAME + 1
+    if len(message) == index or message[index].startswith(b"sglang-neuron:"):
+        message.insert(index, b"")
+    message.append(HEAD_MAJOR_FRAME)
+    return message
 
 
 def from_zmq(original_fn, cls, msg, *args, **kwargs):

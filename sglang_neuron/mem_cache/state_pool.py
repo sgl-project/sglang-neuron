@@ -35,7 +35,7 @@ connector registers and sends the pool's state entries. The platform supplies th
   bank or the padding/sink slots), through mem_cache/state_host_pool; ``get_cpu_copy`` / ``load_cpu_copy`` are
   upstream's retraction backup and restore of a request's slot, synchronous and slot-granular;
 * a separate radix checkpoint store (mem_cache/state_checkpoint_pool) binds to the pool it serves at construction
-  (``HybridReqToTokenPool._init_mamba_pool``, through sglang_patches/megakernel_pool_layout) and copies slots into and
+  (``HybridReqToTokenPool._init_mamba_pool``, through sglang_patches/state_pool_class) and copies slots into and
   out of it with the model's ``copy_across``;
 * a failed operation or drain quarantines the pool: every later operation raises with the first failure, and slots
   are never handed to new owners over state an operation may still write;
@@ -173,7 +173,9 @@ class NeuronStatePool(MambaPool):
         return type(name or f"NeuronStatePool_{spec.family}", (cls,), {"spec": spec, "ops": ops})
 
     def __init__(self, *, size: int, spec_state_size: int, cache_params, mamba_layer_ids: Sequence[int], device,
-                 speculative_eagle_topk: Optional[int] = None, linear_replayssm_cache_len: int = 16, **options):
+                 speculative_eagle_topk: Optional[int] = None, linear_replayssm_cache_len: int = 16,
+                 allocate_intermediate_ssm: bool = True, **options):
+        # The Neuron pool implements its own state layout without upstream's intermediate SSM buffers.
         spec = type(self).spec
         if spec is None:
             raise TypeError("NeuronStatePool is unbound: build the pool class with NeuronStatePool.bind(spec, ops)")

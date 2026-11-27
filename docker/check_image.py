@@ -106,7 +106,8 @@ def installed_package(checkout: Path, sglang_commit: str) -> Path:
     except md.PackageNotFoundError:
         version = "no installed distribution"
     # the version the wheel build gave it; the Dockerfile's sglang stage proved the source is that commit
-    check("sglang is the pinned commit", version.endswith(f"+g{sglang_commit[:7]}"), version)
+    _, _, version_commit = version.rpartition("+g")
+    check("sglang is the pinned commit", len(version_commit) >= 7 and sglang_commit.startswith(version_commit), version)
     check("sglang_neuron is an installed package", site_packages_file(sglang_neuron), sglang_neuron.__file__)
     root = Path(sglang_neuron.__file__).resolve().parent
     shipped = shipped_files(checkout)

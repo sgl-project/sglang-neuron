@@ -21,7 +21,7 @@ export SGLANG_DISAGGREGATION_NIXL_BACKEND=LIBFABRIC NIXL_LIBFABRIC_EFA_UNSOLICIT
 export FI_EFA_USE_HUGE_PAGE=0 FI_EFA_USE_DEVICE_RDMA=1 OMP_NUM_THREADS=1 MKL_NUM_THREADS=1 OPENBLAS_NUM_THREADS=1
 
 COMMON_FLAGS=(--device cpu --attention-backend neuron --sampling-backend pytorch
-    --tp-size 128 --dp-size 8 --enable-dp-attention --ep-size 128 --enable-nvidia-megakernel
+    --tp-size 128 --attn-dp-size 8 --ep-size 128
     --page-size 2048 --context-length 262144 --chunked-prefill-size 16384 --radix-cache-backend neuron-chunk
     --mamba-radix-cache-strategy extra_buffer --mamba-track-interval 2048 --mem-fraction-static 0.8
     --disable-custom-all-reduce --trust-remote-code --watchdog-timeout 7200 --stream-interval 1

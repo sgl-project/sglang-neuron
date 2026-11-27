@@ -7,7 +7,7 @@ lookup to the renamed PrivateUse1 backend, which raises. The method is rebuilt f
 turned off. Everything else stays upstream's, including the padding fill value: ``_is_cpu`` also picks between the
 CPU-graph and the CUDA-graph fill value, and the Neuron attention backend returns the same number for both.
 
-Target md5-pinned against upstream SGLang 43881a7: ``ForwardBatch.prepare_mlp_sync_batch``.
+The source guard covers ``ForwardBatch.prepare_mlp_sync_batch``.
 
 Upstream: SGLang could decide the pin with the platform's is_pin_memory_available() instead of forward_batch_info's
 _is_cpu; the module then goes away."""
@@ -17,7 +17,7 @@ from __future__ import annotations
 _MODULE = "sglang.srt.model_executor.forward_batch_info"
 _QUALNAME = "ForwardBatch.prepare_mlp_sync_batch"
 TARGET = f"{_MODULE}.{_QUALNAME}"
-_TARGET_MD5 = "5d1af57a8341ab1a75c086e70a6786c4"
+_TARGET_MD5 = "ac13563658e5d6a86ba165891c3fddc2"
 UPSTREAM_PIN = "self.use_pin_memory = not _is_cpu"
 NEURON_PIN = "self.use_pin_memory = False"
 

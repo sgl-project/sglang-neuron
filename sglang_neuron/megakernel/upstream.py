@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 """The one module of the megakernel host that imports SGLang's megakernel contract
-(``sglang.kernels.plugin_kernels.nvidia.spec``, upstream RFC sgl-project/sglang#46355).
+(``sglang.kernels.plugin_kernels.megakernel.spec``).
 
 The contract is SGLang's: ``MegakernelSpec`` (requirements, accepted features, numerics, ``max_rows``, ``build``),
 ``BuildContext``, ``Step`` and the ``BuiltMegakernel`` protocol (``widths``, ``summary``, ``plan``, ``forward`` and the
@@ -12,7 +12,7 @@ from __future__ import annotations
 from typing import Any, Optional
 
 try:
-    from sglang.kernels.plugin_kernels.nvidia import spec as _spec
+    from sglang.kernels.plugin_kernels.megakernel import spec as _spec
 except Exception as _err:  # noqa: BLE001 -- a tree older than the contract; refused at use
     _spec = None
     _IMPORT_ERROR: Optional[BaseException] = _err
@@ -20,7 +20,7 @@ else:
     _IMPORT_ERROR = None
 
 # The contract version the host and the shipped specs are written against.
-API_VERSION = 2
+API_VERSION = 3
 # The SGLang flag under which SGLang's binding installs a megakernel (the platform seams route it to this host).
 FLAG = "--enable-nvidia-megakernel"
 
@@ -32,7 +32,7 @@ def available() -> bool:
 
 def unavailable_reason() -> str:
     if _spec is None:
-        return (f"the served SGLang tree has no megakernel contract (sglang.kernels.plugin_kernels.nvidia.spec does not "
+        return (f"the served SGLang tree has no megakernel contract (sglang.kernels.plugin_kernels.megakernel.spec does not "
                 f"import: {_IMPORT_ERROR!r})")
     return (f"the served SGLang tree's megakernel contract is API version {_spec.MEGAKERNEL_API_VERSION}; the host is "
             f"written against version {API_VERSION}")

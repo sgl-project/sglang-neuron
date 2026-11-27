@@ -40,24 +40,27 @@ _COMMON = "sglang.srt.disaggregation.common.conn"
 _NIXL = "sglang.srt.disaggregation.nixl.conn"
 _UTILS = "sglang.srt.disaggregation.utils"
 _SCHEDULER = "sglang.srt.managers.scheduler"
+_RETIRER = "sglang.srt.managers.scheduler_components.request_retirer"
 TARGET = f"{_DECODE}.DecodeTransferQueue.resolve_deferred_releases"
+_FAILED_RECEIVE = (_DECODE, "DecodeTransferQueue._failed_receive_quiescent")
 _TARGETS_MD5 = {
-    (_DECODE, "DecodeTransferQueue.resolve_deferred_releases"): "c2c2c335a27dad608da623b902715b98",
-    # an entry is (decode_req, start, deadline, metadata slot, required acks); pop_transferred delegates to
-    # pop_transferred_with_outcomes, which appends the agreed holds. A room whose destination no prefill rank was sent
-    # (a deferred publish, a held send) is held for a peer rank only and waits for no ack
-    (_DECODE, "DecodeTransferQueue.pop_transferred"): "734e67e1e066ea0df2d540fbb7c32fc2",
-    (_DECODE, "DecodeTransferQueue.pop_transferred_with_outcomes"): "eefc7913311dd1a015b87b20faaf3de6",
-    (_DECODE, "DecodeTransferQueue._defer_release"): "60935590b6a464dec14c18537964ef16",
-    (_DECODE, "DecodeTransferQueue._do_release"): "8d3d458c315a9655797545f857552edd",
+    (_DECODE, "DecodeTransferQueue.resolve_deferred_releases"): "7a64e7b03a3f21c5510f0bcf539243a6",
+    # The indexed queue owns the request until its retirer releases or abandons it.
+    (_DECODE, "DecodeTransferQueue.__init__"): "fadafad2cc2ff143f2f655c6b56dd86b",
+    (_DECODE, "DecodeTransferQueue.move_transferred"): "7534b18f6321093a5d31a52cf36555ba",
+    (_DECODE, "DecodeTransferQueue.move_transferred_with_outcomes"): "632cf0566b4855228d8fc3fc093b82d3",
+    (_DECODE, "DecodeTransferQueue._defer_release"): "f051b1cbc1fcc0726cf1d0e41ce7141c",
+    (_DECODE, "DecodeTransferQueue._do_release"): "dea0d49f4bbfe5995eb120165fdbcfba",
+    (_RETIRER, "RequestRetirer.release"): "1c428103cc9d347b889a8d63b8e555c7",
+    (_RETIRER, "RequestRetirer.abandon"): "e13e7ac902cc9c94210018018e597241",
+    _FAILED_RECEIVE: "bd98146ac912bc9f73509fec062ea4b2",
     (_DECODE, "DecodeTransferQueue._is_host_destination"): "b0b728ec184d5def1bfc29a701c0acd1",
     (_DECODE, "DecodeTransferQueue._observe_deferred_kv_release"): "ce9aac73dab17ec7799f4d0d61777ef2",
     (_DECODE, "DecodeTransferQueue.has_pending_deferred_releases"): "48cd0762b541a784b22f7e37b76a55b1",
-    (_DECODE, "DecodeTransferQueue.release_memory_occupation"): "0fef59c463c16cff8ceac3bde0732244",
     (_COMMON, "CommonKVReceiver.ensure_abort_notified"): "e92d994aff6f8e1a224cc2fe03e612cc",
     (_UTILS, "all_reduce_flags"): "7a6299fea1c3571aba1d517d3feca38e",
     # the pass every rank runs at the same point of its loop
-    (_DECODE, "SchedulerDisaggregationDecodeMixin.process_decode_queue"): "d1df3418bea2696da4c1ffacd3fa7bb0",
+    (_DECODE, "SchedulerDisaggregationDecodeMixin.process_decode_queue"): "5896026fc830bf3ba4f1efb87a147a73",
     # acks are counted per room under the generation its ABORT carried
     (_COMMON, "CommonKVManager.register_deferred_abort_room"): "034e96df7be819cb37e2cca35ac8ba32",
     (_COMMON, "CommonKVManager.note_abort_ack"): "b5e35b6e220f2f947246ebf9846f437b",
@@ -80,14 +83,14 @@ _TARGETS_MD5 = {
     (_COMMON, "CommonKVManager._send_abort_acks"): "3d758824ad34d6c8fb963d13a4cd1e6e",
     (_COMMON, "CommonKVManager._send_abort_ack"): "1a1d21f00855fd549cbd34e08e8942dd",
     # a prefill's registration leaves the table only when the heartbeat declares it dead
-    (_COMMON, "CommonKVManager._start_heartbeat_checker_thread"): "4b82f323219fc1b315be3ba5ee716cb4",
+    (_COMMON, "CommonKVManager._start_heartbeat_checker_thread"): "7ed329ffcfcdae975b269effd321308c",
     (_COMMON, "CommonKVManager._handle_node_failure"): "6e9833cfe13f0603968dbeb2ff1bc091",
-    (_COMMON, "CommonKVManager.try_ensure_parallel_info"): "15b2d05442275911ca74f44980700aac",
+    (_COMMON, "CommonKVManager.try_ensure_parallel_info"): "90636b1cbbb04ad5da7c3368886d1289",
     (_COMMON, "CommonKVReceiver.init"): "fe1b27f354afbc1dfb46cf7dfa0be764",
-    (_COMMON, "CommonKVReceiver._clear"): "8d04db4cf98d46c6677fd778efb08f4c",
+    (_COMMON, "CommonKVReceiver._clear"): "90919ea1b438ae1ab32ef19c9447e3cf",
     # not idle while anything is held, and no idle leak check
-    (_SCHEDULER, "Scheduler.is_fully_idle"): "28e67960ff8d30595eab2437fe29b45e",
-    (_SCHEDULER, "Scheduler.on_idle"): "905885a538273f5271e11bf93c08848c",
+    (_SCHEDULER, "Scheduler.is_fully_idle"): "1ba27796ddcb11bbb34be6a76eaba760",
+    (_SCHEDULER, "Scheduler.on_idle"): "5dac61ea3d7d135009e0b9d50bee0c71",
 }
 
 ABORT_RESEND_S = 5.0
@@ -199,7 +202,7 @@ def resolve_deferred_releases(self) -> None:
     if not self._deferred_releases:
         stale = self.__dict__.get(_STATE)
         if stale is not None:
-            # reset, including holds dropped without a release (release_memory_occupation tears the pool down)
+            # Clear bookkeeping after the last request leaves the queue.
             stale.held, stale.report_at, stale.passes, stale.length = {}, None, 0, 0
             stale.agreed = {}
         return
@@ -213,7 +216,8 @@ def resolve_deferred_releases(self) -> None:
     # Why this rank may release each hold: DRAINED (every prefill rank acked), DEAD (past its deadline, its prefill
     # declared dead), TIMEOUT (past its deadline, on another backend than NIXL: upstream's timed release), or None.
     reasons = []
-    for decode_req, _, deadline, _, required_acks in self._deferred_releases:
+    entries = list(self._deferred_releases.items())
+    for decode_req, _, deadline, _, required_acks in entries:
         receiver = decode_req.kv_receiver
         if self._is_host_destination(decode_req):
             # A timeout cannot prove that a remote write has stopped.
@@ -241,24 +245,21 @@ def resolve_deferred_releases(self) -> None:
         op=torch.distributed.ReduceOp.MIN,
     )
     held_before, quarantine.held = quarantine.held, {}
-    still_held = []
     to_release = []
     across_stages = _pipelined()
-    for entry, is_ready, reason in zip(self._deferred_releases, ready, reasons):
+    for entry, is_ready, reason in zip(entries, ready, reasons):
         decode_req, start_time, deadline, idx, required_acks = entry
         before = held_before.get(id(entry))
         held = before[1] if before is not None and before[0] is entry else None
         if is_ready and across_stages:
             # released with the other stages once all of them agreed (release_agreed); the first agreed reason sticks
             quarantine.agreed.setdefault(hold_key(entry), reason)
-            still_held.append(entry)
             if held is not None:
                 quarantine.held[id(entry)] = (entry, held)
             continue
         if is_ready:
             to_release.append((decode_req, start_time, deadline, idx, reason, held))
             continue
-        still_held.append(entry)
         receiver = decode_req.kv_receiver
         if now < deadline or self._is_host_destination(decode_req) or not quarantines(receiver):
             # Not quarantined: a hold before its deadline, of host pages (only their receiver releases them), or on
@@ -285,11 +286,8 @@ def resolve_deferred_releases(self) -> None:
             resend_abort(receiver)
             held.resend_at = now + held.wait
             held.wait = min(2 * held.wait, ABORT_RESEND_MAX_S)
-    # Commit the survivors before releasing so a _do_release exception can't leave a released entry in the list
-    # (double-free / None receiver on retry).
-    self._deferred_releases = still_held
-    quarantine.length = len(still_held)
     _release(self, to_release, now)
+    quarantine.length = len(self._deferred_releases)
     _report(self, quarantine, now)
 
 
@@ -311,7 +309,7 @@ def agreed_holds(queue) -> list:
     quarantine = queue.__dict__.get(_STATE)
     if quarantine is None or not quarantine.agreed:
         return []
-    keys = (hold_key(entry) for entry in queue._deferred_releases)
+    keys = (hold_key(entry) for entry in queue._deferred_releases.items())
     return [key for key in keys if key in quarantine.agreed]
 
 
@@ -321,18 +319,16 @@ def release_agreed(queue, keys) -> list:
     sending its agreement until the first consensus naming the hold reaches it."""
     quarantine = _quarantine(queue)
     wanted = set(keys)
-    released, to_release, still_held = [], [], []
-    for entry in queue._deferred_releases:
+    released, to_release = [], []
+    for entry in queue._deferred_releases.items():
         decode_req, start_time, deadline, idx, _ = entry
         key = hold_key(entry)
         if key not in wanted:
-            still_held.append(entry)
             continue
         record = quarantine.held.pop(id(entry), None)
         held = record[1] if record is not None and record[0] is entry else None
         to_release.append((decode_req, start_time, deadline, idx, quarantine.agreed.pop(key), held))
         released.append(key)
-    queue._deferred_releases = still_held
     # take only the released holds off the count the last resolve saw: a hold made since still counts as new
     quarantine.length -= len(to_release)
     _release(queue, to_release, time.monotonic())
@@ -361,9 +357,8 @@ def _release(self, to_release, now: float) -> None:
         outcome = "drained" if reason == DRAINED else "timeout"
         try:
             self._do_release(decode_req, idx)
-        except Exception:
-            # Isolate a failed release so the rest still run; entry already dropped.
-            logger.exception("Deferred KV release failed for room %s", room)
+        except Exception as error:
+            self.scheduler.request_retirer.abandon(decode_req.req, error)
             outcome = "error"
         self._observe_deferred_kv_release(duration_seconds=max(0.0, now - start_time), outcome=outcome)
 
@@ -390,12 +385,18 @@ def _report(queue, quarantine: _Quarantine, now: float) -> None:
 
 
 def register(registry, replace) -> None:
-    import functools
-    import importlib
-
     from sglang_neuron.sglang_patches import source_guard
 
-    for (module, qualname), md5 in _TARGETS_MD5.items():
-        obj = functools.reduce(getattr, qualname.split("."), importlib.import_module(module))
-        source_guard.check(obj, md5, f"{module}.{qualname}", __name__)
+    source_guard.check_targets(_TARGETS_MD5, __name__)
     registry.register(TARGET, resolve_deferred_releases, replace)
+    # SGLang's network waiter also uses the deadline to decide if it can move a KV row.
+    # Apply the same drain rule to that path so a live prefill cannot still write the row.
+    waiter = source_guard.with_substitutions(source_guard.resolve(*_FAILED_RECEIVE), (
+        ("    receiver = decode_req.kv_receiver\n",
+         "    from sglang_neuron.sglang_patches import pd_decode_kv_quarantine as quarantine\n\n"
+         "    receiver = decode_req.kv_receiver\n"),
+        ("        or time.monotonic() >= deadline\n",
+         "        or (time.monotonic() >= deadline and (not quarantine.quarantines(receiver)\n"
+         "                                             or quarantine.prefill_declared_dead(receiver)))\n"),
+    ))
+    registry.register(".".join(_FAILED_RECEIVE), waiter, replace)

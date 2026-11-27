@@ -14,7 +14,7 @@ prefill's tokenizer manager would start the backend's bootstrap server, which th
 Each request then gets upstream's fake sender (``PrefillBootstrapQueue.create_sender`` through ``get_kv_class``),
 which reports a finished transfer as soon as the last chunk is sent. Every other launch runs both functions unchanged.
 
-Targets are md5-pinned against upstream SGLang 43881a7.
+Source guards cover both the argument check and the bootstrap server entry point.
 
 Upstream: the fake backend could serve a prefill as it serves a decode; this module then goes away."""
 
@@ -27,7 +27,7 @@ HANDLE = "sglang.srt.arg_groups.pd_disaggregation_hook.handle_pd_disaggregation"
 # the tokenizer manager's own binding, which it calls
 START = "sglang.srt.managers.tokenizer_manager.start_disagg_service"
 _TARGETS_MD5 = {
-    HANDLE: "add6282d525c6422e434aa0c0bde9e95",
+    HANDLE: "f3a817b3cf10ac7034dc53df7133f6ac",
     START: "56e8976a902af879bab75ed2e87c7bcc",
 }
 FAKE = "fake"
