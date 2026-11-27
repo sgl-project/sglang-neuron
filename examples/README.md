@@ -7,6 +7,7 @@ A model's README gives its layout, the launch commands and the accuracy check; t
 |---|---|---|---|
 | GLM-5.2 (MXFP4) | [glm52](glm52/) | one prefill server (4- or 16-stage pipeline) and one decode server, up to 1M tokens | - |
 | GPT-OSS-120B | [gpt_oss_120b](gpt_oss_120b/) | five prefill replicas and one decode server, or six and the giga-kernel decode | - |
+| Inkling-2-Mini | [inkling2_mini](inkling2_mini/) | one aggregated server | TP8 |
 | Qwen3-8B | [qwen3_8b](qwen3_8b/) | one prefill and one decode server | TP4 |
 | Qwen3-0.6B | [qwen3_0p6b](qwen3_0p6b/) | one prefill and five decode servers | TP4 |
 | GLM-4-9B | [glm4_9b](glm4_9b/) | one prefill and two decode servers | TP4 |

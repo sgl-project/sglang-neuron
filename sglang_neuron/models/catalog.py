@@ -117,6 +117,10 @@ class ModelSpec:
     # the launching process, before SGLang resolves the arguments, and every scheduler). Its module-level imports are
     # stdlib only: the launching process imports it before it has decided anything else.
     launch_hooks: str = ""
+    # a module whose register_hf_configs() adds the checkpoint's config types to transformers' AutoConfig, for a
+    # checkpoint newer than the image's transformers: every process registers them when the plugin loads, before SGLang
+    # resolves the arguments (which reads the checkpoint's config); "" for a config transformers knows
+    hf_config_types: str = ""
     # a module of the model's PD KV hand-off, for a decode whose KV lives in its kernel's own caches rather than SGLang's
     # pool (sglang_patches.kernel_kv_handoff: DECODE_HOOKS and PREFILL_HOOKS), "" for upstream's path
     kv_handoff: str = ""
@@ -205,6 +209,16 @@ MODELS = {
     ),
     "Qwen3ForCausalLM": ModelSpec(package="sglang_neuron.models.qwen3", kv_cache_dtypes=("auto", "bf16", "bfloat16")),
     "Glm4ForCausalLM": ModelSpec(package="sglang_neuron.models.glm4", kv_cache_dtypes=("auto", "bf16", "bfloat16")),
+    # the looped decoder's 48 layer visits and its conv-state record are KV layers of the host's own pool size
+    # (models/inkling2/sglang_model.py configure_kv_cache); the record at every page's end serves the radix cache
+    "Inkling2LoopForCausalLM": ModelSpec(package="sglang_neuron.models.inkling2",
+                                                      kv_cache_dtypes=("auto", "bf16", "bfloat16"),
+                                                      logical_nc=1,
+                                                      launch_hooks="sglang_neuron.models.inkling2.launch",
+                                                      hf_config_types="sglang_neuron.models.inkling2.config",
+                                                      # the prefill NEFF's scratchpad beside 6.5 GB of weights a core:
+                                                      # the plugin's 3584 MiB page does not fit (Qwen3.8's 1024)
+                                                      scratchpad_page_mb=(("aggregated", 1024),)),
     "Qwen3MoeForCausalLM": ModelSpec(package="sglang_neuron.models.qwen3_moe",
                                      kv_cache_dtypes=("auto", "bf16", "bfloat16")),
     # the paged giga prefill writes each forward's final GDN state into SGLang's tracking slot, so the chunk-keyed tree
@@ -329,6 +343,13 @@ def checkpoint_quantization(server_args):
 def served(names) -> list:
     """The architectures among ``names`` that the runtime serves."""
     return [name for name in names if name in MODELS]
+
+
+def register_hf_config_types() -> None:
+    """Register every catalog model's own config types (ModelSpec.hf_config_types) with transformers."""
+    for spec in MODELS.values():
+        if spec.hf_config_types:
+            importlib.import_module(spec.hf_config_types).register_hf_configs()
 
 
 def launch_hooks(spec: ModelSpec):

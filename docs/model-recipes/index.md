@@ -10,6 +10,8 @@ needs and what its launch refuses.
 - [DeepSeek-V2-Lite](deepseek-v2.md): MLA over SGLang's MLA pool, served on attention TP4.
 - [Qwen3](qwen3.md): Qwen3-0.6B and Qwen3-8B on the shared dense transformer, TP4 (and TP8 for Qwen3-8B).
 - [Qwen3-MoE](qwen3-moe.md): Qwen3-30B-A3B, the dense transformer with a sparse MoE block, TP4 with EP4.
+- [Inkling-2-Mini](inkling2.md): a looped MoE transformer (48 layer visits) with sliding-window and full attention and
+  short convolutions, TP8 on a trn2.3xlarge; the conv state kept in the KV pages, so the radix cache serves it.
 - [GLM-4](glm-4.md): GLM-4-9B-0414 on the dense transformer, with QKV biases, a fused gate and up projection, two more
   norms and a partial RoPE.
 - [Qwen3.5-397B PD](qwen35-pd.md): the giga megakernel as disaggregated prefill and decode, with a kv_cp=16 (DCP)

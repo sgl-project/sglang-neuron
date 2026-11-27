@@ -265,6 +265,10 @@ def _register_launch_hooks() -> None:
 
     source_guard.check_targets(_LAUNCH_SOURCES_MD5, __name__)
 
+    # checkpoints newer than the image's transformers: their config types, before SGLang reads a config
+    from sglang_neuron.models import catalog
+
+    catalog.register_hf_config_types()
     quantization_registry.register()
     # --speculative-algorithm NEURON_MTP resolves in every process that parses the server arguments
     from sglang_neuron.speculative import neuron_mtp
