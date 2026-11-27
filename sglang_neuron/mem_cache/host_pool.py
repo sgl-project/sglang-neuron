@@ -44,7 +44,9 @@ _VERIFY = os.environ.get("SGLANG_NEURON_HICACHE_VERIFY", "0") == "1"
 # the most _BatchOp records one nrt_tensor_{read,write}_batch call takes (tensors x runs): the driver copies the whole
 # list into kernel memory, and a load of a long scattered prefix over a pool with many regions (Hy3: 242, its K, V
 # and sparse summaries) failed there with -12 (ENOMEM), which killed the server; a transfer splits its runs instead
-MAX_BATCH_OPS = 16384
+# 4096: with Mooncake's EFA memory registrations on the node, 16384-op lists failed the same way (NDL batch copy -12,
+# 242 batches, 23 minutes into an AgentX hour); a smaller list costs a few more calls of a load that moves megabytes
+MAX_BATCH_OPS = 4096
 
 
 # ---- runtime library --------------------------------------------------------------------------------------------
