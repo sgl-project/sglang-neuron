@@ -12,7 +12,7 @@ plugin module a kernel's code imports, directly or through other plugin modules 
 imports of a file that only calls kernels are host code and are not followed); and every file of a vendored kernel
 tree (a model's ``kernels/`` package, ``VENDORED_KERNELS``) but the repository's records beside it
 (``is_kernel_record``: its Markdown and file manifests, which the wheel does not ship, so a checkout and an install of
-the same commit stamp alike). The match errs wide on purpose: a file
+the same commit stamp alike). The import walk stops at the host-side packages (``HOST_BOUNDARY``). The match errs wide on purpose: a file
 that names a kernel library may set what the library reads when it traces a kernel (a model's kernel build settings),
 which no key covers.
 
@@ -52,6 +52,21 @@ VENDORED_KERNELS = "sglang_neuron/models/*/kernels"
 KERNEL_RECORDS = ("MANIFEST.json", "SHARED_MANIFEST.json")
 # this module, in any checkout: it names nki in its own match, and builds no kernel
 THIS_MODULE = Path("sglang_neuron") / "backend" / "compile_cache.py"
+# host-side packages the import walk stops at: the server's orchestration (ranks and groups, the runtime, serving
+# policy, the scheduler and SGLang patches, the PD transfer, the KV / host pools, the env registry, the trace cache).
+# A kernel file's host wrapper may import them (models/hy_v3/experts_fp8.py reads its rank from parallel/state.py),
+# and from there the walk reached nearly the whole plugin, so an edit to the PD transfer refused every NEFF cache. What
+# they decide that a graph sees (rank layout, collectives, shapes, compiler arguments) is in the graph's StableHLO or
+# its compile arguments, which torch-neuronx's NEFF key covers; no kernel's IR is built from them. A file among them
+# that names nki or nkilib itself still counts (NKI_SOURCE), and is not walked further.
+HOST_BOUNDARY = tuple(Path("sglang_neuron") / p for p in (
+    "parallel", "model_executor", "managers", "sglang_patches", "disaggregation", "mem_cache", "distributed",
+    "serving_policy.py", "platform.py", "env_registry.py", "general_plugin.py", "backend/precompile_cache.py"))
+
+
+def _host_boundary(root: Path, path: Path) -> bool:
+    rel = path.relative_to(root)
+    return any(rel == b or b in rel.parents for b in HOST_BOUNDARY)
 PLUGIN_ROOT = Path(__file__).resolve().parents[2]
 
 
@@ -139,10 +154,11 @@ def kernel_sources(root: Path = PLUGIN_ROOT) -> List[Path]:
     reached = set(kernels)
     while kernels:
         for module in _plugin_imports(root, kernels.pop()):
-            if module not in reached and module.relative_to(root) != THIS_MODULE:
-                reached.add(module)
-                if vendored(module) is None:
-                    kernels.append(module)
+            if module in reached or module.relative_to(root) == THIS_MODULE or _host_boundary(root, module):
+                continue
+            reached.add(module)
+            if vendored(module) is None:
+                kernels.append(module)
     return sorted(sources | reached)
 
 

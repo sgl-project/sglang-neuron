@@ -55,18 +55,31 @@ class StripePairing:
     block: int
     draft_rows: str = DRAFT_SHARDED
     state: bool = True
+    # KV-head groups: 1 for an MLA pool (one latent head, DCP over the whole attention TP); for an MHA pool whose KV
+    # heads each span tp / heads ranks, the heads: DCP group ``G`` is ranks ``[G Cp, (G + 1) Cp)`` on the prefill and
+    # ``[G Cd, (G + 1) Cd)`` on the decode (parallel/state.dcp_ranks: runs of consecutive ranks), both holding KV head
+    # ``G``, and the stripe map runs inside each group
+    groups: int = 1
 
     def problem(self) -> Optional[str]:
         """Why the stripe map does not serve this pairing, or None."""
-        cp, cd = self.prefill_dcp, self.decode_dcp
+        cp, cd, k = self.prefill_dcp, self.decode_dcp, self.groups
         if cp < 2:
             return f"the prefill has no DCP (--dcp-size {cp})"
-        if cp != self.prefill_tp:
-            return (f"the stripe map needs the prefill's DCP over its whole attention TP (--dcp-size {self.prefill_tp} "
-                    f"with attention TP {self.prefill_tp}); the prefill runs --dcp-size {cp}")
-        if cd != self.decode_tp:
-            return (f"the stripe map needs the decode's DCP over its whole attention TP (--dcp-size {self.decode_tp} "
-                    f"with attention TP {self.decode_tp}); the decode runs --dcp-size {cd}")
+        if k < 1:
+            return f"the pairing has {k} KV-head groups"
+        if cp * k != self.prefill_tp:
+            return (f"the stripe map needs the prefill's DCP over each of its {k} KV-head groups of its attention TP "
+                    f"(--dcp-size {self.prefill_tp // k} with attention TP {self.prefill_tp}); the prefill runs "
+                    f"--dcp-size {cp}")
+        if cd * k != self.decode_tp:
+            return (f"the stripe map needs the decode's DCP over each of its {k} KV-head groups of its attention TP "
+                    f"(--dcp-size {self.decode_tp // k} with attention TP {self.decode_tp}); the decode runs "
+                    f"--dcp-size {cd}")
+        if k > 1 and self.state:
+            return "a pairing of several KV-head groups does not slice recurrent state"
+        if k > 1 and self.draft_rows != DRAFT_SHARDED:
+            return f"a pairing of several KV-head groups takes sharded drafter rows, not {self.draft_rows}"
         if cd <= cp or cd % cp:
             return f"the decode's DCP size must be a larger multiple of the prefill's {cp}, not {cd}"
         if self.block < 1:
@@ -80,8 +93,20 @@ class StripePairing:
         """Decode ranks per prefill rank's state heads."""
         return self.decode_tp // self.prefill_tp
 
+    def prefill_dcp_rank(self, prefill_rank: int) -> int:
+        """A prefill attention-TP rank's rank in its DCP group (its KV-head group)."""
+        return int(prefill_rank) % self.prefill_dcp
+
+    def decode_dcp_rank(self, decode_rank: int) -> int:
+        """A decode attention-TP rank's rank in its DCP group (its KV-head group)."""
+        return int(decode_rank) % self.decode_dcp
+
     def stripe_source(self, decode_rank: int) -> int:
-        return decode_rank % self.prefill_dcp
+        """The prefill rank that holds the stripes decode rank ``decode_rank`` owns: in the same KV-head group, at DCP
+        rank ``g % Cd % Cp`` (global stripe ``j`` lives on prefill DCP rank ``j % Cp`` and goes to decode DCP rank
+        ``j % Cd``, and ``Cp`` divides ``Cd``)."""
+        group = int(decode_rank) // self.decode_dcp
+        return group * self.prefill_dcp + self.decode_dcp_rank(decode_rank) % self.prefill_dcp
 
     def state_source(self, decode_rank: int) -> int:
         return decode_rank // self.state_ratio
@@ -403,8 +428,9 @@ def stripe_peer(*, name: str, pairing: StripePairing, prefill_rank: int, decode_
     problem = pairing.problem()
     if problem:
         refuse(problem)
-    if frame.dcp_rank != decode_rank:
-        refuse(f"its DCP rank {frame.dcp_rank} is not its attention-TP rank {decode_rank}")
+    if frame.dcp_rank != pairing.decode_dcp_rank(decode_rank):
+        refuse(f"its DCP rank {frame.dcp_rank} is not its attention-TP rank {decode_rank}'s rank in its KV-head group "
+               f"({pairing.decode_dcp_rank(decode_rank)} of {pairing.decode_dcp})")
     if frame.page_size != prefill_page:
         refuse(f"its page is {frame.page_size} tokens and this prefill's {prefill_page} (launch both with "
                f"--page-size {prefill_page})")

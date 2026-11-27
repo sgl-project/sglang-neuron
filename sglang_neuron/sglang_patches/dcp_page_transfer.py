@@ -260,12 +260,32 @@ def init_kv_manager(original_fn, self, *args, **kwargs):
 
 
 def pairs_by_stripes(kv_manager) -> bool:
-    """A DCP decode pairs by stripes when its model's PD prefill stores DCP KV (ModelSpec.prefill_context_parallel)."""
+    """A DCP decode pairs by stripes when its model's PD prefill stores DCP KV (ModelSpec.prefill_context_parallel) in
+    an MLA pool, the only pool the stripe map serves (disaggregation/dcp_stripes.py). An MHA DCP decode pairs by
+    pages with a prefill without DCP (check_page_peer), at any prefill attention TP (nixl_head_major): Hy3 declares
+    prefill_context_parallel for its aggregated DCP prefill, and its PD prefill runs without DCP."""
     from sglang_neuron.models import catalog
 
     if int(getattr(kv_manager, "dcp_size", 1)) <= 1:
         return False
+    if not (getattr(kv_manager, "is_mla_backend", False) or getattr(kv_manager, "is_hybrid_mla_backend", False)):
+        # an MHA DCP decode pairs by stripes with a DCP prefill of a smaller DCP size only when the launch names that
+        # size (SGLANG_NEURON_PD_PREFILL_DCP): the prefill's bootstrap info carries no DCP size, and a prefill without
+        # DCP pairs by pages
+        return mha_prefill_dcp() > 1 and bool(catalog.model_spec(kv_manager.server_args)[1].prefill_context_parallel)
     return bool(catalog.model_spec(kv_manager.server_args)[1].prefill_context_parallel)
+
+
+def mha_prefill_dcp() -> int:
+    """SGLANG_NEURON_PD_PREFILL_DCP on an MHA DCP decode: the DCP size of the PD prefill it pairs with by stripes (each
+    of its KV-head groups of attention TP / heads ranks DCP-sharded, dcp_stripes.StripePairing.groups); unset or 1: a
+    prefill without DCP, paired by pages."""
+    import os
+
+    value = os.environ.get("SGLANG_NEURON_PD_PREFILL_DCP", "1") or "1"
+    if not value.isdigit() or int(value) < 1:
+        raise ValueError(f"SGLANG_NEURON_PD_PREFILL_DCP={value!r}: the prefill's --dcp-size (1 without DCP)")
+    return int(value)
 
 
 def decode_frame(mgr):
@@ -294,11 +314,16 @@ def decode_stripe_pairing(mgr, info):
 
     if not getattr(mgr.kv_args, "neuron_stripe_pairing", False) or int(info.attn_tp_size) >= int(mgr.attn_tp_size):
         return None
+    if _mla(mgr):
+        prefill_dcp, groups = int(info.attn_tp_size), 1
+    else:
+        # MHA: each KV-head group of the decode's DCP size pairs with the prefill's group of the same head
+        prefill_dcp, groups = mha_prefill_dcp(), int(mgr.attn_tp_size) // int(mgr.dcp_size)
     pairing = dcp_stripes.StripePairing(
-        prefill_dcp=int(info.attn_tp_size), decode_dcp=int(mgr.dcp_size), prefill_tp=int(info.attn_tp_size),
+        prefill_dcp=prefill_dcp, decode_dcp=int(mgr.dcp_size), prefill_tp=int(info.attn_tp_size),
         decode_tp=int(mgr.attn_tp_size), block=int(mgr.kv_args.page_size),
         draft_rows=str(getattr(mgr.kv_args, "neuron_draft_rows", dcp_stripes.DRAFT_SHARDED)),
-        state=bool(getattr(mgr.kv_args, "state_types", None)))
+        state=bool(getattr(mgr.kv_args, "state_types", None)), groups=groups)
     problem = pairing.problem()
     if problem:
         raise RuntimeError(f"PD DCP stripe pairing with a prefill of attention TP {info.attn_tp_size}: {problem}")
@@ -404,7 +429,12 @@ def check_page_peer(mgr, peer_info) -> None:
         getattr(mgr.kv_args, "kv_head_num", 0) or 0) * prefill_tp
     replication = decode_tp // total_heads if total_heads else 0
     n = decode_tp // prefill_tp if decode_tp % prefill_tp == 0 else 0
-    heads_ratio = n // max(1, replication) if n else 0
+    # KV heads a rank holds on each side (a head replicated over several ranks counts as one): a decode page is the
+    # prefill page's slice of heads_ratio heads, the whole page when both sides hold one head (Hy3's 8 heads at
+    # prefill TP32, decode TP64)
+    prefill_heads = max(1, total_heads // prefill_tp) if total_heads else 0
+    decode_heads = max(1, total_heads // decode_tp) if total_heads else 0
+    heads_ratio = prefill_heads // decode_heads if decode_heads and prefill_heads % decode_heads == 0 else 0
     if not (n and replication >= 1 and replication % dcp == 0 and heads_ratio >= 1
             and all(src == dst * heads_ratio for src, dst in ratios)):
         raise RuntimeError(
@@ -447,9 +477,16 @@ def check_stripe_peer(mgr, peer_info):
         if problem is not None:
             raise RuntimeError(f"PD DCP stripe transfer to decode peer {name}: it announces a page rule (its KDA state "
                                f"and drafter rows at pages of its state slot), and {problem}")
-    if int(mgr.dcp_rank) != int(mgr.attn_tp_rank):
+    # the stripe map runs inside each KV-head group: one (MLA, DCP over the whole attention TP) or attention TP / DCP
+    # (MHA, a DCP group of consecutive ranks per KV head, parallel/state.dcp_ranks)
+    groups = int(mgr.attn_tp_size) // int(mgr.dcp_size)
+    if groups > 1 and _mla(mgr):
+        raise RuntimeError(f"PD DCP stripe transfer to decode peer {name}: an MLA prefill's DCP ({mgr.dcp_size}) must "
+                           f"span its attention TP ({mgr.attn_tp_size})")
+    if int(mgr.dcp_rank) != int(mgr.attn_tp_rank) % int(mgr.dcp_size):
         raise RuntimeError(f"PD DCP stripe transfer to decode peer {name}: this prefill rank's DCP rank "
-                           f"{mgr.dcp_rank} is not its attention-TP rank {mgr.attn_tp_rank}")
+                           f"{mgr.dcp_rank} is not its attention-TP rank {mgr.attn_tp_rank}'s place in its KV-head "
+                           f"group of {mgr.dcp_size} consecutive ranks")
     states = list(getattr(kv, "state_types", None) or [])
     if any(state != StateType.MAMBA for state in states):
         raise NotImplementedError(f"PD DCP stripe transfer to decode peer {name}: it sends recurrent (mamba) state "
@@ -462,7 +499,7 @@ def check_stripe_peer(mgr, peer_info):
     pairing = dcp_stripes.StripePairing(
         prefill_dcp=int(mgr.dcp_size), decode_dcp=int(peer_info.dst_dcp_size), prefill_tp=int(mgr.attn_tp_size),
         decode_tp=int(peer_info.decode_tp_size), block=int(kv.page_size), draft_rows=frame.draft_rows,
-        state=bool(states))
+        state=bool(states), groups=groups)
     n_src, n_dst = len(kv.kv_item_lens), len(peer_info.dst_kv_item_lens)
     dst_indices = resolve_dcp_dst_entry_indices(list(kv.kv_layer_ids or []), list(peer_info.dst_kv_layer_ids or []),
                                                 n_src, n_dst)
@@ -533,11 +570,24 @@ def prepare_payload_xfer(original_fn, self, peer_info, *args, **kwargs):
         return None
     if not _page_peer(self, peer_info):
         return original_fn(self, peer_info, *args, **kwargs)
-    plain = dataclasses.replace(peer_info, requires_dcp_relayout=False)
+    whole = _whole_pages(self, peer_info)
+    # a decode rank that holds its prefill rank's page whole (both sides one KV head a rank: Hy3's 8 heads at prefill
+    # TP32, decode TP64) takes the equal-TP dlists, which carry every entry the pool registers (the MTP layer, the
+    # sparse summaries' side buffers); upstream's head-slice dlists assume every entry is a K or V page of one size
+    plain = dataclasses.replace(peer_info, requires_dcp_relayout=False,
+                                **({"decode_tp_size": int(self.attn_tp_size)} if whole else {}))
     out = original_fn(self, plain, *args, **kwargs)
     peer_info.dst_homogeneous_mem_kind = plain.dst_homogeneous_mem_kind
-    peer_info.dcp_page_slices = int(peer_info.decode_tp_size) != int(self.attn_tp_size)
+    peer_info.dcp_page_slices = not whole and int(peer_info.decode_tp_size) != int(self.attn_tp_size)
     return out
+
+
+def _whole_pages(mgr, peer_info) -> bool:
+    """Whether each of this prefill's KV entries goes whole into its paired decode entry (equal item bytes)."""
+    n_src, n_dst = len(mgr.kv_args.kv_item_lens), len(peer_info.dst_kv_item_lens)
+    dst_indices = mgr._build_transfer_dst_indices(peer_info=peer_info, n_src=n_src, n_dst=n_dst)
+    return all(int(mgr.kv_args.kv_item_lens[i]) == int(peer_info.dst_kv_item_lens[j])
+               for i, j in enumerate(dst_indices))
 
 
 def build_dcp_token_transfer_plan(original_fn, src_page_indices, dst_page_indices, *, physical_page_size: int,
@@ -625,12 +675,13 @@ def send_stripes(mgr, peer_name, dst_info, chunk: DcpChunk) -> list:
     kv = mgr.kv_args
     n_draft = int(getattr(kv, "num_draft_entries", 0) or 0)
     n_target = len(kv.kv_data_ptrs) - n_draft
-    stripes = dcp_stripes.chunk_stripes(peer.pairing, int(mgr.attn_tp_rank), chunk.src_page_indices,
+    stripes = dcp_stripes.chunk_stripes(peer.pairing, peer.pairing.prefill_dcp_rank(mgr.attn_tp_rank),
+                                        chunk.src_page_indices,
                                         chunk.dst_page_indices, src_page_offset=chunk.src_page_offset,
                                         decode_prefix_len=chunk.decode_prefix_len, num_kv_tokens=chunk.num_kv_tokens)
     parts = []
     if peer.roles.stripes:
-        owned = stripes.to(peer.decode_rank)
+        owned = stripes.to(peer.pairing.decode_dcp_rank(peer.decode_rank))
         parts.append((0, n_target, peer.target_dst, owned))
         if n_draft and peer.pairing.draft_rows == dcp_stripes.DRAFT_SHARDED:
             parts.append((n_target, n_target + n_draft, peer.draft_dst, owned))
@@ -638,7 +689,8 @@ def send_stripes(mgr, peer_name, dst_info, chunk: DcpChunk) -> list:
             block = int(peer.pairing.block)
             first, slot = ring_window(mgr, peer_name, chunk, peer.page_rule, block)
             parts.append((n_target, n_target + n_draft, peer.draft_dst,
-                          stripes.ring(peer.decode_rank, peer.page_rule, slot, first)))
+                          stripes.ring(peer.pairing.decode_dcp_rank(peer.decode_rank), peer.page_rule, slot,
+                                       first)))
     if n_draft and peer.pairing.draft_rows == dcp_stripes.DRAFT_REPLICATED:
         parts.append((n_target, n_target + n_draft, peer.draft_dst, stripes.replicated()))
     handles = []

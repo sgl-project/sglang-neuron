@@ -178,7 +178,7 @@ def register_or_refuse(mgr, frames, agent_name: str) -> None:
         refusals = refusals_of(mgr) or mgr.__dict__.setdefault(_STATE, PeerRefusals())
         refusals.peers[agent_name] = f"{type(error).__name__}: {error}"
         logger.error("prefill rank %s refused decode peer %s at registration, and fails each of its rooms: %s",
-                     mgr.kv_args.engine_rank, agent_name, refusals.peers[agent_name])
+                     mgr.kv_args.engine_rank, agent_name, refusals.peers[agent_name], exc_info=True)
         return
     refusals = refusals_of(mgr)
     if refusals is not None:
