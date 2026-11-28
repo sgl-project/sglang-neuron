@@ -308,6 +308,10 @@ def _register_launch_hooks() -> None:
     from sglang_neuron.sglang_patches import decode_radix_mtp
 
     decode_radix_mtp.register(HookRegistry, HookType.AROUND)
+    # scheduler metrics only from the stats-logging rank: at TP64 every rank's series made /metrics ~1 s a scrape
+    from sglang_neuron.sglang_patches import scheduler_metrics_rank0
+
+    scheduler_metrics_rank0.register(HookRegistry, HookType.AROUND)
     HookRegistry.register(f"{_TOKENIZER}._validate_one_request", _validate_request, HookType.AROUND)
     # the served model's own sampling values for a chat request (launch hooks chat_sampling_params; the Kimi-K3 API's)
     from sglang_neuron.sglang_patches import model_chat_sampling
